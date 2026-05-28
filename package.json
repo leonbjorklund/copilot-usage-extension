@@ -1,0 +1,117 @@
+{
+  "name": "copilot-usage-extension",
+  "displayName": "Copilot Usage",
+  "description": "Local Copilot token usage and AI Credit billing cost.",
+  "version": "0.0.1",
+  "publisher": "leonbjorklund",
+  "license": "MIT",
+  "scripts": {
+    "clean": "node -e \"const fs=require('node:fs'); for (const dir of ['dist','out']) fs.rmSync(dir,{recursive:true,force:true});\"",
+    "check-types": "tsc --noEmit -p ./",
+    "compile": "npm run check-types && node esbuild.js",
+    "compile:production": "npm run check-types && node esbuild.js --production",
+    "vscode:prepublish": "npm run compile:production",
+    "watch": "node esbuild.js --watch",
+    "test": "vitest run --passWithNoTests",
+    "package": "vsce package --no-dependencies",
+    "install:local": "vsce package --no-dependencies --out copilot-usage-extension.vsix && code --install-extension copilot-usage-extension.vsix --force"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "@types/vscode": "^1.120.0",
+    "@vscode/vsce": "^3.9.1",
+    "esbuild": "^0.28.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.7"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/leonbjorklund/copilot-usage-extension.git"
+  },
+  "bugs": {
+    "url": "https://github.com/leonbjorklund/copilot-usage-extension/issues"
+  },
+  "homepage": "https://github.com/leonbjorklund/copilot-usage-extension#readme",
+  "keywords": [
+    "copilot",
+    "usage",
+    "tokens",
+    "cost",
+    "ai"
+  ],
+  "pricing": "Free",
+  "engines": {
+    "vscode": "^1.120.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "icon": "logos/logo.png",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "extensionKind": [
+    "ui"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Copilot Usage works in Restricted Mode, but workspace-defined custom scan paths are ignored until the workspace is trusted.",
+      "restrictedConfigurations": [
+        "copilotUsage.dataPath"
+      ]
+    },
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "Copilot Usage scans local VS Code and Copilot files from disk."
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "copilotUsage.refresh",
+        "title": "Copilot Usage: Refresh"
+      },
+      {
+        "command": "copilotUsage.showDiagnostics",
+        "title": "Copilot Usage: Show Scan Diagnostics"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "copilotUsage",
+          "title": "Copilot Usage",
+          "icon": "logos/logo.svg"
+        }
+      ]
+    },
+    "views": {
+      "copilotUsage": [
+        {
+          "id": "copilotUsage.views.usage",
+          "name": "Usage",
+          "icon": "logos/logo.svg"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "copilotUsage.views.usage",
+        "contents": "[Enable Copilot logs to see token use](command:copilotUsage.openCopilotLoggingSetting)",
+        "when": "copilotUsage.setupNeeded"
+      }
+    ],
+    "configuration": {
+      "title": "Copilot Usage",
+      "properties": {
+        "copilotUsage.dataPath": {
+          "type": "string",
+          "default": "",
+          "description": "Extra local folder to scan for Copilot usage data."
+        }
+      }
+    }
+  }
+}

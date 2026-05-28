@@ -1,0 +1,7 @@
+{
+  "id": "chat-json",
+  "title": "JSON Chat",
+  "createdAt": "2026-05-28T08:00:00.000Z",
+  "model": "gpt-test",
+  "usage": { "input_tokens": 1000, "output_tokens": 500 }
+}

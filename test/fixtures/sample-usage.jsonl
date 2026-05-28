@@ -1,0 +1,2 @@
+{"id":"chat-total","title":"Total Chat","timestamp":"2026-05-28T09:00:00.000Z","model":"gpt-test","total_tokens":2000}
+{"id":"chat-text","title":"Text Chat","timestamp":"2026-05-28T10:00:00.000Z","model":"gpt-test","messages":[{"role":"user","content":"12345678"},{"role":"assistant","content":"abcdefgh"}]}
