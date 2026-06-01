@@ -41,7 +41,7 @@ describe('package manifest and publish contents', () => {
     expect(manifest.devDependencies.sharp).toBeUndefined();
     expect(manifest.contributes.viewsContainers.activitybar).toContainEqual({
       id: 'copilotUsage',
-      title: 'Copilot Usage',
+      title: 'Copilot Token Cost',
       icon: 'logos/logo.svg',
     });
     expect(manifest.contributes.views.explorer).toBeUndefined();
@@ -60,8 +60,8 @@ describe('package manifest and publish contents', () => {
       },
     ]);
     expect(manifest.contributes.commands.map((command) => command.title)).toEqual([
-      'Copilot Usage: Refresh',
-      'Copilot Usage: Show Scan Diagnostics',
+      'Copilot Token Cost: Refresh',
+      'Copilot Token Cost: Show Scan Diagnostics',
     ]);
     expect(Object.keys(manifest.contributes.configuration.properties)).toEqual(['copilotUsage.dataPath']);
   });

@@ -16,8 +16,8 @@ Dollar amounts use GitHub's [Copilot usage-based billing docs](https://docs.gith
 
 ## Reference
 
-- `Copilot Usage: Refresh` — re-scans log files and updates totals
-- `Copilot Usage: Show Scan Diagnostics` — shows details about skipped or unreadable files
+- `Copilot Token Cost: Refresh` — re-scans log files and updates totals
+- `Copilot Token Cost: Show Scan Diagnostics` — shows details about skipped or unreadable files
 - `copilotUsage.dataPath` — extra local folder to scan for Copilot usage data (absolute path)
 
 ## Feedback

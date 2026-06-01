@@ -1,6 +1,6 @@
 {
   "name": "copilot-usage-extension",
-  "displayName": "Copilot Usage",
+  "displayName": "Copilot Token Cost",
   "description": "Local Copilot token usage and AI Credit billing cost.",
   "version": "0.0.1",
   "publisher": "leonbjorklund",
@@ -57,32 +57,32 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": "limited",
-      "description": "Copilot Usage works in Restricted Mode, but workspace-defined custom scan paths are ignored until the workspace is trusted.",
+      "description": "Copilot Token Cost works in Restricted Mode, but workspace-defined custom scan paths are ignored until the workspace is trusted.",
       "restrictedConfigurations": [
         "copilotUsage.dataPath"
       ]
     },
     "virtualWorkspaces": {
       "supported": false,
-      "description": "Copilot Usage scans local VS Code and Copilot files from disk."
+      "description": "Copilot Token Cost scans local VS Code and Copilot files from disk."
     }
   },
   "contributes": {
     "commands": [
       {
         "command": "copilotUsage.refresh",
-        "title": "Copilot Usage: Refresh"
+        "title": "Copilot Token Cost: Refresh"
       },
       {
         "command": "copilotUsage.showDiagnostics",
-        "title": "Copilot Usage: Show Scan Diagnostics"
+        "title": "Copilot Token Cost: Show Scan Diagnostics"
       }
     ],
     "viewsContainers": {
       "activitybar": [
         {
           "id": "copilotUsage",
-          "title": "Copilot Usage",
+          "title": "Copilot Token Cost",
           "icon": "logos/logo.svg"
         }
       ]
@@ -104,7 +104,7 @@
       }
     ],
     "configuration": {
-      "title": "Copilot Usage",
+      "title": "Copilot Token Cost",
       "properties": {
         "copilotUsage.dataPath": {
           "type": "string",
