@@ -43,14 +43,14 @@ describe('package manifest and publish contents', () => {
     expect(manifest.devDependencies.sharp).toBeUndefined();
     expect(manifest.contributes.viewsContainers.activitybar).toContainEqual({
       id: 'copilotUsage',
-      title: 'Copilot Token Cost',
+      title: 'Copilot Sessions',
       icon: 'logos/logo.svg',
     });
     expect(manifest.contributes.views.explorer).toBeUndefined();
     expect(manifest.contributes.views.copilotUsage).toEqual([
       {
         id: 'copilotUsage.views.usage',
-        name: 'Usage',
+        name: 'Copilot Sessions',
         icon: 'logos/logo.svg',
       },
     ]);

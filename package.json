@@ -82,7 +82,7 @@
       "activitybar": [
         {
           "id": "copilotUsage",
-          "title": "Copilot Token Cost",
+          "title": "Copilot Sessions",
           "icon": "logos/logo.svg"
         }
       ]
@@ -91,7 +91,7 @@
       "copilotUsage": [
         {
           "id": "copilotUsage.views.usage",
-          "name": "Usage",
+          "name": "Copilot Sessions",
           "icon": "logos/logo.svg"
         }
       ]
