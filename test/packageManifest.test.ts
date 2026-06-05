@@ -35,7 +35,9 @@ describe('package manifest and publish contents', () => {
     expect(vscodeIgnore).toContain('AGENTS.md');
     expect(vscodeIgnore).toContain('TODO');
     expect(vscodeIgnore).toContain('*.vsix');
-    expect(manifest.scripts['install:local']).toContain('code --install-extension copilot-usage-extension.vsix --force');
+    expect(manifest.scripts['install:local']).toBe(
+      'vsce package --no-dependencies --out copilot-usage-extension.vsix && code --install-extension copilot-usage-extension.vsix --force && code --new-window .',
+    );
     expect(manifest.scripts['generate:logos']).toBeUndefined();
     expect(manifest.scripts.update).toBeUndefined();
     expect(manifest.devDependencies.sharp).toBeUndefined();

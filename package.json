@@ -14,7 +14,7 @@
     "watch": "node esbuild.js --watch",
     "test": "vitest run --passWithNoTests",
     "package": "vsce package --no-dependencies",
-    "install:local": "vsce package --no-dependencies --out copilot-usage-extension.vsix && code --install-extension copilot-usage-extension.vsix --force"
+    "install:local": "vsce package --no-dependencies --out copilot-usage-extension.vsix && code --install-extension copilot-usage-extension.vsix --force && code --new-window ."
   },
   "devDependencies": {
     "@types/node": "^25.9.1",

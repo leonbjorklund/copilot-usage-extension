@@ -219,7 +219,6 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   async function openView(): Promise<void> {
-    await vscode.commands.executeCommand("workbench.view.explorer");
     await vscode.commands.executeCommand("copilotUsage.views.usage.focus");
   }
 

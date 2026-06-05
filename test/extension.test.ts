@@ -486,6 +486,20 @@ describe("activate", () => {
     );
   });
 
+  it("opens the usage activity view directly from the status bar command", async () => {
+    const context = createContext();
+
+    activate(context);
+    await settle();
+    vi.mocked(vscode.commands.executeCommand).mockClear();
+    const openView = commandCallback("copilotUsage.openView");
+    await openView();
+
+    expect(vscode.commands.executeCommand).toHaveBeenCalledTimes(1);
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("copilotUsage.views.usage.focus");
+    expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("workbench.view.explorer");
+  });
+
   it("creates scoped file watchers for indexed folders and updates one changed file from cache", async () => {
     vi.useFakeTimers();
     state.watchFolders = ["root/GitHub.copilot-chat"];
