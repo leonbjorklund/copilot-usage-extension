@@ -104,6 +104,67 @@ describe('UsageTreeProvider', () => {
     expect(await provider.getChildren(chatChildren[0])).toEqual([]);
   });
 
+  it('keeps bucket children sorted newest first by default', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setSummary(
+      createSummary([
+        createChat('older-today', 'Older today', new Date(2026, 4, 28, 8, 0), 300),
+        createChat('newer-today', 'Newer today', new Date(2026, 4, 28, 11, 0), 100),
+      ]),
+    );
+    const rootChildren = (await provider.getChildren()) ?? [];
+
+    const chatChildren = (await provider.getChildren(rootChildren[0])) ?? [];
+
+    expect(chatChildren.map((node) => node.kind === 'chat' && node.chat.chatId)).toEqual([
+      'newer-today',
+      'older-today',
+    ]);
+  });
+
+  it('sorts bucket children by cost with tokens and time tie-breakers', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setSortMode('cost');
+    provider.setSummary(
+      createSummary([
+        createChat('newer-cheaper', 'Newer cheaper', new Date(2026, 4, 28, 11, 0), 900, createCost(1)),
+        createChat('most-expensive', 'Most expensive', new Date(2026, 4, 28, 8, 0), 100, createCost(3)),
+        createChat('same-cost-more-tokens', 'Same cost more tokens', new Date(2026, 4, 28, 9, 0), 700, createCost(2)),
+        createChat('same-cost-newer', 'Same cost newer', new Date(2026, 4, 28, 10, 0), 700, createCost(2)),
+      ]),
+    );
+    const rootChildren = (await provider.getChildren()) ?? [];
+
+    const chatChildren = (await provider.getChildren(rootChildren[0])) ?? [];
+
+    expect(chatChildren.map((node) => node.kind === 'chat' && node.chat.chatId)).toEqual([
+      'most-expensive',
+      'same-cost-newer',
+      'same-cost-more-tokens',
+      'newer-cheaper',
+    ]);
+  });
+
+  it('keeps date bucket order when cost sorting is active', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setSortMode('cost');
+    provider.setSummary(
+      createSummary([
+        createChat('older', 'Older', new Date(2026, 4, 26, 8, 0), 100, createCost(9)),
+        createChat('yesterday', 'Yesterday', new Date(2026, 4, 27, 8, 0), 100, createCost(8)),
+        createChat('today', 'Today', new Date(2026, 4, 28, 8, 0), 100, createCost(1)),
+      ]),
+    );
+
+    const rootChildren = (await provider.getChildren()) ?? [];
+
+    expect(rootChildren.map((node) => node.kind === 'bucket' && node.bucket.id)).toEqual([
+      'today',
+      'yesterday',
+      'older',
+    ]);
+  });
+
   it('renders older bucket children with date and time', async () => {
     const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
     provider.setSummary(createSummary([createChat('chat-2', 'Bug fix', new Date(2026, 4, 26, 16, 18), 23_300)]));

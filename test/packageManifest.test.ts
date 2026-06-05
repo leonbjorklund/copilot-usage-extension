@@ -15,9 +15,10 @@ describe('package manifest and publish contents', () => {
           activitybar: Array<{ id: string; title: string; icon: string }>;
         };
         views: Record<string, Array<{ id: string; name: string; icon?: string }>>;
-        commands: Array<{ command: string; title: string }>;
+        commands: Array<{ command: string; title: string; category?: string; icon?: string }>;
         menus?: {
           'view/item/context'?: Array<{ command: string; when: string; group?: string }>;
+          'view/title'?: Array<{ command: string; when: string; group?: string }>;
         };
         configuration: {
           properties: Record<string, unknown>;
@@ -67,8 +68,37 @@ describe('package manifest and publish contents', () => {
     expect(manifest.contributes.commands.map((command) => command.title)).toEqual([
       'Copilot Token Cost: Refresh',
       'Copilot Token Cost: Show Scan Diagnostics',
-      'Copilot Token Cost: Open Source Log',
+      'Open Source Log',
+      'Sort Sessions by Cost',
+      'Sort Sessions by Time',
     ]);
+    expect(manifest.contributes.commands).toContainEqual({
+      command: 'copilotUsage.openSourceLog',
+      title: 'Open Source Log',
+      category: 'Copilot Token Cost',
+    });
+    expect(manifest.contributes.commands).toContainEqual({
+      command: 'copilotUsage.sortSessionsByCost',
+      title: 'Sort Sessions by Cost',
+      category: 'Copilot Token Cost',
+      icon: '$(sort-precedence)',
+    });
+    expect(manifest.contributes.commands).toContainEqual({
+      command: 'copilotUsage.sortSessionsByTime',
+      title: 'Sort Sessions by Time',
+      category: 'Copilot Token Cost',
+      icon: '$(history)',
+    });
+    expect(manifest.contributes.menus?.['view/title']).toContainEqual({
+      command: 'copilotUsage.sortSessionsByCost',
+      when: 'view == copilotUsage.views.usage && copilotUsage.sortMode == time',
+      group: 'navigation@2',
+    });
+    expect(manifest.contributes.menus?.['view/title']).toContainEqual({
+      command: 'copilotUsage.sortSessionsByTime',
+      when: 'view == copilotUsage.views.usage && copilotUsage.sortMode == cost',
+      group: 'navigation@2',
+    });
     expect(manifest.contributes.menus?.['view/item/context']).toContainEqual({
       command: 'copilotUsage.openSourceLog',
       when: 'view == copilotUsage.views.usage && viewItem == chat',

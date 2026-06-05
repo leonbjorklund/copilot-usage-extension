@@ -18,7 +18,12 @@ import type {
 } from "./core/types";
 import { UsageIndex } from "./core/usageIndex";
 import { formatTokens, formatUsd } from "./ui/formatters";
-import { formatDiagnostics, UsageTreeProvider, type UsageNode } from "./ui/usageTreeProvider";
+import {
+  formatDiagnostics,
+  UsageTreeProvider,
+  type UsageNode,
+  type UsageTreeSortMode,
+} from "./ui/usageTreeProvider";
 
 const STATUS_BAR_DISPLAY = {
   scanningText: "Scanning Sessions...",
@@ -28,6 +33,8 @@ const STATUS_BAR_DISPLAY = {
   separator: " | ",
 };
 const SETUP_NEEDED_CONTEXT = "copilotUsage.setupNeeded";
+const SORT_MODE_CONTEXT = "copilotUsage.sortMode";
+const SORT_MODE_STORAGE_KEY = "copilotUsage.sortMode";
 
 const USAGE_WATCH_GLOB =
   "**/{github.copilot-chat,GitHub.copilot-chat,debug-logs,transcripts,chatSessions,chatsessions,emptyWindowChatSessions,emptywindowchatsessions}/**";
@@ -180,7 +187,7 @@ function setStatusBarSetupNeeded(statusBar: vscode.StatusBarItem): void {
 }
 
 export function activate(context: vscode.ExtensionContext): void {
-  const treeProvider = new UsageTreeProvider();
+  const treeProvider = new UsageTreeProvider(() => new Date(), readPersistedSortMode(context));
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   const usageIndex = new UsageIndex();
   let latestDiagnostics: UsageDiagnostics | undefined;
@@ -196,6 +203,7 @@ export function activate(context: vscode.ExtensionContext): void {
   statusBar.command = "copilotUsage.openView";
   setStatusBarScanning(statusBar);
   statusBar.show();
+  void setSortModeContext(readPersistedSortMode(context));
 
   async function runRefresh(): Promise<void> {
     const refreshGeneration = ++generation;
@@ -269,6 +277,16 @@ export function activate(context: vscode.ExtensionContext): void {
 
   function setSetupNeededContext(value: boolean): Thenable<unknown> {
     return vscode.commands.executeCommand("setContext", SETUP_NEEDED_CONTEXT, value);
+  }
+
+  function setSortModeContext(value: UsageTreeSortMode): Thenable<unknown> {
+    return vscode.commands.executeCommand("setContext", SORT_MODE_CONTEXT, value);
+  }
+
+  async function setSortMode(value: UsageTreeSortMode): Promise<void> {
+    treeProvider.setSortMode(value);
+    await context.globalState.update(SORT_MODE_STORAGE_KEY, value);
+    await setSortModeContext(value);
   }
 
   function syncWatchers(folders: string[]): void {
@@ -418,6 +436,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("copilotUsage.openSourceLog", (node?: UsageNode) =>
       openSourceLog(node),
     ),
+    vscode.commands.registerCommand("copilotUsage.sortSessionsByCost", () => setSortMode("cost")),
+    vscode.commands.registerCommand("copilotUsage.sortSessionsByTime", () => setSortMode("time")),
     vscode.commands.registerCommand("copilotUsage.openCopilotLoggingSetting", () =>
       vscode.commands.executeCommand(
         "workbench.action.openSettings",
@@ -454,6 +474,10 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export function deactivate(): void {}
+
+function readPersistedSortMode(context: vscode.ExtensionContext): UsageTreeSortMode {
+  return context.globalState.get<string>(SORT_MODE_STORAGE_KEY, "time") === "cost" ? "cost" : "time";
+}
 
 function buildSourceLogPicks(node: Extract<UsageNode, { kind: "chat" }>): SourceLogPick[] {
   const logsByPath = new Map<string, SourceLog>();

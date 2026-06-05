@@ -9,6 +9,7 @@ import type {
 import { formatTokens, formatUsd } from "./formatters";
 
 type BucketId = "today" | "yesterday" | "older";
+export type UsageTreeSortMode = "time" | "cost";
 
 interface UsageBucket {
   id: BucketId;
@@ -39,7 +40,15 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode> {
 
   readonly onDidChangeTreeData = this.changeEmitter.event;
 
-  constructor(private readonly now = () => new Date()) {}
+  constructor(
+    private readonly now = () => new Date(),
+    private sortMode: UsageTreeSortMode = "time",
+  ) {}
+
+  setSortMode(sortMode: UsageTreeSortMode): void {
+    this.sortMode = sortMode;
+    this.changeEmitter.fire();
+  }
 
   setSummary(summary: UsageSummary): void {
     this.summary = summary;
@@ -63,7 +72,7 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode> {
     }
 
     if (!element) {
-      const buckets = buildBuckets(this.summary, this.now()).map(
+      const buckets = buildBuckets(this.summary, this.now(), this.sortMode).map(
         (bucket): UsageNode => ({ kind: "bucket", bucket }),
       );
       return buckets.length > 0 ? buckets : [{ kind: "empty" }];
@@ -111,7 +120,11 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode> {
   }
 }
 
-function buildBuckets(summary: UsageSummary, baseDate: Date): UsageBucket[] {
+function buildBuckets(
+  summary: UsageSummary,
+  baseDate: Date,
+  sortMode: UsageTreeSortMode,
+): UsageBucket[] {
   const buckets: UsageBucket[] = [
     { id: "today", label: "Today", chats: [], tokens: 0, githubCopilot: emptyCostEstimate() },
     {
@@ -132,7 +145,29 @@ function buildBuckets(summary: UsageSummary, baseDate: Date): UsageBucket[] {
     addCost(bucket.githubCopilot, chat.githubCopilot);
   }
 
+  for (const bucket of buckets) {
+    bucket.chats.sort(comparerForSortMode(sortMode));
+  }
+
   return buckets.filter((bucket) => bucket.chats.length > 0);
+}
+
+function comparerForSortMode(
+  sortMode: UsageTreeSortMode,
+): (left: ChatUsageSummary, right: ChatUsageSummary) => number {
+  return sortMode === "cost" ? compareChatsByCost : compareChatsByTime;
+}
+
+function compareChatsByTime(left: ChatUsageSummary, right: ChatUsageSummary): number {
+  return right.timestamp.getTime() - left.timestamp.getTime();
+}
+
+function compareChatsByCost(left: ChatUsageSummary, right: ChatUsageSummary): number {
+  return (
+    right.githubCopilot.aiCredits - left.githubCopilot.aiCredits ||
+    right.tokens - left.tokens ||
+    compareChatsByTime(left, right)
+  );
 }
 
 function emptyCostEstimate(): CopilotCostEstimate {

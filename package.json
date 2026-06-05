@@ -79,10 +79,35 @@
       },
       {
         "command": "copilotUsage.openSourceLog",
-        "title": "Copilot Token Cost: Open Source Log"
+        "title": "Open Source Log",
+        "category": "Copilot Token Cost"
+      },
+      {
+        "command": "copilotUsage.sortSessionsByCost",
+        "title": "Sort Sessions by Cost",
+        "category": "Copilot Token Cost",
+        "icon": "$(sort-precedence)"
+      },
+      {
+        "command": "copilotUsage.sortSessionsByTime",
+        "title": "Sort Sessions by Time",
+        "category": "Copilot Token Cost",
+        "icon": "$(history)"
       }
     ],
     "menus": {
+      "view/title": [
+        {
+          "command": "copilotUsage.sortSessionsByCost",
+          "when": "view == copilotUsage.views.usage && copilotUsage.sortMode == time",
+          "group": "navigation@2"
+        },
+        {
+          "command": "copilotUsage.sortSessionsByTime",
+          "when": "view == copilotUsage.views.usage && copilotUsage.sortMode == cost",
+          "group": "navigation@2"
+        }
+      ],
       "view/item/context": [
         {
           "command": "copilotUsage.openSourceLog",

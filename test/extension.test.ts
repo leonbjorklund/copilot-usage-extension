@@ -489,6 +489,63 @@ describe("activate", () => {
     expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("workbench.view.explorer");
   });
 
+  it("restores persisted cost sorting for registered tree provider", async () => {
+    state.usageIndexResult = {
+      summary: createSummaryWithChats([
+        createChatSummary("newer-cheaper", new Date(2026, 4, 28, 11, 0), 900, 1),
+        createChatSummary("older-expensive", new Date(2026, 4, 28, 8, 0), 100, 3),
+      ]),
+      diagnostics: createDiagnostics(),
+    };
+
+    await activateExtension(createContext("cost"));
+
+    const provider = registeredTreeProvider();
+    const rootChildren = (await provider.getChildren()) ?? [];
+    const chatChildren = (await provider.getChildren(rootChildren[0])) ?? [];
+    expect(chatChildren.map((node) => node.kind === "chat" && node.chat.chatId)).toEqual([
+      "older-expensive",
+      "newer-cheaper",
+    ]);
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith(
+      "setContext",
+      "copilotUsage.sortMode",
+      "cost",
+    );
+  });
+
+  it("persists cost sorting when the view title command runs", async () => {
+    const context = createContext();
+    await activateExtension(context);
+    vi.mocked(vscode.commands.executeCommand).mockClear();
+    const sortByCost = commandCallback("copilotUsage.sortSessionsByCost");
+
+    await sortByCost();
+
+    expect(context.globalState.update).toHaveBeenCalledWith("copilotUsage.sortMode", "cost");
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith(
+      "setContext",
+      "copilotUsage.sortMode",
+      "cost",
+    );
+  });
+
+  it("persists time sorting when the view title command runs", async () => {
+    const context = createContext("cost");
+    await activateExtension(context);
+    vi.mocked(vscode.commands.executeCommand).mockClear();
+    const sortByTime = commandCallback("copilotUsage.sortSessionsByTime");
+
+    await sortByTime();
+
+    expect(context.globalState.update).toHaveBeenCalledWith("copilotUsage.sortMode", "time");
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith(
+      "setContext",
+      "copilotUsage.sortMode",
+      "time",
+    );
+  });
+
   it("opens the newest source log for a usage tree chat", async () => {
     const openSourceLog = await activatedCommand("copilotUsage.openSourceLog");
     vi.mocked(vscode.Uri.file).mockClear();
@@ -792,11 +849,11 @@ function createDiagnostics(): UsageDiagnostics {
   };
 }
 
-function createContext(): vscode.ExtensionContext {
+function createContext(sortMode?: string): vscode.ExtensionContext {
   return {
     subscriptions: [],
     globalState: {
-      get: vi.fn(),
+      get: vi.fn((_key: string, fallback: unknown) => sortMode ?? fallback),
       update: vi.fn(),
     },
   } as unknown as vscode.ExtensionContext;
@@ -808,8 +865,8 @@ async function settle(): Promise<void> {
   await Promise.resolve();
 }
 
-async function activateExtension(): Promise<void> {
-  activate(createContext());
+async function activateExtension(context = createContext()): Promise<void> {
+  activate(context);
   await settle();
 }
 
@@ -828,6 +885,14 @@ function commandCallback(command: string): (...args: unknown[]) => Promise<unkno
   }
 
   return call[1] as (...args: unknown[]) => Promise<unknown>;
+}
+
+function registeredTreeProvider(): {
+  getChildren: (element?: UsageNode) => UsageNode[] | Promise<UsageNode[] | undefined> | undefined;
+} {
+  return vi.mocked(vscode.window.registerTreeDataProvider).mock.calls[0][1] as {
+    getChildren: (element?: UsageNode) => UsageNode[] | Promise<UsageNode[] | undefined> | undefined;
+  };
 }
 
 function createCost(usd: number): CopilotCostEstimate {
@@ -851,6 +916,37 @@ function createChatNode(sources: Array<[filePath: string, timestamp: Date]>): Us
       githubCopilot: createCost(0),
       records: sources.map(([filePath, timestamp]) => createUsageRecord(filePath, timestamp)),
     },
+  };
+}
+
+function createSummaryWithChats(chats: ChatUsageSummary[]): UsageSummary {
+  const tokens = chats.reduce((sum, chat) => sum + chat.tokens, 0);
+  const usd = chats.reduce((sum, chat) => sum + chat.githubCopilot.usd, 0);
+  return {
+    today: createTotal(tokens, usd),
+    week: createTotal(tokens, usd),
+    month: createTotal(tokens, usd),
+    allTime: createTotal(tokens, usd),
+    topModels: [],
+    chats,
+    highestSessionToday: chats[0],
+  };
+}
+
+function createChatSummary(
+  chatId: string,
+  timestamp: Date,
+  tokens: number,
+  githubUsd: number,
+): ChatUsageSummary {
+  return {
+    chatId,
+    title: chatId,
+    model: "gpt-4.1",
+    timestamp,
+    tokens,
+    githubCopilot: createCost(githubUsd),
+    records: [],
   };
 }
 
