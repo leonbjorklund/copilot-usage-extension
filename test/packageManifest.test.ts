@@ -16,6 +16,9 @@ describe('package manifest and publish contents', () => {
         };
         views: Record<string, Array<{ id: string; name: string; icon?: string }>>;
         commands: Array<{ command: string; title: string }>;
+        menus?: {
+          'view/item/context'?: Array<{ command: string; when: string; group?: string }>;
+        };
         configuration: {
           properties: Record<string, unknown>;
         };
@@ -64,7 +67,13 @@ describe('package manifest and publish contents', () => {
     expect(manifest.contributes.commands.map((command) => command.title)).toEqual([
       'Copilot Token Cost: Refresh',
       'Copilot Token Cost: Show Scan Diagnostics',
+      'Copilot Token Cost: Open Source Log',
     ]);
+    expect(manifest.contributes.menus?.['view/item/context']).toContainEqual({
+      command: 'copilotUsage.openSourceLog',
+      when: 'view == copilotUsage.views.usage && viewItem == chat',
+      group: 'navigation@1',
+    });
     expect(Object.keys(manifest.contributes.configuration.properties)).toEqual(['copilotUsage.dataPath']);
   });
 

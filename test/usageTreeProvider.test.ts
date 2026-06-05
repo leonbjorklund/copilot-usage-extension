@@ -100,6 +100,7 @@ describe('UsageTreeProvider', () => {
     expect(chatItem.label).toBe('Feature work');
     expect(chatItem.description).toBe('09:30 | gpt-4.1 | 150 (1.2$)');
     expect(chatItem.collapsibleState).toBe(vscode.TreeItemCollapsibleState.None);
+    expect(chatItem.contextValue).toBe('chat');
     expect(await provider.getChildren(chatChildren[0])).toEqual([]);
   });
 

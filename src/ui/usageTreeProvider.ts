@@ -18,7 +18,7 @@ interface UsageBucket {
   githubCopilot: CopilotCostEstimate;
 }
 
-type UsageNode =
+export type UsageNode =
   | {
       kind: "empty";
     }
@@ -106,6 +106,7 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode> {
     const item = new vscode.TreeItem(element.chat.title, vscode.TreeItemCollapsibleState.None);
     item.description = formatChatDescription(element.chat, element.bucketId);
     item.tooltip = formatChatTooltip(element.chat);
+    item.contextValue = "chat";
     return item;
   }
 }

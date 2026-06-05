@@ -72,6 +72,7 @@ vi.mock("vscode", () => ({
     registerTreeDataProvider: vi.fn(),
     showInformationMessage: vi.fn(),
     showErrorMessage: vi.fn(),
+    showQuickPick: vi.fn(),
   },
   commands: {
     executeCommand: vi.fn(),
@@ -142,9 +143,11 @@ import type {
   CopilotCostEstimate,
   ExtensionConfig,
   UsageDiagnostics,
+  UsageRecord,
   UsageSummary,
 } from "../src/core/types";
 import { activate, formatStatusBarSummary, formatStatusBarTooltip } from "../src/extension";
+import type { UsageNode } from "../src/ui/usageTreeProvider";
 
 describe("formatStatusBarTooltip", () => {
   it("formats expanded status bar tooltip", () => {
@@ -441,10 +444,8 @@ describe("activate", () => {
       show: vi.fn(),
     } as unknown as vscode.StatusBarItem;
     vi.mocked(vscode.window.createStatusBarItem).mockReturnValue(statusBar);
-    const context = createContext();
 
-    activate(context);
-    await settle();
+    await activateExtension();
 
     expect(statusBar.text).toBe("Enable Copilot logs to see token use");
     expect(statusBar.tooltip).toBeUndefined();
@@ -460,10 +461,7 @@ describe("activate", () => {
   });
 
   it("clears the setup context after a scan completes", async () => {
-    const context = createContext();
-
-    activate(context);
-    await settle();
+    await activateExtension();
 
     expect(vscode.commands.executeCommand).toHaveBeenCalledWith(
       "setContext",
@@ -473,11 +471,7 @@ describe("activate", () => {
   });
 
   it("opens the exact Copilot file logging setting", async () => {
-    const context = createContext();
-
-    activate(context);
-    await settle();
-    const openSetting = commandCallback("copilotUsage.openCopilotLoggingSetting");
+    const openSetting = await activatedCommand("copilotUsage.openCopilotLoggingSetting");
     await openSetting();
 
     expect(vscode.commands.executeCommand).toHaveBeenCalledWith(
@@ -487,12 +481,7 @@ describe("activate", () => {
   });
 
   it("opens the usage activity view directly from the status bar command", async () => {
-    const context = createContext();
-
-    activate(context);
-    await settle();
-    vi.mocked(vscode.commands.executeCommand).mockClear();
-    const openView = commandCallback("copilotUsage.openView");
+    const openView = await activatedCommand("copilotUsage.openView");
     await openView();
 
     expect(vscode.commands.executeCommand).toHaveBeenCalledTimes(1);
@@ -500,13 +489,56 @@ describe("activate", () => {
     expect(vscode.commands.executeCommand).not.toHaveBeenCalledWith("workbench.view.explorer");
   });
 
+  it("opens the newest source log for a usage tree chat", async () => {
+    const openSourceLog = await activatedCommand("copilotUsage.openSourceLog");
+    vi.mocked(vscode.Uri.file).mockClear();
+
+    await openSourceLog(
+      createChatNode([
+        ["C:/logs/new.jsonl", new Date(2026, 4, 28, 9, 0)],
+        ["C:/logs/new.jsonl", new Date(2026, 4, 28, 10, 0)],
+      ]),
+    );
+
+    expect(vscode.Uri.file).toHaveBeenCalledWith("C:/logs/new.jsonl");
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("vscode.open", {
+      fsPath: "C:/logs/new.jsonl",
+      scheme: "file",
+    });
+    expect(vscode.window.showQuickPick).not.toHaveBeenCalled();
+  });
+
+  it("asks which source log to open when a usage tree chat spans files", async () => {
+    vi.mocked(vscode.window.showQuickPick).mockImplementationOnce(async () =>
+      createSourceLogPick("C:/logs/new.jsonl"),
+    );
+    const openSourceLog = await activatedCommand("copilotUsage.openSourceLog");
+
+    await openSourceLog(
+      createChatNode([
+        ["C:/logs/old.jsonl", new Date(2026, 4, 28, 9, 0)],
+        ["C:/logs/new.jsonl", new Date(2026, 4, 28, 10, 0)],
+      ]),
+    );
+
+    expect(vscode.window.showQuickPick).toHaveBeenCalledWith(
+      [
+        createSourceLogPick("C:/logs/new.jsonl"),
+        createSourceLogPick("C:/logs/old.jsonl"),
+      ],
+      { placeHolder: "Open source log" },
+    );
+    expect(vscode.commands.executeCommand).toHaveBeenCalledWith("vscode.open", {
+      fsPath: "C:/logs/new.jsonl",
+      scheme: "file",
+    });
+  });
+
   it("creates scoped file watchers for indexed folders and updates one changed file from cache", async () => {
     vi.useFakeTimers();
     state.watchFolders = ["root/GitHub.copilot-chat"];
-    const context = createContext();
 
-    activate(context);
-    await settle();
+    await activateExtension();
 
     expect(vscode.workspace.createFileSystemWatcher).toHaveBeenCalled();
     expect(watcherRegistrations[0].pattern).toMatchObject({
@@ -533,10 +565,8 @@ describe("activate", () => {
   it("uses broad JSON watchers for the configured custom data path", async () => {
     state.watchFolders = ["C:/custom/copilot-logs"];
     readConfig.mockReturnValue(createConfig("C:/custom/copilot-logs"));
-    const context = createContext();
 
-    activate(context);
-    await settle();
+    await activateExtension();
 
     expect(watcherRegistrations[0].pattern).toMatchObject({
       baseUri: { fsPath: "C:/custom/copilot-logs" },
@@ -546,10 +576,8 @@ describe("activate", () => {
 
   it("ignores root-level JSON file events outside Copilot usage folders", async () => {
     vi.useFakeTimers();
-    const context = createContext();
 
-    activate(context);
-    await settle();
+    await activateExtension();
 
     watcherRegistrations[0].handlers.change[0]({ fsPath: "root/other-extension-state.json" });
     await vi.runAllTimersAsync();
@@ -560,10 +588,8 @@ describe("activate", () => {
 
   it("keeps existing watchers after processing a changed file", async () => {
     vi.useFakeTimers();
-    const context = createContext();
 
-    activate(context);
-    await settle();
+    await activateExtension();
     const firstWatcher = watcherRegistrations[0].watcher;
 
     watcherRegistrations[0].handlers.change[0]({ fsPath: "root/usage.jsonl" });
@@ -582,10 +608,8 @@ describe("activate", () => {
     await mkdir(usageFolder, { recursive: true });
     state.watchFolders = [root];
     locateCopilotDataPaths.mockResolvedValue([root]);
-    const context = createContext();
 
-    activate(context);
-    await settle();
+    await activateExtension();
 
     watcherRegistrations[0].handlers.create[0]({ fsPath: usageFolder });
     await vi.waitFor(() => {
@@ -601,10 +625,8 @@ describe("activate", () => {
 
   it("does not schedule folder scans for created non-directories", async () => {
     vi.useFakeTimers();
-    const context = createContext();
 
-    activate(context);
-    await settle();
+    await activateExtension();
 
     watcherRegistrations[0].handlers.create[0]({ fsPath: "root/usage.jsonl" });
     await vi.runAllTimersAsync();
@@ -616,10 +638,8 @@ describe("activate", () => {
   it("removes watchers for folders no longer needed after file events", async () => {
     vi.useFakeTimers();
     state.watchFolders = ["root/GitHub.copilot-chat", "root/GitHub.copilot-chat/session"];
-    const context = createContext();
 
-    activate(context);
-    await settle();
+    await activateExtension();
     const staleWatchers = watcherRegistrations
       .filter(
         (registration) =>
@@ -640,10 +660,8 @@ describe("activate", () => {
   it("batches changed files into one index update", async () => {
     vi.useFakeTimers();
     state.watchFolders = ["root/GitHub.copilot-chat"];
-    const context = createContext();
 
-    activate(context);
-    await settle();
+    await activateExtension();
 
     watcherRegistrations[0].handlers.change[0]({ fsPath: "root/GitHub.copilot-chat/first.jsonl" });
     watcherRegistrations[0].handlers.change[0]({ fsPath: "root/GitHub.copilot-chat/second.jsonl" });
@@ -664,10 +682,8 @@ describe("activate", () => {
   it("reuses the cached config while processing watcher events", async () => {
     vi.useFakeTimers();
     state.watchFolders = ["root/GitHub.copilot-chat"];
-    const context = createContext();
 
-    activate(context);
-    await settle();
+    await activateExtension();
     readConfig.mockClear();
 
     watcherRegistrations[0].handlers.change[0]({ fsPath: "root/GitHub.copilot-chat/usage.jsonl" });
@@ -695,10 +711,8 @@ describe("activate", () => {
       }),
       state.usageIndexResult,
     ];
-    const context = createContext();
 
-    activate(context);
-    await settle();
+    await activateExtension();
 
     const refresh = commandCallback("copilotUsage.refresh");
     await refresh();
@@ -710,10 +724,7 @@ describe("activate", () => {
   });
 
   it("manual refresh rebuilds the full index and keeps unchanged watchers", async () => {
-    const context = createContext();
-
-    activate(context);
-    await settle();
+    await activateExtension();
     const firstWatcher = watcherRegistrations[0].watcher;
 
     state.watchFolders = ["root", "root/session"];
@@ -797,7 +808,18 @@ async function settle(): Promise<void> {
   await Promise.resolve();
 }
 
-function commandCallback(command: string): () => Promise<void> {
+async function activateExtension(): Promise<void> {
+  activate(createContext());
+  await settle();
+}
+
+async function activatedCommand(command: string): Promise<(...args: unknown[]) => Promise<unknown>> {
+  await activateExtension();
+  vi.mocked(vscode.commands.executeCommand).mockClear();
+  return commandCallback(command);
+}
+
+function commandCallback(command: string): (...args: unknown[]) => Promise<unknown> {
   const call = vi
     .mocked(vscode.commands.registerCommand)
     .mock.calls.find(([registered]) => registered === command);
@@ -805,7 +827,7 @@ function commandCallback(command: string): () => Promise<void> {
     throw new Error(`Command ${command} was not registered.`);
   }
 
-  return call[1] as () => Promise<void>;
+  return call[1] as (...args: unknown[]) => Promise<unknown>;
 }
 
 function createCost(usd: number): CopilotCostEstimate {
@@ -813,5 +835,47 @@ function createCost(usd: number): CopilotCostEstimate {
     available: usd > 0,
     usd,
     aiCredits: usd * 100,
+  };
+}
+
+function createChatNode(sources: Array<[filePath: string, timestamp: Date]>): UsageNode {
+  return {
+    kind: "chat",
+    bucketId: "today",
+    chat: {
+      chatId: "chat-1",
+      title: "Feature work",
+      model: "gpt-4.1",
+      timestamp: sources.at(-1)?.[1] ?? new Date(0),
+      tokens: 0,
+      githubCopilot: createCost(0),
+      records: sources.map(([filePath, timestamp]) => createUsageRecord(filePath, timestamp)),
+    },
+  };
+}
+
+function createUsageRecord(filePath: string, timestamp: Date): UsageRecord {
+  return {
+    chatId: "chat-1",
+    title: "Feature work",
+    timestamp,
+    model: "gpt-4.1",
+    tokens: {
+      input: 0,
+      cachedInput: 0,
+      output: 0,
+      cacheWriteInput: 0,
+      total: 0,
+      source: "recorded",
+    },
+    filePath,
+  };
+}
+
+function createSourceLogPick(filePath: string): { label: string; description: string; filePath: string } {
+  return {
+    label: filePath.split("/").at(-1) ?? filePath,
+    description: filePath,
+    filePath,
   };
 }

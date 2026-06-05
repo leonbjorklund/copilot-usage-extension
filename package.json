@@ -76,8 +76,27 @@
       {
         "command": "copilotUsage.showDiagnostics",
         "title": "Copilot Token Cost: Show Scan Diagnostics"
+      },
+      {
+        "command": "copilotUsage.openSourceLog",
+        "title": "Copilot Token Cost: Open Source Log"
       }
     ],
+    "menus": {
+      "view/item/context": [
+        {
+          "command": "copilotUsage.openSourceLog",
+          "when": "view == copilotUsage.views.usage && viewItem == chat",
+          "group": "navigation@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "copilotUsage.openSourceLog",
+          "when": "false"
+        }
+      ]
+    },
     "viewsContainers": {
       "activitybar": [
         {

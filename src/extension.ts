@@ -1,4 +1,5 @@
 import { stat } from "node:fs/promises";
+import { basename } from "node:path";
 
 import * as vscode from "vscode";
 
@@ -17,7 +18,7 @@ import type {
 } from "./core/types";
 import { UsageIndex } from "./core/usageIndex";
 import { formatTokens, formatUsd } from "./ui/formatters";
-import { formatDiagnostics, UsageTreeProvider } from "./ui/usageTreeProvider";
+import { formatDiagnostics, UsageTreeProvider, type UsageNode } from "./ui/usageTreeProvider";
 
 const STATUS_BAR_DISPLAY = {
   scanningText: "Scanning Sessions...",
@@ -34,6 +35,15 @@ const CUSTOM_DATA_PATH_WATCH_GLOB = "**/*.{json,jsonl}";
 const GITHUB_COPILOT_USAGE_BASED_BILLING_URL =
   "https://docs.github.com/en/copilot/concepts/billing/usage-based-billing-for-individuals";
 const TOOLTIP_TITLE = `Cost is based on <a href="${GITHUB_COPILOT_USAGE_BASED_BILLING_URL}">GitHub Copilot Usage-based billing $(link-external)</a>`;
+
+interface SourceLogPick extends vscode.QuickPickItem {
+  filePath: string;
+}
+
+interface SourceLog {
+  filePath: string;
+  timestamp: Date;
+}
 
 function formatSessionCount(count: number): string {
   return `${count} ${count === 1 ? "session" : "sessions"}`;
@@ -222,6 +232,34 @@ export function activate(context: vscode.ExtensionContext): void {
     await vscode.commands.executeCommand("copilotUsage.views.usage.focus");
   }
 
+  async function openSourceLog(node: UsageNode | undefined): Promise<void> {
+    if (node?.kind !== "chat") {
+      return;
+    }
+
+    const sourceLogs = buildSourceLogPicks(node);
+    if (sourceLogs.length === 0) {
+      await vscode.window.showInformationMessage("No source log available for this session.");
+      return;
+    }
+
+    if (sourceLogs.length === 1) {
+      await openFile(sourceLogs[0].filePath);
+      return;
+    }
+
+    const selected = await vscode.window.showQuickPick(sourceLogs, {
+      placeHolder: "Open source log",
+    });
+    if (selected) {
+      await openFile(selected.filePath);
+    }
+  }
+
+  async function openFile(filePath: string): Promise<void> {
+    await vscode.commands.executeCommand("vscode.open", vscode.Uri.file(filePath));
+  }
+
   function applyResult(result: { summary: UsageSummary; diagnostics: UsageDiagnostics }): void {
     latestDiagnostics = result.diagnostics;
     void setSetupNeededContext(false);
@@ -377,6 +415,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.registerTreeDataProvider("copilotUsage.views.usage", treeProvider),
     vscode.commands.registerCommand("copilotUsage.refresh", () => runRefresh()),
     vscode.commands.registerCommand("copilotUsage.openView", () => openView()),
+    vscode.commands.registerCommand("copilotUsage.openSourceLog", (node?: UsageNode) =>
+      openSourceLog(node),
+    ),
     vscode.commands.registerCommand("copilotUsage.openCopilotLoggingSetting", () =>
       vscode.commands.executeCommand(
         "workbench.action.openSettings",
@@ -413,3 +454,27 @@ export function activate(context: vscode.ExtensionContext): void {
 }
 
 export function deactivate(): void {}
+
+function buildSourceLogPicks(node: Extract<UsageNode, { kind: "chat" }>): SourceLogPick[] {
+  const logsByPath = new Map<string, SourceLog>();
+
+  for (const record of node.chat.records) {
+    const existing = logsByPath.get(record.filePath);
+    if (existing && existing.timestamp >= record.timestamp) {
+      continue;
+    }
+
+    logsByPath.set(record.filePath, {
+      filePath: record.filePath,
+      timestamp: record.timestamp,
+    });
+  }
+
+  return Array.from(logsByPath.values()).sort(
+    (left, right) => right.timestamp.getTime() - left.timestamp.getTime(),
+  ).map((log) => ({
+    label: basename(log.filePath),
+    description: log.filePath,
+    filePath: log.filePath,
+  }));
+}
