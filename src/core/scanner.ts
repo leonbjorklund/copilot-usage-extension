@@ -112,7 +112,7 @@ function createDiagnostics(): ScanDiagnostics {
   };
 }
 
-function isSupportedUsageFile(fileName: string): boolean {
+export function isSupportedUsageFile(fileName: string): boolean {
   return SUPPORTED_EXTENSIONS.has(extname(fileName).toLowerCase());
 }
 
@@ -120,7 +120,7 @@ export function isIgnoredUsageCacheFile(filePath: string): boolean {
   return IGNORED_USAGE_CACHE_FILE_NAMES.has(basename(filePath).toLowerCase());
 }
 
-function uniqueResolvedPaths(paths: string[]): string[] {
+export function uniqueResolvedPaths(paths: string[]): string[] {
   return [...new Set(paths.map((path) => resolve(path)))];
 }
 

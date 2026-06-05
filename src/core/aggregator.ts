@@ -18,7 +18,6 @@ export function aggregateUsage(records: UsageRecord[], now = new Date()): UsageS
   const week = emptyTotal();
   const month = emptyTotal();
   const allTime = emptyTotal();
-  const chats = new Map<string, ChatUsageSummary>();
   const titleCandidates = new Map<string, TitleCandidate>();
   const visibleRecords: UsageRecord[] = [];
 
@@ -57,46 +56,13 @@ export function aggregateUsage(records: UsageRecord[], now = new Date()): UsageS
     visibleRecords.push(record);
   }
 
-  for (const record of visibleRecords) {
-    const title = resolveTitle(record, titleCandidates.get(record.chatId));
-    const tokens = record.tokens.total;
-    const cost = estimateRecordCost(record);
-    const existing = chats.get(record.chatId);
-
-    if (existing) {
-      existing.tokens += tokens;
-      addCost(existing.githubCopilot, cost);
-      existing.records.push(record);
-
-      if (record.timestamp > existing.timestamp) {
-        existing.title = title;
-        existing.model = record.model;
-        existing.timestamp = record.timestamp;
-      }
-    } else {
-      const chat: ChatUsageSummary = {
-        chatId: record.chatId,
-        title,
-        model: record.model,
-        timestamp: record.timestamp,
-        tokens,
-        githubCopilot: emptyCostEstimate(),
-        records: [record],
-      };
-
-      addCost(chat.githubCopilot, cost);
-      chats.set(record.chatId, chat);
-    }
-  }
-
-  const sortedChats = Array.from(chats.values())
-    .map((chat) => ({
-      ...chat,
-      records: chat.records.sort((left, right) => right.timestamp.getTime() - left.timestamp.getTime()),
-    }))
+  const sortedChats = buildChatSummaries(visibleRecords, titleCandidates)
     .sort((left, right) => right.timestamp.getTime() - left.timestamp.getTime());
 
-  const todayChats = buildTodayChatSummaries(visibleRecords, titleCandidates, now);
+  const todayChats = buildChatSummaries(
+    visibleRecords.filter((record) => isSameLocalDay(record.timestamp, now)),
+    titleCandidates,
+  );
 
   return {
     today,
@@ -110,18 +76,13 @@ export function aggregateUsage(records: UsageRecord[], now = new Date()): UsageS
   };
 }
 
-function buildTodayChatSummaries(
+function buildChatSummaries(
   records: UsageRecord[],
   titleCandidates: Map<string, TitleCandidate>,
-  now: Date,
 ): ChatUsageSummary[] {
   const chats = new Map<string, ChatUsageSummary>();
 
   for (const record of records) {
-    if (!isSameLocalDay(record.timestamp, now)) {
-      continue;
-    }
-
     const title = resolveTitle(record, titleCandidates.get(record.chatId));
     const cost = estimateRecordCost(record);
     const existing = chats.get(record.chatId);

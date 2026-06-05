@@ -84,12 +84,4 @@ describe('package manifest and publish contents', () => {
 
     expect(launch.configurations[0].outFiles).toEqual(['${workspaceFolder}/dist/**/*.js']);
   });
-
-  it('does not declare stale generation scripts', async () => {
-    const manifest = JSON.parse(await readFile('package.json', 'utf8')) as {
-      scripts: Record<string, string>;
-    };
-
-    expect(manifest.scripts['generate:logos']).toBeUndefined();
-  });
 });

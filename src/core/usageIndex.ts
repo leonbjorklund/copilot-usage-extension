@@ -10,7 +10,14 @@ import {
   type ParseUsageMode,
   type RawUsageItem,
 } from './parser';
-import { isIgnoredUsageCacheFile, isSameOrInsidePath, scanUsageFiles, type ScanDiagnostics } from './scanner';
+import {
+  isIgnoredUsageCacheFile,
+  isSameOrInsidePath,
+  isSupportedUsageFile,
+  scanUsageFiles,
+  uniqueResolvedPaths,
+  type ScanDiagnostics,
+} from './scanner';
 import type { ExtensionConfig, UsageDiagnostics, UsageRecord, UsageServiceResult } from './types';
 
 export interface UsageIndexOptions {
@@ -42,7 +49,6 @@ interface FileUsageState {
   canAppendJsonl: boolean;
 }
 
-const SUPPORTED_EXTENSIONS = new Set(['.json', '.jsonl']);
 const MAX_CONCURRENT_FILE_PARSES = 8;
 
 export class UsageIndex {
@@ -529,14 +535,6 @@ function emptyScanDiagnostics(): ScanDiagnostics {
     oversizedFiles: 0,
     unreadableFiles: 0,
   };
-}
-
-function isSupportedUsageFile(filePath: string): boolean {
-  return SUPPORTED_EXTENSIONS.has(extname(filePath).toLowerCase());
-}
-
-function uniqueResolvedPaths(paths: string[]): string[] {
-  return [...new Set(paths.map((path) => resolve(path)))];
 }
 
 function pruneNestedFolders(paths: string[]): string[] {
