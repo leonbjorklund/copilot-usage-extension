@@ -16,6 +16,14 @@ Dollar amounts use GitHub's [Copilot usage-based billing docs](https://docs.gith
 
 ## Reference
 
+Commands:
+
 - `Copilot Token Cost: Refresh` — re-scans log files and updates totals
 - `Copilot Token Cost: Show Scan Diagnostics` — shows details about skipped or unreadable files
+- `Open Source Log` — opens the log file a session was read from
+- `Sort Sessions by Cost` — orders the session list by AI Credit cost
+- `Sort Sessions by Time` — orders the session list by most recent
+
+Settings:
+
 - `copilotUsage.dataPath` — extra local folder to scan for Copilot usage data (absolute path)
