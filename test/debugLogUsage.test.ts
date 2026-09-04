@@ -150,6 +150,13 @@ describe('Copilot debug log usage', () => {
     expect(records).toEqual([]);
   });
 
+  it.each([-1, 1.5, Infinity, NaN])('rejects invalid token counts: %s', (inputTokens) => {
+    expect(normalizeRawUsage({
+      filePath: 'main.jsonl',
+      value: { type: 'llm_request', attrs: { inputTokens, copilotUsageNanoAiu: 1 } },
+    })).toEqual([]);
+  });
+
   it('marks title generation debug records hidden from explorer', () => {
     const records = normalizeRawUsage(
       {

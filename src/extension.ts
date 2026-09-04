@@ -313,7 +313,7 @@ export function activate(context: vscode.ExtensionContext): void {
         continue;
       }
 
-      watcherDisposablesByFolder.set(folder, [...registerUsageWatcher(folder)]);
+      watcherDisposablesByFolder.set(folder, registerUsageWatcher(folder));
     }
   }
 
@@ -494,8 +494,6 @@ export function activate(context: vscode.ExtensionContext): void {
 
   void runRefresh();
 }
-
-export function deactivate(): void {}
 
 function readPersistedSortMode(context: vscode.ExtensionContext): UsageTreeSortMode {
   return context.globalState.get<string>(SORT_MODE_STORAGE_KEY, "time") === "cost" ? "cost" : "time";

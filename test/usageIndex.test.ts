@@ -41,6 +41,33 @@ describe('UsageIndex', () => {
     expect(result.summary.chats.map((chat) => chat.chatId).sort()).toEqual(['json', 'jsonl']);
     expect(result.diagnostics.files).toBe(2);
     expect(result.diagnostics.normalizedRecords).toBe(2);
+
+    const unchanged = { pathsToDelete: [], pathsToUpdate: [], config: configForRoot(root) };
+    expect(await index.applyChanges({ ...unchanged, now: new Date('2026-05-28T13:00:00.000Z') })).toBe(result);
+    const nextDay = await index.applyChanges({ ...unchanged, now: new Date('2026-05-29T12:00:00.000Z') });
+    expect(nextDay.summary.today.tokens).toBe(0);
+    expect(nextDay.summary.allTime.tokens).toBe(12);
+  });
+
+  it('tracks malformed JSONL lines and skipped records in diagnostics', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    await writeFile(join(root, 'usage.jsonl'), [
+      JSON.stringify(usageRecord('usage', 150)),
+      'not-json',
+      JSON.stringify({ id: 'no-usage' }),
+    ].join('\n'));
+
+    const result = await new UsageIndex().rebuild({ roots: [root], config: configForRoot(root) });
+
+    expect(result.summary.allTime.tokens).toBe(150);
+    expect(result.summary.chats[0].chatId).toBe('usage');
+    expect(result.diagnostics).toMatchObject({
+      parsedRecords: 2,
+      normalizedRecords: 1,
+      skippedRecords: 2,
+      skippedMalformedFiles: 0,
+    });
   });
 
   it('skips files without AI Credit markers before parsing usage content', async () => {

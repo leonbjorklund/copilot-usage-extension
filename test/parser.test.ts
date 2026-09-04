@@ -3,10 +3,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { normalizeRawUsage } from '../src/core/normalizer';
-import { fileContainsText, parseUsageFile } from '../src/core/parser';
+import { parseUsageFile } from '../src/core/parser';
 
-describe('parseUsageFile and normalizeRawUsage', () => {
+describe('parseUsageFile', () => {
   const roots: string[] = [];
 
   afterEach(async () => {
@@ -14,72 +13,46 @@ describe('parseUsageFile and normalizeRawUsage', () => {
     roots.length = 0;
   });
 
-  it('skips JSON usage fixture without AI Credit marker in billed mode', async () => {
-    const filePath = join(__dirname, 'fixtures', 'sample-usage.json');
-    const result = await parseUsageFile(filePath, { mode: 'billed-usage' });
-    const records = result.items.flatMap((item) => normalizeRawUsage(item));
+  it.each(['json', 'jsonl'])('skips %s files without AI Credit markers before parsing', async (extension) => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-parser-'));
+    roots.push(root);
+    const filePath = join(root, `usage.${extension}`);
+    await writeFile(filePath, '{not valid json');
 
-    expect(result.items).toHaveLength(0);
-    expect(records).toEqual([]);
+    expect(await parseUsageFile(filePath, { mode: 'billed-usage' })).toEqual({
+      items: [], malformedRecords: 0, consumedBytes: 0,
+    });
   });
 
   it('finds AI Credit markers across streamed file chunks', async () => {
     const root = await mkdtemp(join(tmpdir(), 'copilot-usage-parser-'));
     roots.push(root);
     const filePath = join(root, 'usage.jsonl');
-    await writeFile(filePath, `prefix ${'"copilot'.padStart(4096, 'x')}UsageNanoAiu" suffix`);
-
-    await expect(fileContainsText(filePath, '"copilotUsageNanoAiu"')).resolves.toBe(true);
-  });
-
-  it('skips a JSON root array without AI Credit marker in billed mode', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-parser-'));
-    roots.push(root);
-    const filePath = join(root, 'usage.json');
-    await writeFile(
-      filePath,
-      JSON.stringify([
-        { id: 'array-first', total_tokens: 1 },
-        { id: 'array-second', total_tokens: 2 },
-      ]),
-    );
+    const value = { copilotUsageNanoAiu: 1 };
+    // Split the marker between the first two 4096-byte reads.
+    await writeFile(filePath, ' '.repeat(4090) + JSON.stringify(value) + '\n');
 
     const result = await parseUsageFile(filePath, { mode: 'billed-usage' });
-    const records = result.items.flatMap((item) => normalizeRawUsage(item));
 
-    expect(result.items).toHaveLength(0);
-    expect(records).toEqual([]);
+    expect(result.items).toEqual([{ value, filePath }]);
+    expect(result.malformedRecords).toBe(0);
   });
 
-  it('skips a JSON records container without AI Credit marker in billed mode', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-parser-'));
-    roots.push(root);
-    const filePath = join(root, 'usage.json');
-    await writeFile(
-      filePath,
-      JSON.stringify({
-        records: [
-          { id: 'records-first', total_tokens: 1 },
-          { id: 'records-second', total_tokens: 2 },
-        ],
-      }),
-    );
+  it.each(['single', 'array', 'records', 'items', 'requests', 'turns', 'chats'])(
+    'parses JSON metadata in a %s container without AI Credits', async (container) => {
+      const root = await mkdtemp(join(tmpdir(), 'copilot-usage-parser-'));
+      roots.push(root);
+      const filePath = join(root, 'usage.json');
+      const value = { kind: 1, k: ['customTitle'], v: 'Stored title' };
+      const payload = container === 'single' ? value : container === 'array' ? [value] : { [container]: [value] };
+      await writeFile(filePath, JSON.stringify(payload));
 
-    const result = await parseUsageFile(filePath, { mode: 'billed-usage' });
-    const records = result.items.flatMap((item) => normalizeRawUsage(item));
+      const result = await parseUsageFile(filePath, { mode: 'metadata' });
 
-    expect(result.items).toHaveLength(0);
-    expect(records).toEqual([]);
-  });
-
-  it('skips a JSONL usage fixture without AI Credit marker in billed mode', async () => {
-    const filePath = join(__dirname, 'fixtures', 'sample-usage.jsonl');
-    const result = await parseUsageFile(filePath, { mode: 'billed-usage' });
-    const records = result.items.flatMap((item) => normalizeRawUsage(item));
-
-    expect(result.items).toHaveLength(0);
-    expect(records).toEqual([]);
-  });
+      expect(result.items).toEqual([{ value, filePath }]);
+      expect(result.malformedRecords).toBe(0);
+    },
+  );
 
   it('parses uppercase JSONL metadata files', async () => {
     const root = await mkdtemp(join(tmpdir(), 'copilot-usage-parser-'));
@@ -112,100 +85,6 @@ describe('parseUsageFile and normalizeRawUsage', () => {
     expect(result.malformedRecords).toBe(1);
   });
 
-  it('ignores nested camel-case total token counts without AI Credits', () => {
-    const records = normalizeRawUsage(
-      {
-        filePath: 'usage.json',
-        value: {
-          id: 'nested-total',
-          usage: { totalTokens: 3000 },
-        },
-      },
-    );
-
-    expect(records).toEqual([]);
-  });
-
-  it('ignores cached total token counts without AI Credits', () => {
-    const records = normalizeRawUsage(
-      {
-        filePath: 'usage.json',
-        value: {
-          id: 'cached-total',
-          total_tokens: 3000,
-          cached_tokens: 1200,
-        },
-      },
-    );
-
-    expect(records).toEqual([]);
-  });
-
-  it('ignores split token counts without AI Credits', () => {
-    const records = normalizeRawUsage(
-      {
-        filePath: 'usage.json',
-        value: {
-          id: 'cached-split',
-          model: 'gpt-5.4',
-          input_tokens: 3000,
-          cached_tokens: 1200,
-          output_tokens: 500,
-        },
-      },
-    );
-
-    expect(records).toEqual([]);
-  });
-
-  it('ignores cache write token counts without AI Credits', () => {
-    const records = normalizeRawUsage(
-      {
-        filePath: 'usage.json',
-        value: {
-          id: 'cache-write',
-          model: 'claude-sonnet-4.6',
-          usage: {
-            input_tokens: 5000,
-            cache_write_input_tokens: 2000,
-            output_tokens: 1000,
-          },
-        },
-      },
-    );
-
-    expect(records).toEqual([]);
-  });
-
-  it('skips invalid numeric token counts', () => {
-    const records = [
-      normalizeRawUsage({ filePath: 'usage.json', value: { id: 'negative', input_tokens: -1 } }),
-      normalizeRawUsage({ filePath: 'usage.json', value: { id: 'fractional', total_tokens: 1.5 } }),
-      normalizeRawUsage({ filePath: 'usage.json', value: { id: 'infinite', output_tokens: Infinity } }),
-      normalizeRawUsage({ filePath: 'usage.json', value: { id: 'nan', total_tokens: NaN } }),
-    ].flat();
-
-    expect(records).toEqual([]);
-  });
-
-  it('skips text-only records without token counts', () => {
-    const records = normalizeRawUsage(
-      {
-        filePath: 'usage.json',
-        value: {
-          id: 'multi-message',
-          messages: [
-            { role: 'user', content: '12' },
-            { role: 'user', content: '34' },
-            { role: 'assistant', content: 'ab' },
-            { role: 'assistant', content: 'cd' },
-          ],
-        },
-      },
-    );
-
-    expect(records).toEqual([]);
-  });
   it('reports the bytes it read so incremental reads resume in the right place', async () => {
     const root = await mkdtemp(join(tmpdir(), 'copilot-usage-parser-'));
     roots.push(root);

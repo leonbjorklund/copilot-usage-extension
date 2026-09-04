@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -16,7 +16,6 @@ const {
   usageIndexInstances: [] as Array<{
     rebuild: ReturnType<typeof vi.fn>;
     applyChanges: ReturnType<typeof vi.fn>;
-    summarize: ReturnType<typeof vi.fn>;
     getWatchFolders: ReturnType<typeof vi.fn>;
   }>,
   watcherRegistrations: [] as Array<{
@@ -156,7 +155,6 @@ vi.mock("../src/core/usageIndex", () => ({
     const instance = {
       rebuild: vi.fn(() => Promise.resolve(state.rebuildResults.shift() ?? state.usageIndexResult)),
       applyChanges: vi.fn(() => Promise.resolve(state.usageIndexResult)),
-      summarize: vi.fn(() => state.usageIndexResult),
       getWatchFolders: vi.fn(() => state.watchFolders),
     };
     usageIndexInstances.push(instance);
@@ -462,6 +460,17 @@ describe("activate", () => {
   afterEach(async () => {
     await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })));
     roots.length = 0;
+  });
+
+  it("registers every command declared by the manifest", async () => {
+    const manifest = JSON.parse(await readFile("package.json", "utf8")) as {
+      contributes: { commands: Array<{ command: string }> };
+    };
+    await activateExtension();
+
+    for (const { command } of manifest.contributes.commands) {
+      expect(vscode.commands.registerCommand).toHaveBeenCalledWith(command, expect.any(Function));
+    }
   });
 
   it("shows setup action and skips scanning when Copilot file logging is disabled", async () => {

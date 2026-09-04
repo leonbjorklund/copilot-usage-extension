@@ -35,7 +35,7 @@ export async function parseUsageFile(
   filePath: string,
   options: ParseUsageFileOptions,
 ): Promise<ParseUsageFileResult> {
-  if (options.mode === 'billed-usage' && !(await fileContainsText(filePath, AI_CREDIT_MARKER))) {
+  if (options.mode === 'billed-usage' && !(await fileContainsAiCredits(filePath))) {
     return { items: [], malformedRecords: 0, consumedBytes: 0 };
   }
 
@@ -70,11 +70,7 @@ export async function parseUsageFile(
   return { items: [], malformedRecords: 0, consumedBytes };
 }
 
-export async function fileContainsText(filePath: string, needle: string): Promise<boolean> {
-  if (needle.length === 0) {
-    return true;
-  }
-
+async function fileContainsAiCredits(filePath: string): Promise<boolean> {
   const file = await open(filePath, 'r');
   try {
     const buffer = Buffer.alloc(MARKER_SCAN_CHUNK_BYTES);
@@ -87,11 +83,11 @@ export async function fileContainsText(filePath: string, needle: string): Promis
       }
 
       const content = carry + buffer.subarray(0, bytesRead).toString('utf8');
-      if (content.includes(needle)) {
+      if (content.includes(AI_CREDIT_MARKER)) {
         return true;
       }
 
-      carry = content.slice(Math.max(0, content.length - needle.length + 1));
+      carry = content.slice(-(AI_CREDIT_MARKER.length - 1));
     }
   } finally {
     await file.close();

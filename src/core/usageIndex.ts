@@ -57,9 +57,8 @@ export class UsageIndex {
   private watchFolders: string[] = [];
   private scanDiagnostics: ScanDiagnostics = emptyScanDiagnostics();
   private recordsCache: UsageRecord[] | undefined;
-  private recordsVersion = 0;
   private summaryCache:
-    | { recordsVersion: number; localDateKey: string; result: UsageServiceResult }
+    | { localDateKey: string; result: UsageServiceResult }
     | undefined;
 
   async rebuild(options: UsageIndexOptions): Promise<UsageServiceResult> {
@@ -103,13 +102,10 @@ export class UsageIndex {
     return this.summarize(options);
   }
 
-  summarize(options: UsageIndexUpdateOptions): UsageServiceResult {
+  private summarize(options: UsageIndexUpdateOptions): UsageServiceResult {
     const now = options.now ?? new Date();
     const localDateKey = formatLocalDateKey(now);
-    if (
-      this.summaryCache?.recordsVersion === this.recordsVersion &&
-      this.summaryCache.localDateKey === localDateKey
-    ) {
+    if (this.summaryCache?.localDateKey === localDateKey) {
       return this.summaryCache.result;
     }
 
@@ -119,7 +115,6 @@ export class UsageIndex {
       diagnostics: this.buildDiagnostics(),
     };
     this.summaryCache = {
-      recordsVersion: this.recordsVersion,
       localDateKey,
       result,
     };
@@ -271,7 +266,7 @@ export class UsageIndex {
       return;
     }
 
-    const normalized = normalizeItems(parsed.items, recordFilterForMode(state.mode));
+    const normalized = normalizeItems(parsed.items, state.mode);
     state.records.push(...normalized.records);
     state.parsedRecords += parsed.items.length;
     state.skippedRecords += parsed.malformedRecords + normalized.skippedRecords;
@@ -380,7 +375,6 @@ export class UsageIndex {
   }
 
   private invalidateCaches(): void {
-    this.recordsVersion += 1;
     this.recordsCache = undefined;
     this.summaryCache = undefined;
   }
@@ -424,8 +418,7 @@ function buildState(
   parsed: ParseUsageFileResult,
   canAppendJsonl: boolean,
 ): FileUsageState {
-  const normalized = normalizeItems(parsed.items, recordFilterForMode(mode));
-  const extension = extname(filePath).toLowerCase();
+  const normalized = normalizeItems(parsed.items, mode);
 
   return {
     filePath,
@@ -436,20 +429,23 @@ function buildState(
     skippedMalformedFiles: 0,
     sizeBytes,
     mtimeMs,
-    jsonlOffsetBytes: extension === '.jsonl' && canAppendJsonl ? parsed.consumedBytes : 0,
+    jsonlOffsetBytes: canAppendJsonl ? parsed.consumedBytes : 0,
     canAppendJsonl,
   };
 }
 
 function normalizeItems(
   items: RawUsageItem[],
-  recordFilter: (record: UsageRecord) => boolean = () => true,
+  mode: ParseUsageMode,
 ): { records: UsageRecord[]; skippedRecords: number } {
   const records: UsageRecord[] = [];
   let skippedRecords = 0;
 
   for (const item of items) {
-    const normalizedRecords = normalizeRawUsage(item).filter(recordFilter);
+    // Keep prompts from billed logs as title candidates, but never bill title files.
+    const normalizedRecords = normalizeRawUsage(item).filter((record) =>
+      record.metadataOnly === true || (mode === 'billed-usage' && (record.billing?.aiCredits ?? 0) > 0),
+    );
     skippedRecords += normalizedRecords.length === 0 ? 1 : 0;
     records.push(...normalizedRecords);
   }
@@ -475,20 +471,6 @@ function emptyMalformedState(filePath: string, mode: ParseUsageMode): FileUsageS
 async function fileStateKey(filePath: string): Promise<string> {
   const canonicalPath = await realpath(filePath).catch(() => resolve(filePath));
   return process.platform === 'win32' ? canonicalPath.toLowerCase() : canonicalPath;
-}
-
-function recordFilterForMode(mode: ParseUsageMode): (record: UsageRecord) => boolean {
-  if (mode === 'billed-usage') {
-    // Debug logs carry the user's prompt alongside the billed requests, so the
-    // title candidate it yields has to survive this filter to label the chat.
-    return (record) => record.metadataOnly === true || (record.billing?.aiCredits ?? 0) > 0;
-  }
-
-  if (mode === 'metadata') {
-    return (record) => record.metadataOnly === true;
-  }
-
-  return () => false;
 }
 
 function metadataChatIdFromPath(filePath: string, billedChatIds: Set<string>): string | undefined {

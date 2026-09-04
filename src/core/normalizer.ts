@@ -1,6 +1,6 @@
 import { basename, dirname } from 'node:path';
 
-import { TITLE_PRIORITY, type TokenSource, type TokenUsage, type UsageRecord } from './types';
+import { TITLE_PRIORITY, type UsageRecord } from './types';
 import type { RawUsageItem } from './parser';
 
 type RecordValue = Record<string, unknown>;
@@ -87,24 +87,6 @@ function readTimestampFromRecords(records: Array<RecordValue | undefined>): Date
   }
 
   return new Date(0);
-}
-
-function buildTokenUsage(
-  input: number,
-  output: number,
-  cachedInput = 0,
-  cacheWriteInput = 0,
-  source: TokenSource,
-  total?: number,
-): TokenUsage {
-  return {
-    input,
-    cachedInput,
-    output,
-    cacheWriteInput,
-    total: total ?? input + output,
-    source,
-  };
 }
 
 function subtractCachedTokens(
@@ -226,16 +208,6 @@ function parseAssistantResponseTitle(response: string): string | undefined {
   return undefined;
 }
 
-function buildUsageRecord(
-  item: RawUsageItem,
-  values: Omit<UsageRecord, 'filePath'>,
-): UsageRecord {
-  return {
-    ...values,
-    filePath: item.filePath,
-  };
-}
-
 function buildTitleMetadataRecord(
   item: RawUsageItem,
   chatId: string,
@@ -243,15 +215,16 @@ function buildTitleMetadataRecord(
   timestamp: Date,
   titlePriority: number,
 ): UsageRecord {
-  return buildUsageRecord(item, {
+  return {
     chatId,
     title,
     timestamp,
     model: 'unknown',
     metadataOnly: true,
     titlePriority,
-    tokens: buildTokenUsage(0, 0, 0, 0, 'missing'),
-  });
+    tokens: { input: 0, output: 0, cachedInput: 0, cacheWriteInput: 0, total: 0, source: 'missing' },
+    filePath: item.filePath,
+  };
 }
 
 function normalizeCopilotGeneratedTitleRecord(item: RawUsageItem, value: RecordValue): UsageRecord[] {
@@ -361,7 +334,7 @@ function normalizeCopilotDebugLogRecord(item: RawUsageItem, value: RecordValue):
   const childRun = isChildDebugLogFile(item.filePath);
 
   return [
-    buildUsageRecord(item, {
+    {
       chatId,
       title: debugName ?? 'Copilot debug request',
       timestamp,
@@ -372,9 +345,10 @@ function normalizeCopilotDebugLogRecord(item: RawUsageItem, value: RecordValue):
         : isGenericDebugName(debugName)
           ? TITLE_PRIORITY.generic
           : TITLE_PRIORITY.record,
-      tokens: buildTokenUsage(tokens.input, tokens.output, cachedInput, cacheWriteInput, 'recorded', tokens.total),
+      tokens: { ...tokens, cachedInput, cacheWriteInput, source: 'recorded' },
       billing,
-    }),
+      filePath: item.filePath,
+    },
   ];
 }
 
@@ -399,10 +373,5 @@ export function normalizeRawUsage(item: RawUsageItem): UsageRecord[] {
     return transcriptTitleRecords;
   }
 
-  const debugLogRecords = normalizeCopilotDebugLogRecord(item, value);
-  if (debugLogRecords.length > 0) {
-    return debugLogRecords;
-  }
-
-  return [];
+  return normalizeCopilotDebugLogRecord(item, value);
 }
