@@ -14,6 +14,21 @@ export interface UsageBilling {
   source: 'copilot-debug-log';
 }
 
+/**
+ * How much a record's title is worth as the chat's label. The normalizer stamps
+ * it; the aggregator picks the highest, and ties on a prompt go to the earliest
+ * turn while every other tie goes to the latest.
+ */
+export const TITLE_PRIORITY = {
+  custom: 5,
+  generated: 4,
+  prompt: 2,
+  record: 1,
+  generic: 0,
+  /** A subagent or title run is never the chat's label, whatever it calls itself. */
+  childRun: -1,
+} as const;
+
 export interface UsageRecord {
   chatId: string;
   title: string;

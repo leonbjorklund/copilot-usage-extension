@@ -181,7 +181,11 @@ export class UsageIndex {
       existing?.canAppendJsonl === true &&
       existing.mode === mode &&
       fileStat.size >= existing.jsonlOffsetBytes &&
-      !sameSizeRewrite
+      !sameSizeRewrite &&
+      // A rewrite that ends up longer than the old file also passes the size
+      // check, so confirm the resume point still lands on a line boundary in
+      // the file as it stands now.
+      (await endsAtLineBoundary(resolvedPath, existing.jsonlOffsetBytes))
     ) {
       await this.appendJsonlFile(resolvedPath, fileStat.size, fileStat.mtimeMs, existing);
     } else {
@@ -274,25 +278,29 @@ export class UsageIndex {
     state.jsonlOffsetBytes += parsed.consumedBytes;
     state.sizeBytes = sizeBytes;
     state.mtimeMs = mtimeMs;
-    state.canAppendJsonl = true;
-    if (parsed.items.length > 0 || parsed.malformedRecords > 0 || normalized.records.length > 0) {
+    if (parsed.items.length > 0 || parsed.malformedRecords > 0) {
       this.invalidateCaches();
     }
   }
 
   private async reparseFile(
     filePath: string,
-    options: { mode: ParseUsageMode; keepEmpty?: boolean },
+    options: { mode: ParseUsageMode; keepEmpty: boolean },
   ): Promise<void> {
     const resolvedPath = resolve(filePath);
     const stateKey = await fileStateKey(resolvedPath);
     const mode = options.mode;
-    const keepEmpty = options.keepEmpty ?? true;
+    const keepEmpty = options.keepEmpty;
     try {
       const fileStat = await stat(resolvedPath);
       const parsed = await parseUsageFile(resolvedPath, { mode });
+      // Resume from what the read actually consumed. `fileStat.size` is sampled
+      // before the read, so Copilot appending mid-read would leave those bytes
+      // both parsed and ahead of the offset, and the next append would count
+      // them a second time.
       const canAppendJsonl =
-        extname(resolvedPath).toLowerCase() === '.jsonl' && (await sizeBytesEndsAtLineBoundary(resolvedPath, fileStat.size));
+        extname(resolvedPath).toLowerCase() === '.jsonl' &&
+        (await endsAtLineBoundary(resolvedPath, parsed.consumedBytes));
       const state = buildState(
         resolvedPath,
         mode,
@@ -428,7 +436,7 @@ function buildState(
     skippedMalformedFiles: 0,
     sizeBytes,
     mtimeMs,
-    jsonlOffsetBytes: extension === '.jsonl' ? sizeBytes : 0,
+    jsonlOffsetBytes: extension === '.jsonl' && canAppendJsonl ? parsed.consumedBytes : 0,
     canAppendJsonl,
   };
 }
@@ -471,7 +479,9 @@ async function fileStateKey(filePath: string): Promise<string> {
 
 function recordFilterForMode(mode: ParseUsageMode): (record: UsageRecord) => boolean {
   if (mode === 'billed-usage') {
-    return (record) => record.metadataOnly !== true && (record.billing?.aiCredits ?? 0) > 0;
+    // Debug logs carry the user's prompt alongside the billed requests, so the
+    // title candidate it yields has to survive this filter to label the chat.
+    return (record) => record.metadataOnly === true || (record.billing?.aiCredits ?? 0) > 0;
   }
 
   if (mode === 'metadata') {
@@ -573,16 +583,25 @@ async function forEachLimited<T>(items: T[], limit: number, worker: (item: T) =>
   );
 }
 
-async function sizeBytesEndsAtLineBoundary(filePath: string, sizeBytes: number): Promise<boolean> {
+/** True when byte `sizeBytes - 1` of the file as it stands now is a line ending. */
+async function endsAtLineBoundary(filePath: string, sizeBytes: number): Promise<boolean> {
   if (sizeBytes === 0) {
     return true;
   }
 
-  const file = await open(filePath, 'r');
+  let file;
+  try {
+    file = await open(filePath, 'r');
+  } catch {
+    return false;
+  }
+
   try {
     const buffer = Buffer.alloc(1);
-    await file.read(buffer, 0, 1, sizeBytes - 1);
-    return buffer[0] === 10 || buffer[0] === 13;
+    const { bytesRead } = await file.read(buffer, 0, 1, sizeBytes - 1);
+    return bytesRead === 1 && (buffer[0] === 10 || buffer[0] === 13);
+  } catch {
+    return false;
   } finally {
     await file.close();
   }

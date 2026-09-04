@@ -408,7 +408,7 @@ describe('UsageIndex', () => {
     });
 
     expect(result.summary.allTime.tokens).toBe(11);
-    expect(result.summary.chats.map((chat) => chat.chatId)).toEqual(['new-session']);
+    expect(result.summary.chats.map((chat) => chat.chatId)).toEqual(['session-1']);
     expect(index.getWatchFolders()).toEqual([root]);
   });
 

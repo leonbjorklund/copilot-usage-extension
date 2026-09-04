@@ -9,6 +9,7 @@ import {
   readConfig,
 } from "./core/config";
 import { locateCopilotDataPaths } from "./core/locator";
+import { CopilotQuotaService } from "./core/quotaService";
 import { isSameOrInsidePath, pathContainsUsageFolder } from "./core/scanner";
 import type {
   CopilotCostEstimate,
@@ -80,7 +81,6 @@ export function formatStatusBarTooltip(summary: UsageSummary): vscode.MarkdownSt
 
   lines.push("", "---", "", ...formatHighestTodayTooltipRows(summary));
 
-  lines.push("", "---", "", "Click for detailed chat entries");
   const tooltip = new vscode.MarkdownString(lines.join("\n"), true);
   tooltip.supportHtml = true;
   return tooltip;
@@ -174,9 +174,9 @@ function setStatusBarReady(statusBar: vscode.StatusBarItem, summary: UsageSummar
   statusBar.command = "copilotUsage.openView";
 }
 
-function setStatusBarFailed(statusBar: vscode.StatusBarItem, error: unknown): void {
+function setStatusBarFailed(statusBar: vscode.StatusBarItem, message: string): void {
   statusBar.text = STATUS_BAR_DISPLAY.failedText;
-  statusBar.tooltip = error instanceof Error ? error.message : String(error);
+  statusBar.tooltip = message;
   statusBar.command = "copilotUsage.openView";
 }
 
@@ -187,9 +187,13 @@ function setStatusBarSetupNeeded(statusBar: vscode.StatusBarItem): void {
 }
 
 export function activate(context: vscode.ExtensionContext): void {
-  const treeProvider = new UsageTreeProvider(() => new Date(), readPersistedSortMode(context));
+  const initialSortMode = readPersistedSortMode(context);
+  const treeProvider = new UsageTreeProvider(() => new Date(), initialSortMode);
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   const usageIndex = new UsageIndex();
+  const quotaService = new CopilotQuotaService(
+    context.extension?.packageJSON?.version ?? "",
+  );
   let latestDiagnostics: UsageDiagnostics | undefined;
   let currentConfig: ExtensionConfig = readConfig();
   let generation = 0;
@@ -200,13 +204,15 @@ export function activate(context: vscode.ExtensionContext): void {
   const changedPaths = new Set<string>();
   const deletedPaths = new Set<string>();
 
-  statusBar.command = "copilotUsage.openView";
   setStatusBarScanning(statusBar);
   statusBar.show();
-  void setSortModeContext(readPersistedSortMode(context));
+  void setSortModeContext(initialSortMode);
 
   async function runRefresh(): Promise<void> {
     const refreshGeneration = ++generation;
+    // The credit quota is not read from the logs, so it is fetched even when
+    // logging is off and the tree is showing the setup row.
+    void quotaService.refreshNow();
     try {
       if (!isCopilotFileLoggingEnabled()) {
         treeProvider.setSetupNeeded();
@@ -231,9 +237,15 @@ export function activate(context: vscode.ExtensionContext): void {
       syncWatchers(usageIndex.getWatchFolders());
     } catch (error) {
       if (refreshGeneration === generation) {
-        setStatusBarFailed(statusBar, error);
+        reportScanFailure(error);
       }
     }
+  }
+
+  function reportScanFailure(error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
+    setStatusBarFailed(statusBar, message);
+    treeProvider.setScanFailed(message);
   }
 
   async function openView(): Promise<void> {
@@ -270,7 +282,6 @@ export function activate(context: vscode.ExtensionContext): void {
 
   function applyResult(result: { summary: UsageSummary; diagnostics: UsageDiagnostics }): void {
     latestDiagnostics = result.diagnostics;
-    void setSetupNeededContext(false);
     treeProvider.setSummary(result.summary);
     setStatusBarReady(statusBar, result.summary);
   }
@@ -400,7 +411,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const flushGeneration = eventGeneration;
       updateChain = updateChain
         .then(() => processFileEvents(pathsToUpdate, pathsToDelete, flushGeneration))
-        .catch((error: unknown) => setStatusBarFailed(statusBar, error));
+        .catch((error: unknown) => reportScanFailure(error));
     }, 100);
   }
 
@@ -426,12 +437,22 @@ export function activate(context: vscode.ExtensionContext): void {
 
     applyResult(result);
     syncWatchers(usageIndex.getWatchFolders());
+    // Copilot has just billed credits; ask GitHub for the new total once the
+    // log stops changing.
+    quotaService.scheduleRefresh();
   }
 
   context.subscriptions.push(
     statusBar,
+    // Unregister the view before the provider tears its event emitter down.
     vscode.window.registerTreeDataProvider("copilotUsage.views.usage", treeProvider),
+    treeProvider,
+    quotaService,
+    quotaService.onDidChange(() => treeProvider.setQuotaState(quotaService.getState())),
     vscode.commands.registerCommand("copilotUsage.refresh", () => runRefresh()),
+    vscode.commands.registerCommand("copilotUsage.connectQuota", () =>
+      quotaService.refreshNow({ interactive: true }),
+    ),
     vscode.commands.registerCommand("copilotUsage.openView", () => openView()),
     vscode.commands.registerCommand("copilotUsage.openSourceLog", (node?: UsageNode) =>
       openSourceLog(node),

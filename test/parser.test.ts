@@ -206,4 +206,20 @@ describe('parseUsageFile and normalizeRawUsage', () => {
 
     expect(records).toEqual([]);
   });
+  it('reports the bytes it read so incremental reads resume in the right place', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-parser-'));
+    roots.push(root);
+    const filePath = join(root, 'main.jsonl');
+    const content =
+      [
+        JSON.stringify({ type: 'llm_request', sid: 's', ts: 1, attrs: { copilotUsageNanoAiu: 1, inputTokens: 1, outputTokens: 1 } }),
+        JSON.stringify({ type: 'llm_request', sid: 's', ts: 2, attrs: { copilotUsageNanoAiu: 1, inputTokens: 1, outputTokens: 1 } }),
+      ].join('\n') + '\n';
+    await writeFile(filePath, content);
+
+    const parsed = await parseUsageFile(filePath, { mode: 'billed-usage' });
+
+    expect(parsed.items).toHaveLength(2);
+    expect(parsed.consumedBytes).toBe(Buffer.byteLength(content, 'utf8'));
+  });
 });

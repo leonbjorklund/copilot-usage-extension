@@ -64,8 +64,25 @@ vi.mock("vscode", () => ({
     Right: 2,
   },
   EventEmitter: class {
-    event = vi.fn();
-    fire = vi.fn();
+    private readonly listeners: Array<(value: unknown) => void> = [];
+    event = (listener: (value: unknown) => void) => {
+      this.listeners.push(listener);
+      return { dispose: vi.fn() };
+    };
+    fire = (value?: unknown) => {
+      for (const listener of [...this.listeners]) {
+        listener(value);
+      }
+    };
+    dispose = vi.fn();
+  },
+  ThemeIcon: class {
+    constructor(readonly id: string) {}
+  },
+  version: "1.136.0",
+  authentication: {
+    getSession: vi.fn(async () => undefined),
+    onDidChangeSessions: vi.fn(() => ({ dispose: vi.fn() })),
   },
   window: {
     createStatusBarItem: vi.fn(),
@@ -502,7 +519,8 @@ describe("activate", () => {
 
     const provider = registeredTreeProvider();
     const rootChildren = (await provider.getChildren()) ?? [];
-    const chatChildren = (await provider.getChildren(rootChildren[0])) ?? [];
+    const bucket = rootChildren.find((node) => node.kind === "bucket");
+    const chatChildren = (await provider.getChildren(bucket)) ?? [];
     expect(chatChildren.map((node) => node.kind === "chat" && node.chat.chatId)).toEqual([
       "older-expensive",
       "newer-cheaper",
@@ -791,6 +809,34 @@ describe("activate", () => {
     expect(usageIndexInstances[0].rebuild).toHaveBeenCalledTimes(2);
     expect(firstWatcher.dispose).not.toHaveBeenCalled();
     expect(watcherRegistrations).toHaveLength(2);
+  });
+
+  it("explains a failed scan in the tree instead of leaving it blank", async () => {
+    locateCopilotDataPaths.mockRejectedValueOnce(new Error("profile folder is locked"));
+
+    await activateExtension();
+
+    const rootChildren = (await registeredTreeProvider().getChildren()) ?? [];
+    expect(rootChildren.map((node) => node.kind)).toContain("error");
+  });
+
+  it("offers the consent row when GitHub grants no silent session", async () => {
+    await activateExtension();
+    await settle();
+
+    const rootChildren = (await registeredTreeProvider().getChildren()) ?? [];
+    expect(rootChildren[0]).toEqual({ kind: "quota", state: { kind: "needs-consent" } });
+  });
+
+  it("asks for consent only when the user clicks the quota row", async () => {
+    await activateExtension();
+    expect(vscode.authentication.getSession).toHaveBeenCalledWith("github", [], { silent: true });
+
+    await commandCallback("copilotUsage.connectQuota")();
+
+    expect(vscode.authentication.getSession).toHaveBeenLastCalledWith("github", [], {
+      createIfNone: true,
+    });
   });
 });
 

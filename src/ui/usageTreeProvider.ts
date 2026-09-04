@@ -6,7 +6,9 @@ import type {
   UsageDiagnostics,
   UsageSummary,
 } from "../core/types";
-import { formatTokens, formatUsd } from "./formatters";
+import { formatCredits, formatQuotaLabel } from "../core/quota";
+import type { QuotaState } from "../core/quotaService";
+import { clampCount, formatTokens, formatUsd } from "./formatters";
 
 type BucketId = "today" | "yesterday" | "older";
 export type UsageTreeSortMode = "time" | "cost";
@@ -23,6 +25,19 @@ export type UsageNode =
   | {
       kind: "empty";
     }
+  /** Scanning failed, so the tree explains itself instead of rendering blank. */
+  | {
+      kind: "error";
+      message: string;
+    }
+  | {
+      kind: "quota";
+      state: QuotaRowState;
+    }
+  /** Stands in for the welcome view when a quota row is already filling the tree. */
+  | {
+      kind: "setup";
+    }
   | {
       kind: "bucket";
       bucket: UsageBucket;
@@ -33,9 +48,11 @@ export type UsageNode =
       bucketId: BucketId;
     };
 
-export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode> {
+export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode>, vscode.Disposable {
   private summary: UsageSummary | undefined;
   private setupNeeded = false;
+  private scanError: string | undefined;
+  private quotaState: QuotaState = { kind: "idle" };
   private readonly changeEmitter = new vscode.EventEmitter<UsageNode | undefined | null | void>();
 
   readonly onDidChangeTreeData = this.changeEmitter.event;
@@ -50,32 +67,35 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode> {
     this.changeEmitter.fire();
   }
 
+  setQuotaState(state: QuotaState): void {
+    this.quotaState = state;
+    this.changeEmitter.fire();
+  }
+
   setSummary(summary: UsageSummary): void {
     this.summary = summary;
     this.setupNeeded = false;
+    this.scanError = undefined;
     this.changeEmitter.fire();
   }
 
   setSetupNeeded(): void {
     this.summary = undefined;
     this.setupNeeded = true;
+    this.scanError = undefined;
+    this.changeEmitter.fire();
+  }
+
+  setScanFailed(message: string): void {
+    this.summary = undefined;
+    this.setupNeeded = false;
+    this.scanError = message;
     this.changeEmitter.fire();
   }
 
   getChildren(element?: UsageNode): vscode.ProviderResult<UsageNode[]> {
-    if (this.setupNeeded) {
-      return [];
-    }
-
-    if (!this.summary) {
-      return [];
-    }
-
     if (!element) {
-      const buckets = buildBuckets(this.summary, this.now(), this.sortMode).map(
-        (bucket): UsageNode => ({ kind: "bucket", bucket }),
-      );
-      return buckets.length > 0 ? buckets : [{ kind: "empty" }];
+      return this.rootRows();
     }
 
     if (element.kind === "bucket") {
@@ -87,9 +107,61 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode> {
     return [];
   }
 
+  /** The credit quota does not depend on the logs, so it leads whenever it is known. */
+  private rootRows(): UsageNode[] {
+    const quota: UsageNode[] = showsQuotaRow(this.quotaState)
+      ? [{ kind: "quota", state: this.quotaState }]
+      : [];
+
+    if (this.setupNeeded) {
+      // An empty tree is what makes VS Code draw the welcome view, so the setup
+      // prompt only becomes a row once the quota row has taken that away.
+      return quota.length > 0 ? [...quota, { kind: "setup" }] : [];
+    }
+
+    if (this.scanError !== undefined) {
+      return [...quota, { kind: "error", message: this.scanError }];
+    }
+
+    if (!this.summary) {
+      return quota;
+    }
+
+    const buckets = buildBuckets(this.summary, this.now(), this.sortMode).map(
+      (bucket): UsageNode => ({ kind: "bucket", bucket }),
+    );
+    return [...quota, ...(buckets.length > 0 ? buckets : [{ kind: "empty" } as UsageNode])];
+  }
+
   getTreeItem(element: UsageNode): vscode.TreeItem {
     if (element.kind === "empty") {
-      return new vscode.TreeItem("No Copilot usage found", vscode.TreeItemCollapsibleState.None);
+      const item = new vscode.TreeItem(
+        "No Copilot usage found",
+        vscode.TreeItemCollapsibleState.None,
+      );
+      item.id = "empty";
+      return item;
+    }
+
+    if (element.kind === "error") {
+      const item = new vscode.TreeItem("Scan failed", vscode.TreeItemCollapsibleState.None);
+      item.id = "error";
+      item.iconPath = new vscode.ThemeIcon("error");
+      item.tooltip = element.message;
+      return item;
+    }
+
+    if (element.kind === "quota") {
+      return buildQuotaTreeItem(element.state);
+    }
+
+    if (element.kind === "setup") {
+      const label = "Enable Copilot logs to see token use";
+      const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
+      item.id = "setup";
+      item.iconPath = new vscode.ThemeIcon("gear");
+      item.command = { command: "copilotUsage.openCopilotLoggingSetting", title: label };
+      return item;
     }
 
     if (element.kind === "bucket") {
@@ -109,15 +181,76 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode> {
         `Tokens: ${formatExactTokens(element.bucket.tokens)}`,
         ...formatCostTooltipLines(element.bucket.githubCopilot),
       ].join("\n");
+      // Without a stable id VS Code identifies rows by position, so the quota
+      // row arriving at the top would drop whatever the user had expanded.
+      item.id = `bucket:${element.bucket.id}`;
       return item;
     }
 
     const item = new vscode.TreeItem(element.chat.title, vscode.TreeItemCollapsibleState.None);
+    item.id = `chat:${element.bucketId}:${element.chat.chatId}`;
     item.description = formatChatDescription(element.chat, element.bucketId);
     item.tooltip = formatChatTooltip(element.chat);
     item.contextValue = "chat";
     return item;
   }
+
+  dispose(): void {
+    this.changeEmitter.dispose();
+  }
+}
+
+type QuotaRowState = Extract<QuotaState, { kind: "quota" | "needs-consent" }>;
+
+function showsQuotaRow(state: QuotaState): state is QuotaRowState {
+  return state.kind === "quota" || state.kind === "needs-consent";
+}
+
+const QUOTA_CONNECT_TITLE = "Show AI Credit Quota";
+
+function buildQuotaTreeItem(state: QuotaRowState): vscode.TreeItem {
+  if (state.kind === "needs-consent") {
+    const item = new vscode.TreeItem(QUOTA_CONNECT_TITLE, vscode.TreeItemCollapsibleState.None);
+    item.id = "quota";
+    item.iconPath = new vscode.ThemeIcon("credit-card");
+    item.tooltip =
+      "Grant this extension access to your existing GitHub session to read your Copilot AI Credit quota.";
+    item.command = { command: "copilotUsage.connectQuota", title: QUOTA_CONNECT_TITLE };
+    return item;
+  }
+
+  const item = new vscode.TreeItem(
+    formatQuotaLabel(state.quota),
+    vscode.TreeItemCollapsibleState.None,
+  );
+  item.id = "quota";
+  item.iconPath = new vscode.ThemeIcon("credit-card");
+  item.description = "AI Credits left";
+  item.tooltip = formatQuotaTooltip(state);
+  return item;
+}
+
+function formatQuotaTooltip(state: Extract<QuotaState, { kind: "quota" }>): string {
+  const lines = [`Account: ${state.account}`];
+
+  if (state.quota.unlimited) {
+    lines.push("AI Credits: unlimited");
+  } else {
+    lines.push(
+      `Remaining: ${formatCredits(state.quota.remaining)} of ${formatCredits(state.quota.entitlement)}`,
+      `Used: ${formatCredits(state.quota.used)}`,
+    );
+  }
+
+  if (state.quota.resetDate) {
+    lines.push(`Resets: ${state.quota.resetDate.toLocaleDateString()}`);
+  }
+
+  if (state.quota.overageCount > 0) {
+    lines.push(`Overage used: ${formatCredits(state.quota.overageCount)}`);
+  }
+
+  return lines.join("\n");
 }
 
 function buildBuckets(
@@ -198,7 +331,7 @@ function hasDisplayableCost(cost: CopilotCostEstimate): boolean {
 }
 
 function formatExactTokens(tokens: number): string {
-  return `${Math.round(tokens)}`;
+  return `${Math.round(clampCount(tokens))}`;
 }
 
 function formatSessionCount(count: number): string {

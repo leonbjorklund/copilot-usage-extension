@@ -1,3 +1,4 @@
+import { TITLE_PRIORITY } from './types';
 import type {
   ChatUsageSummary,
   CopilotCostEstimate,
@@ -12,6 +13,14 @@ interface TitleCandidate {
   priority: number;
   timestamp: Date;
 }
+
+export const UNTITLED_CHAT_TITLE = 'Untitled chat';
+
+/**
+ * GitHub's usage-based billing docs price one AI Credit at $0.01. This is a
+ * display estimate, not the billed amount.
+ */
+const USD_PER_AI_CREDIT = 0.01;
 
 export function aggregateUsage(records: UsageRecord[], now = new Date()): UsageSummary {
   const today = emptyTotal();
@@ -186,7 +195,7 @@ function estimateRecordCost(record: UsageRecord): CopilotCostEstimate {
   const aiCredits = record.billing?.aiCredits ?? 0;
   return {
     available: aiCredits > 0,
-    usd: roundUsd(aiCredits * 0.01),
+    usd: roundUsd(aiCredits * USD_PER_AI_CREDIT),
     aiCredits,
   };
 }
@@ -213,7 +222,7 @@ function roundUsd(value: number): number {
 function collectTitleCandidate(candidates: Map<string, TitleCandidate>, record: UsageRecord): void {
   const candidate = {
     title: record.title,
-    priority: record.titlePriority ?? 1,
+    priority: record.titlePriority ?? TITLE_PRIORITY.record,
     timestamp: record.timestamp,
   };
   const existing = candidates.get(record.chatId);
@@ -228,7 +237,7 @@ function isBetterTitleCandidate(candidate: TitleCandidate, existing: TitleCandid
     return candidate.priority > existing.priority;
   }
 
-  if (candidate.priority === 2) {
+  if (candidate.priority === TITLE_PRIORITY.prompt) {
     return candidate.timestamp < existing.timestamp;
   }
 
@@ -237,16 +246,20 @@ function isBetterTitleCandidate(candidate: TitleCandidate, existing: TitleCandid
 
 function resolveTitle(record: UsageRecord, candidate: TitleCandidate | undefined): string {
   const title = candidate?.title ?? record.title;
-  if (isGenericTitle(title)) {
-    return record.chatId || title;
-  }
-
-  return title;
+  // The chat id is a UUID, which tells the reader nothing. A plain label is
+  // more useful, and the id stays available in the row tooltip.
+  return isGenericTitle(title) ? UNTITLED_CHAT_TITLE : title;
 }
 
 function isGenericTitle(title: string): boolean {
   const normalized = title.trim().toLowerCase();
-  return normalized === '' || normalized === 'panel/editagent' || normalized === 'copilot debug request';
+  return (
+    normalized === '' ||
+    normalized === 'panel/editagent' ||
+    normalized === 'copilot debug request' ||
+    // Internal request names such as `tool/runSubagent-Explore`.
+    normalized.startsWith('tool/')
+  );
 }
 
 function isSameLocalDay(left: Date, right: Date): boolean {

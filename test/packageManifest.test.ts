@@ -68,10 +68,16 @@ describe('package manifest and publish contents', () => {
     expect(manifest.contributes.commands.map((command) => command.title)).toEqual([
       'Copilot Token Cost: Refresh',
       'Copilot Token Cost: Show Scan Diagnostics',
+      'Show AI Credit Quota',
       'Open Source Log',
       'Sort Sessions by Cost',
       'Sort Sessions by Time',
     ]);
+    expect(manifest.contributes.commands).toContainEqual({
+      command: 'copilotUsage.connectQuota',
+      title: 'Show AI Credit Quota',
+      category: 'Copilot Token Cost',
+    });
     expect(manifest.contributes.commands).toContainEqual({
       command: 'copilotUsage.openSourceLog',
       title: 'Open Source Log',
@@ -105,6 +111,19 @@ describe('package manifest and publish contents', () => {
       group: 'navigation@1',
     });
     expect(Object.keys(manifest.contributes.configuration.properties)).toEqual(['copilotUsage.dataPath']);
+  });
+
+  it('registers every command the manifest declares', async () => {
+    const manifest = JSON.parse(await readFile('package.json', 'utf8')) as {
+      contributes: { commands: Array<{ command: string }> };
+    };
+    const source = await readFile('src/extension.ts', 'utf8');
+
+    const unregistered = manifest.contributes.commands
+      .map((command) => command.command)
+      .filter((id) => !source.includes(`registerCommand("${id}"`));
+
+    expect(unregistered).toEqual([]);
   });
 
   it('debugs the bundled output used by the extension host', async () => {

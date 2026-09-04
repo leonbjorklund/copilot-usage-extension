@@ -9,6 +9,12 @@ export interface RawUsageItem {
 export interface ParseUsageFileResult {
   items: RawUsageItem[];
   malformedRecords: number;
+  /**
+   * Bytes of `filePath` these items were read from. The incremental JSONL
+   * reader resumes here, so it must reflect what was actually parsed, never a
+   * size sampled before the read.
+   */
+  consumedBytes: number;
 }
 
 export type ParseUsageMode = 'billed-usage' | 'metadata';
@@ -30,37 +36,38 @@ export async function parseUsageFile(
   options: ParseUsageFileOptions,
 ): Promise<ParseUsageFileResult> {
   if (options.mode === 'billed-usage' && !(await fileContainsText(filePath, AI_CREDIT_MARKER))) {
-    return { items: [], malformedRecords: 0 };
+    return { items: [], malformedRecords: 0, consumedBytes: 0 };
   }
 
   const content = await readFile(filePath, 'utf8');
-
   const extension = extname(filePath).toLowerCase();
 
   if (extension === '.jsonl') {
     return parseJsonlContent(content, filePath);
   }
 
+  const consumedBytes = Buffer.byteLength(content, 'utf8');
+
   if (extension === '.json') {
     const parsed = JSON.parse(content) as unknown;
 
     if (Array.isArray(parsed)) {
-      return { items: itemsFromArray(parsed, filePath), malformedRecords: 0 };
+      return { items: itemsFromArray(parsed, filePath), malformedRecords: 0, consumedBytes };
     }
 
     if (parsed !== null && typeof parsed === 'object') {
       for (const key of jsonArrayContainerKeys) {
         const value = (parsed as Record<string, unknown>)[key];
         if (Array.isArray(value)) {
-          return { items: itemsFromArray(value, filePath), malformedRecords: 0 };
+          return { items: itemsFromArray(value, filePath), malformedRecords: 0, consumedBytes };
         }
       }
     }
 
-    return { items: [{ value: parsed, filePath }], malformedRecords: 0 };
+    return { items: [{ value: parsed, filePath }], malformedRecords: 0, consumedBytes };
   }
 
-  return { items: [], malformedRecords: 0 };
+  return { items: [], malformedRecords: 0, consumedBytes };
 }
 
 export async function fileContainsText(filePath: string, needle: string): Promise<boolean> {
@@ -91,7 +98,7 @@ export async function fileContainsText(filePath: string, needle: string): Promis
   }
 }
 
-export function parseJsonlContent(content: string, filePath: string): ParseUsageFileResult {
+function parseJsonlContent(content: string, filePath: string): ParseUsageFileResult {
   const items: RawUsageItem[] = [];
   let malformedRecords = 0;
 
@@ -108,23 +115,14 @@ export function parseJsonlContent(content: string, filePath: string): ParseUsage
     }
   }
 
-  return { items, malformedRecords };
+  return { items, malformedRecords, consumedBytes: Buffer.byteLength(content, 'utf8') };
 }
 
-export interface ParseCompleteJsonlLinesResult extends ParseUsageFileResult {
-  consumedBytes: number;
-}
-
-export function parseCompleteJsonlLines(content: string, filePath: string): ParseCompleteJsonlLinesResult {
+export function parseCompleteJsonlLines(content: string, filePath: string): ParseUsageFileResult {
   const lastNewline = Math.max(content.lastIndexOf('\n'), content.lastIndexOf('\r'));
   if (lastNewline === -1) {
     return { items: [], malformedRecords: 0, consumedBytes: 0 };
   }
 
-  const completeContent = content.slice(0, lastNewline + 1);
-  const parsed = parseJsonlContent(completeContent, filePath);
-  return {
-    ...parsed,
-    consumedBytes: Buffer.byteLength(completeContent, 'utf8'),
-  };
+  return parseJsonlContent(content.slice(0, lastNewline + 1), filePath);
 }

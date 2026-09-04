@@ -2,7 +2,7 @@
   "name": "copilot-usage-extension",
   "displayName": "Copilot Token Cost",
   "description": "Local Copilot token usage and AI Credit billing cost.",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "publisher": "leonbjorklund",
   "license": "MIT",
   "scripts": {
@@ -76,6 +76,11 @@
       {
         "command": "copilotUsage.showDiagnostics",
         "title": "Copilot Token Cost: Show Scan Diagnostics"
+      },
+      {
+        "command": "copilotUsage.connectQuota",
+        "title": "Show AI Credit Quota",
+        "category": "Copilot Token Cost"
       },
       {
         "command": "copilotUsage.openSourceLog",

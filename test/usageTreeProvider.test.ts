@@ -283,6 +283,106 @@ describe('UsageTreeProvider', () => {
     expect(chatItem.tooltip).not.toContain('Cost:');
   });
 
+  it('shows the AI credit quota as a flat row above the date buckets', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setSummary(createSummary());
+    provider.setQuotaState({
+      kind: 'quota',
+      account: 'octocat',
+      quota: {
+        entitlement: 1500,
+        remaining: 537.4,
+        used: 962.6,
+        percentRemaining: 35.8,
+        unlimited: false,
+        overageCount: 0,
+      },
+    });
+
+    const rootChildren = (await provider.getChildren()) ?? [];
+
+    expect(rootChildren).toHaveLength(3);
+    const item = provider.getTreeItem(rootChildren[0]);
+    expect(item.label).toBe('537 / 1,500 | 36%');
+    expect(item.description).toBe('AI Credits left');
+    expect(item.collapsibleState).toBe(vscode.TreeItemCollapsibleState.None);
+    expect(item.tooltip).toBe(
+      ['Account: octocat', 'Remaining: 537 of 1,500', 'Used: 963'].join('\n'),
+    );
+    expect(provider.getTreeItem(rootChildren[1]).label).toBe('Today');
+  });
+
+  it('offers a one-click consent row instead of the quota when access is not granted', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setSummary(createSummary());
+    provider.setQuotaState({ kind: 'needs-consent' });
+
+    const rootChildren = (await provider.getChildren()) ?? [];
+
+    const item = provider.getTreeItem(rootChildren[0]);
+    expect(item.label).toBe('Show AI Credit Quota');
+    expect(item.command).toMatchObject({ command: 'copilotUsage.connectQuota' });
+  });
+
+  it('keeps the quota row when Copilot logging is off and offers setup below it', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setSetupNeeded();
+    provider.setQuotaState({ kind: 'needs-consent' });
+
+    const rootChildren = (await provider.getChildren()) ?? [];
+
+    expect(rootChildren).toHaveLength(2);
+    expect(provider.getTreeItem(rootChildren[0]).label).toBe('Show AI Credit Quota');
+    const setup = provider.getTreeItem(rootChildren[1]);
+    expect(setup.label).toBe('Enable Copilot logs to see token use');
+    expect(setup.command).toMatchObject({
+      command: 'copilotUsage.openCopilotLoggingSetting',
+    });
+  });
+
+  it('explains a failed scan instead of drawing an empty tree', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setScanFailed('profile folder is locked');
+
+    const rootChildren = (await provider.getChildren()) ?? [];
+
+    expect(rootChildren).toHaveLength(1);
+    const item = provider.getTreeItem(rootChildren[0]);
+    expect(item.label).toBe('Scan failed');
+    expect(item.tooltip).toBe('profile folder is locked');
+
+    provider.setSummary(createSummary());
+    const afterScan = (await provider.getChildren()) ?? [];
+    expect(afterScan.map((node) => node.kind)).not.toContain('error');
+  });
+
+  it('gives every row a stable id so a late quota row keeps expansion', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setSummary(createSummary());
+
+    const rootChildren = (await provider.getChildren()) ?? [];
+    const bucket = rootChildren[0];
+    const chats = (await provider.getChildren(bucket)) ?? [];
+
+    expect(provider.getTreeItem(bucket).id).toBe('bucket:today');
+    expect(provider.getTreeItem(chats[0]).id).toBe('chat:today:chat-1');
+
+    provider.setQuotaState({ kind: 'needs-consent' });
+    const withQuota = (await provider.getChildren()) ?? [];
+    expect(provider.getTreeItem(withQuota[0]).id).toBe('quota');
+    expect(provider.getTreeItem(withQuota[1]).id).toBe('bucket:today');
+  });
+
+  it('draws no quota row while the state is idle or the account has no credits', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setSummary(createSummary());
+
+    expect((await provider.getChildren()) ?? []).toHaveLength(2);
+
+    provider.setQuotaState({ kind: 'unavailable' });
+    expect((await provider.getChildren()) ?? []).toHaveLength(2);
+  });
+
 });
 
 describe('differenceInLocalCalendarDays', () => {

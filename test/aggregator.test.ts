@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { aggregateUsage } from '../src/core/aggregator';
+import { aggregateUsage, UNTITLED_CHAT_TITLE } from '../src/core/aggregator';
 import type { UsageRecord } from '../src/core/types';
 
 describe('aggregateUsage', () => {
@@ -173,7 +173,7 @@ describe('aggregateUsage', () => {
     expect(summary.chats[0].records[0].title).toBe('panel/editAgent');
   });
 
-  it('falls back to session id before generic debug names', () => {
+  it('labels a chat as untitled when only generic debug names are available', () => {
     const now = new Date('2026-05-28T12:00:00.000Z');
     const records: UsageRecord[] = [
       {
@@ -200,7 +200,7 @@ describe('aggregateUsage', () => {
 
     const summary = aggregateUsage(records, now);
 
-    expect(summary.chats[0].title).toBe('session-1');
+    expect(summary.chats[0].title).toBe(UNTITLED_CHAT_TITLE);
   });
 
   it('ignores hidden records when selecting session titles', () => {
@@ -247,7 +247,7 @@ describe('aggregateUsage', () => {
 
     const summary = aggregateUsage(records, now);
 
-    expect(summary.chats[0].title).toBe('session-1');
+    expect(summary.chats[0].title).toBe(UNTITLED_CHAT_TITLE);
   });
 
   it('prefers stored custom titles over generated title metadata', () => {
