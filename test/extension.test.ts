@@ -79,9 +79,9 @@ vi.mock("vscode", () => ({
   ThemeIcon: class {
     constructor(readonly id: string) {}
   },
-  version: "1.136.0",
   authentication: {
     getSession: vi.fn(async () => undefined),
+    getAccounts: vi.fn(async () => []),
     onDidChangeSessions: vi.fn(() => ({ dispose: vi.fn() })),
   },
   window: {
@@ -137,6 +137,15 @@ vi.mock("vscode", () => ({
 import * as vscode from "vscode";
 
 vi.mock("../src/core/locator", () => ({ locateCopilotDataPaths }));
+vi.mock("../src/core/copilotAccount", () => ({
+  CopilotAccountWatcher: vi.fn().mockImplementation(function () {
+    return {
+      onDidChange: vi.fn(() => ({ dispose: vi.fn() })),
+      currentLogin: vi.fn(async () => undefined),
+      dispose: vi.fn(),
+    };
+  }),
+}));
 vi.mock("../src/core/config", () => ({
   COPILOT_FILE_LOGGING_SETTING: "github.copilot.chat.agentDebugLog.fileLogging.enabled",
   isCopilotFileLoggingEnabled: vi.fn(() => state.copilotFileLoggingEnabled),
@@ -475,6 +484,8 @@ describe("activate", () => {
     expect(usageIndexInstances[0].rebuild).not.toHaveBeenCalled();
     expect(locateCopilotDataPaths).not.toHaveBeenCalled();
     expect(vscode.workspace.createFileSystemWatcher).not.toHaveBeenCalled();
+    // The quota does not come from the logs, so it is still read.
+    expect(vscode.authentication.getSession).toHaveBeenCalledWith("github", [], { silent: true });
   });
 
   it("clears the setup context after a scan completes", async () => {
@@ -836,7 +847,27 @@ describe("activate", () => {
 
     expect(vscode.authentication.getSession).toHaveBeenLastCalledWith("github", [], {
       createIfNone: true,
+      clearSessionPreference: true,
     });
+  });
+
+  it("re-reads the quota once a log write has settled", async () => {
+    vi.useFakeTimers();
+    state.watchFolders = ["root/GitHub.copilot-chat"];
+
+    await activateExtension();
+    vi.mocked(vscode.authentication.getSession).mockClear();
+
+    watcherRegistrations[0].handlers.change[0]({ fsPath: "root/GitHub.copilot-chat/usage.jsonl" });
+    await vi.advanceTimersByTimeAsync(100);
+    await settle();
+    expect(vscode.authentication.getSession).not.toHaveBeenCalled();
+
+    // The settle delay and the one-minute floor both run out in fake time.
+    await vi.runAllTimersAsync();
+
+    expect(vscode.authentication.getSession).toHaveBeenCalledTimes(1);
+    expect(vscode.authentication.getSession).toHaveBeenLastCalledWith("github", [], { silent: true });
   });
 });
 
@@ -898,6 +929,7 @@ function createDiagnostics(): UsageDiagnostics {
 function createContext(sortMode?: string): vscode.ExtensionContext {
   return {
     subscriptions: [],
+    logUri: { fsPath: "C:/logs/window1/exthost/leonbjorklund.copilot-usage-extension" },
     globalState: {
       get: vi.fn((_key: string, fallback: unknown) => sortMode ?? fallback),
       update: vi.fn(),

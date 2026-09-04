@@ -8,6 +8,7 @@ import {
   isCopilotFileLoggingEnabled,
   readConfig,
 } from "./core/config";
+import { CopilotAccountWatcher } from "./core/copilotAccount";
 import { locateCopilotDataPaths } from "./core/locator";
 import { CopilotQuotaService } from "./core/quotaService";
 import { isSameOrInsidePath, pathContainsUsageFolder } from "./core/scanner";
@@ -191,9 +192,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const treeProvider = new UsageTreeProvider(() => new Date(), initialSortMode);
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   const usageIndex = new UsageIndex();
-  const quotaService = new CopilotQuotaService(
-    context.extension?.packageJSON?.version ?? "",
-  );
+  const copilotAccount = new CopilotAccountWatcher(context.logUri.fsPath);
+  const quotaService = new CopilotQuotaService(copilotAccount);
   let latestDiagnostics: UsageDiagnostics | undefined;
   let currentConfig: ExtensionConfig = readConfig();
   let generation = 0;
@@ -448,6 +448,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.registerTreeDataProvider("copilotUsage.views.usage", treeProvider),
     treeProvider,
     quotaService,
+    copilotAccount,
     quotaService.onDidChange(() => treeProvider.setQuotaState(quotaService.getState())),
     vscode.commands.registerCommand("copilotUsage.refresh", () => runRefresh()),
     vscode.commands.registerCommand("copilotUsage.connectQuota", () =>

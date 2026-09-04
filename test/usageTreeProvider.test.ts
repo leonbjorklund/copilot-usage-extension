@@ -37,6 +37,8 @@ import * as vscode from 'vscode';
 import { differenceInLocalCalendarDays, UsageTreeProvider } from '../src/ui/usageTreeProvider';
 import type { ChatUsageSummary, CopilotCostEstimate, UsageRecord, UsageSummary, UsageTotal } from '../src/core/types';
 
+const QUOTA_CLICK_HINT = 'Follows the account Copilot Chat uses. Click to re-read.';
+
 describe('UsageTreeProvider', () => {
   it('returns no tree rows when Copilot file logging is disabled so the welcome view renders', async () => {
     const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
@@ -292,7 +294,6 @@ describe('UsageTreeProvider', () => {
       quota: {
         entitlement: 1500,
         remaining: 537.4,
-        used: 962.6,
         percentRemaining: 35.8,
         unlimited: false,
         overageCount: 0,
@@ -304,12 +305,52 @@ describe('UsageTreeProvider', () => {
     expect(rootChildren).toHaveLength(3);
     const item = provider.getTreeItem(rootChildren[0]);
     expect(item.label).toBe('537 / 1,500 | 36%');
-    expect(item.description).toBe('AI Credits left');
+    expect(item.description).toBe('AI Credits left · octocat');
     expect(item.collapsibleState).toBe(vscode.TreeItemCollapsibleState.None);
     expect(item.tooltip).toBe(
-      ['Account: octocat', 'Remaining: 537 of 1,500', 'Used: 963'].join('\n'),
+      [
+        'Account: octocat',
+        'Remaining: 537 of 1,500',
+        'Used: 963',
+        '',
+        QUOTA_CLICK_HINT,
+      ].join('\n'),
     );
+    // The filled row stays clickable: that click is the account picker.
+    expect(item.command).toMatchObject({ command: 'copilotUsage.connectQuota' });
     expect(provider.getTreeItem(rootChildren[1]).label).toBe('Today');
+  });
+
+  it('describes an unlimited plan, the reset date and any overage in the tooltip', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setSummary(createSummary());
+    const resetDate = new Date(2026, 9, 1);
+    provider.setQuotaState({
+      kind: 'quota',
+      account: 'octocat',
+      quota: {
+        entitlement: Number.POSITIVE_INFINITY,
+        remaining: Number.POSITIVE_INFINITY,
+        percentRemaining: 100,
+        unlimited: true,
+        overageCount: 12,
+        resetDate,
+      },
+    });
+
+    const item = provider.getTreeItem(((await provider.getChildren()) ?? [])[0]);
+
+    expect(item.label).toBe('Unlimited AI Credits');
+    expect(item.tooltip).toBe(
+      [
+        'Account: octocat',
+        'AI Credits: unlimited',
+        `Resets: ${resetDate.toLocaleDateString()}`,
+        'Overage used: 12',
+        '',
+        QUOTA_CLICK_HINT,
+      ].join('\n'),
+    );
   });
 
   it('offers a one-click consent row instead of the quota when access is not granted', async () => {
@@ -321,7 +362,15 @@ describe('UsageTreeProvider', () => {
 
     const item = provider.getTreeItem(rootChildren[0]);
     expect(item.label).toBe('Show AI Credit Quota');
+    expect(item.description).toBeUndefined();
     expect(item.command).toMatchObject({ command: 'copilotUsage.connectQuota' });
+
+    // Naming the account makes it plain the row is following Copilot and only
+    // needs the one-time allow for that account.
+    provider.setQuotaState({ kind: 'needs-consent', account: 'hubot' });
+    const named = provider.getTreeItem(((await provider.getChildren()) ?? [])[0]);
+    expect(named.description).toBe('hubot');
+    expect(named.tooltip).toContain('Copilot Chat is signed in as hubot.');
   });
 
   it('keeps the quota row when Copilot logging is off and offers setup below it', async () => {
@@ -354,23 +403,6 @@ describe('UsageTreeProvider', () => {
     provider.setSummary(createSummary());
     const afterScan = (await provider.getChildren()) ?? [];
     expect(afterScan.map((node) => node.kind)).not.toContain('error');
-  });
-
-  it('gives every row a stable id so a late quota row keeps expansion', async () => {
-    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
-    provider.setSummary(createSummary());
-
-    const rootChildren = (await provider.getChildren()) ?? [];
-    const bucket = rootChildren[0];
-    const chats = (await provider.getChildren(bucket)) ?? [];
-
-    expect(provider.getTreeItem(bucket).id).toBe('bucket:today');
-    expect(provider.getTreeItem(chats[0]).id).toBe('chat:today:chat-1');
-
-    provider.setQuotaState({ kind: 'needs-consent' });
-    const withQuota = (await provider.getChildren()) ?? [];
-    expect(provider.getTreeItem(withQuota[0]).id).toBe('quota');
-    expect(provider.getTreeItem(withQuota[1]).id).toBe('bucket:today');
   });
 
   it('draws no quota row while the state is idle or the account has no credits', async () => {

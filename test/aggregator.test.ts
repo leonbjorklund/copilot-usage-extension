@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { aggregateUsage, UNTITLED_CHAT_TITLE } from '../src/core/aggregator';
+import { aggregateUsage } from '../src/core/aggregator';
 import type { UsageRecord } from '../src/core/types';
 
 describe('aggregateUsage', () => {
@@ -173,34 +173,37 @@ describe('aggregateUsage', () => {
     expect(summary.chats[0].records[0].title).toBe('panel/editAgent');
   });
 
-  it('labels a chat as untitled when only generic debug names are available', () => {
+  it('falls back to the session id for generic and internal request names', () => {
     const now = new Date('2026-05-28T12:00:00.000Z');
-    const records: UsageRecord[] = [
-      {
-        chatId: 'session-1',
-        title: 'panel/editAgent',
-        timestamp: new Date('2026-05-28T08:00:00Z'),
-        model: 'gpt-test',
-        titlePriority: 0,
-        tokens: {
-          input: 100,
-          cachedInput: 0,
-          output: 50,
-          cacheWriteInput: 0,
-          total: 150,
-          source: 'recorded',
+    // `tool/...` is what a subagent request calls itself; it is no chat title.
+    for (const title of ['panel/editAgent', 'tool/runSubagent-Explore']) {
+      const records: UsageRecord[] = [
+        {
+          chatId: 'session-1',
+          title,
+          timestamp: new Date('2026-05-28T08:00:00Z'),
+          model: 'gpt-test',
+          titlePriority: 1,
+          tokens: {
+            input: 100,
+            cachedInput: 0,
+            output: 50,
+            cacheWriteInput: 0,
+            total: 150,
+            source: 'recorded',
+          },
+          filePath: 'main.jsonl',
+          billing: {
+            aiCredits: 1.5,
+            source: 'copilot-debug-log',
+          },
         },
-        filePath: 'main.jsonl',
-        billing: {
-          aiCredits: 1.5,
-          source: 'copilot-debug-log',
-        },
-      },
-    ];
+      ];
 
-    const summary = aggregateUsage(records, now);
+      const summary = aggregateUsage(records, now);
 
-    expect(summary.chats[0].title).toBe(UNTITLED_CHAT_TITLE);
+      expect(summary.chats[0].title).toBe('session-1');
+    }
   });
 
   it('ignores hidden records when selecting session titles', () => {
@@ -247,7 +250,7 @@ describe('aggregateUsage', () => {
 
     const summary = aggregateUsage(records, now);
 
-    expect(summary.chats[0].title).toBe(UNTITLED_CHAT_TITLE);
+    expect(summary.chats[0].title).toBe('session-1');
   });
 
   it('prefers stored custom titles over generated title metadata', () => {

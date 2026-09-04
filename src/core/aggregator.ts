@@ -14,8 +14,6 @@ interface TitleCandidate {
   timestamp: Date;
 }
 
-export const UNTITLED_CHAT_TITLE = 'Untitled chat';
-
 /**
  * GitHub's usage-based billing docs price one AI Credit at $0.01. This is a
  * display estimate, not the billed amount.
@@ -246,9 +244,7 @@ function isBetterTitleCandidate(candidate: TitleCandidate, existing: TitleCandid
 
 function resolveTitle(record: UsageRecord, candidate: TitleCandidate | undefined): string {
   const title = candidate?.title ?? record.title;
-  // The chat id is a UUID, which tells the reader nothing. A plain label is
-  // more useful, and the id stays available in the row tooltip.
-  return isGenericTitle(title) ? UNTITLED_CHAT_TITLE : title;
+  return isGenericTitle(title) ? record.chatId || title : title;
 }
 
 function isGenericTitle(title: string): boolean {

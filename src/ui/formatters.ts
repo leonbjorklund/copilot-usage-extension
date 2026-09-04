@@ -1,14 +1,4 @@
-/**
- * Counts are sums of recorded usage, so a negative or non-finite value means a
- * defect upstream. Show zero rather than a nonsensical number in the tree.
- */
-export function clampCount(value: number): number {
-  return Number.isFinite(value) && value > 0 ? value : 0;
-}
-
-export function formatTokens(rawTokens: number): string {
-  const tokens = clampCount(rawTokens);
-
+export function formatTokens(tokens: number): string {
   if (tokens >= 1_000_000) {
     return `${Math.round(tokens / 100_000) / 10}M`;
   }
@@ -21,8 +11,7 @@ export function formatTokens(rawTokens: number): string {
   return `${Math.round(tokens)}`;
 }
 
-export function formatUsd(rawUsd: number): string {
-  const usd = clampCount(rawUsd);
+export function formatUsd(usd: number): string {
   const cents = Math.round(usd * 100);
   if (cents <= 0) {
     return "0$";

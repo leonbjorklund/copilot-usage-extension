@@ -210,10 +210,11 @@ describe('parseUsageFile and normalizeRawUsage', () => {
     const root = await mkdtemp(join(tmpdir(), 'copilot-usage-parser-'));
     roots.push(root);
     const filePath = join(root, 'main.jsonl');
+    // Multi-byte text keeps the byte count apart from the character count.
     const content =
       [
         JSON.stringify({ type: 'llm_request', sid: 's', ts: 1, attrs: { copilotUsageNanoAiu: 1, inputTokens: 1, outputTokens: 1 } }),
-        JSON.stringify({ type: 'llm_request', sid: 's', ts: 2, attrs: { copilotUsageNanoAiu: 1, inputTokens: 1, outputTokens: 1 } }),
+        JSON.stringify({ type: 'llm_request', sid: 's', ts: 2, attrs: { debugName: 'Förklara 🚀', copilotUsageNanoAiu: 1, inputTokens: 1, outputTokens: 1 } }),
       ].join('\n') + '\n';
     await writeFile(filePath, content);
 
@@ -221,5 +222,6 @@ describe('parseUsageFile and normalizeRawUsage', () => {
 
     expect(parsed.items).toHaveLength(2);
     expect(parsed.consumedBytes).toBe(Buffer.byteLength(content, 'utf8'));
+    expect(parsed.consumedBytes).not.toBe(content.length);
   });
 });

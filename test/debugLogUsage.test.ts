@@ -3,7 +3,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { UNTITLED_CHAT_TITLE } from '../src/core/aggregator';
 import {
   debugSessionIdFromFilePath,
   isChildDebugLogFile,
@@ -504,17 +503,25 @@ describe('Copilot debug log usage', () => {
       }) + '\n';
 
     await writeFile(join(folder, 'main.jsonl'), request('2026-05-28T08:00:00.000Z', 'panel/editAgent'));
-    // A subagent names itself after its own task, and its log is written after
-    // the parent turn, so a plain recency tie-break would hand it the label.
+    // A subagent names itself after its own task and gets its own prompt, and
+    // its log is written after the parent turn, so a plain recency tie-break
+    // or the prompt rule would hand it the label.
     await writeFile(
       join(folder, 'runSubagent-Explore-call_abc.jsonl'),
-      request('2026-05-28T08:00:05.000Z', 'Explore repo layout'),
+      JSON.stringify({
+        type: 'user_message',
+        sid: 'call_abc',
+        ts: Date.parse('2026-05-28T08:00:04.000Z'),
+        attrs: { content: 'Explore the repo layout' },
+      }) +
+        '\n' +
+        request('2026-05-28T08:00:05.000Z', 'Explore repo layout'),
     );
 
     const result = await rebuildUsage(root);
 
     expect(result.summary.chats).toHaveLength(1);
-    expect(result.summary.chats[0].title).toBe(UNTITLED_CHAT_TITLE);
+    expect(result.summary.chats[0].title).toBe('session-1');
     expect(result.summary.chats[0].tokens).toBe(20);
   });
 

@@ -1,15 +1,26 @@
 import * as vscode from 'vscode';
 
+import type { CopilotAccountSource } from './copilotAccount';
 import { fetchCopilotQuota, type CopilotQuota, type QuotaFetchResult } from './quota';
 
 export type QuotaState =
   | { kind: 'idle' }
-  /** No session was available silently; the user has to grant access once. */
-  | { kind: 'needs-consent' }
+  /**
+   * No session was available silently; the user has to grant access once.
+   * `account` names the Copilot Chat login that access is needed for.
+   */
+  | { kind: 'needs-consent'; account?: string }
   | { kind: 'quota'; quota: CopilotQuota; account: string }
   /** Signed in, but there is no credit quota to show for this account. */
   | { kind: 'unavailable' };
 
+/**
+ * Copilot Chat signs in through this provider unless
+ * `github.copilot.advanced.authProvider` points it at GitHub Enterprise Server,
+ * which this extension does not support: the quota endpoint lives on
+ * api.github.com. GitHub Enterprise Cloud accounts are github.com accounts.
+ */
+const AUTH_PROVIDER_ID = 'github';
 /** Wait for Copilot to stop writing before asking GitHub for new numbers. */
 const SETTLE_DELAY_MS = 10_000;
 /**
@@ -32,30 +43,46 @@ export class CopilotQuotaService implements vscode.Disposable {
   private disposed = false;
   private backoffUntil = 0;
   private backoffMs = DEFAULT_BACKOFF_MS;
-  /** GitHub rejected the cached token, so the next gesture must mint a new one. */
-  private tokenRejected = false;
 
   readonly onDidChange = this.changeEmitter.event;
 
-  constructor(private readonly pluginVersion = '') {
+  constructor(private readonly copilotAccount: CopilotAccountSource) {
     this.disposables.push(
       this.changeEmitter,
+      // Fires on sign-in, sign-out, and when this extension's preferred account
+      // changes. The floor still applies, so a burst of token refreshes is one read.
       vscode.authentication.onDidChangeSessions((event) => {
-        if (event.provider.id !== authProviderId()) {
+        if (event.provider.id !== AUTH_PROVIDER_ID) {
           return;
         }
 
-        // The event says only that something moved, so re-resolve. A new
-        // token is worth retrying immediately; a rate limit or a network
-        // failure is not, and the floor still applies either way.
-        if (this.tokenRejected) {
-          this.tokenRejected = false;
+        // A new token is the one thing that fixes a rejected one, so it does
+        // not wait out that backoff.
+        if (this.state.kind === 'needs-consent') {
           this.clearBackoff();
         }
 
         void this.refreshNow();
       }),
+      copilotAccount.onDidChange(() => void this.followCopilotAccount()),
     );
+  }
+
+  /** Copilot switched account: re-read at once, after any read already running. */
+  private async followCopilotAccount(): Promise<void> {
+    await this.inFlight;
+    const login = await this.copilotAccount.currentLogin();
+    if (this.disposed || login === undefined) {
+      return;
+    }
+
+    if (this.state.kind === 'quota' && this.state.account === login) {
+      return;
+    }
+
+    // A switch is rare and the user's own doing, so it skips the floor.
+    this.lastFetchAt = 0;
+    void this.refreshNow();
   }
 
   getState(): QuotaState {
@@ -72,21 +99,21 @@ export class CopilotQuotaService implements vscode.Disposable {
       clearTimeout(this.settleTimer);
     }
 
-    // Waiting out the floor here rather than firing early keeps the read from
-    // being dropped on arrival, which would leave the row stale until the next
-    // log write happened to land outside the window.
+    // Wait out the floor and any backoff here, so the read is not dropped on
+    // arrival and the timer does not have to poll.
     const readyAt = Math.max(this.backoffUntil, this.lastFetchAt + MIN_REFRESH_INTERVAL_MS);
-    const delay = Math.max(SETTLE_DELAY_MS, readyAt - Date.now());
-
-    this.settleTimer = setTimeout(() => {
-      this.settleTimer = undefined;
-      void this.refreshNow();
-    }, delay);
+    this.settleTimer = setTimeout(
+      () => {
+        this.settleTimer = undefined;
+        void this.refreshNow();
+      },
+      Math.max(SETTLE_DELAY_MS, readyAt - Date.now()),
+    );
   }
 
   /**
-   * @param interactive Allow the one-time access prompt. Only ever pass true
-   * from a user gesture; a background refresh must stay silent.
+   * @param interactive The user clicked. Allows the consent dialog and the
+   * account picker and skips the floor; a background refresh must stay silent.
    */
   async refreshNow(options: { interactive?: boolean } = {}): Promise<void> {
     if (this.disposed) {
@@ -95,7 +122,7 @@ export class CopilotQuotaService implements vscode.Disposable {
 
     const interactive = options.interactive === true;
     // A background read cannot raise the consent dialog, so a click waits for it
-    // rather than being answered by it. Looping means the second click joins the
+    // rather than being answered by it. Looping means a second click joins the
     // interactive run the first one started instead of opening its own dialog.
     while (this.inFlight) {
       if (!interactive || this.inFlightInteractive) {
@@ -109,20 +136,20 @@ export class CopilotQuotaService implements vscode.Disposable {
       return;
     }
 
-    // Only a user gesture may jump the queue; every automatic caller waits.
     const now = Date.now();
     if (!interactive && (now < this.backoffUntil || now - this.lastFetchAt < MIN_REFRESH_INTERVAL_MS)) {
-      // Try again once the wait is over, or the numbers stay stale until the
-      // next log write happens to land outside the window.
+      // Defer rather than drop, or the row stays stale until the next log write
+      // happens to land outside the window.
       this.scheduleRefresh();
       return;
     }
 
-    // Nothing awaits a background refresh, so a failure here must not surface
-    // as an unhandled rejection in the extension host.
     this.inFlightInteractive = interactive;
     this.inFlight = this.run(interactive)
-      .catch(() => this.enterBackoff())
+      // getSession throws while the GitHub provider is still registering at
+      // startup, and when the user cancels the dialog. Nothing awaits a
+      // background refresh, so this must not become an unhandled rejection.
+      .catch(() => this.retryLater())
       .finally(() => {
         this.inFlight = undefined;
         this.inFlightInteractive = false;
@@ -133,68 +160,82 @@ export class CopilotQuotaService implements vscode.Disposable {
   private async run(interactive: boolean): Promise<void> {
     this.lastFetchAt = Date.now();
 
-    let session: vscode.AuthenticationSession | undefined;
-    try {
-      session = await getGitHubSession(interactive, this.tokenRejected);
-    } catch {
-      // The GitHub provider can still be registering at startup. Leave the row
-      // as it is and retry later rather than telling the user to grant access
-      // they have already granted.
-      this.enterBackoff();
+    // Follow the account Copilot Chat reports. When it reports none that is
+    // signed in here, VS Code falls back to the account this extension was
+    // allowed for. The GitHub provider matches scopes as an exact set, so an
+    // empty list is the only request that matches Copilot's own session.
+    const account = await copilotAccountSignedInHere(this.copilotAccount);
+    const target = account ? { account } : {};
+    let session = await vscode.authentication.getSession(AUTH_PROVIDER_ID, [], {
+      silent: true,
+      ...target,
+    });
+    if (
+      interactive &&
+      (!session || (!account && (this.state.kind !== 'quota' || (await hasSeveralAccounts()))))
+    ) {
+      // VS Code asks for consent to Copilot's account. Only when that account
+      // is unknown does it show its picker instead, which also offers signing
+      // in again; clearing the preference is what brings the picker back.
+      session = await vscode.authentication.getSession(AUTH_PROVIDER_ID, [], {
+        createIfNone: true,
+        ...(account ? target : { clearSessionPreference: true }),
+      });
+    }
+
+    if (this.disposed) {
       return;
     }
 
     if (!session) {
-      this.setState({ kind: 'needs-consent' });
+      this.setState({ kind: 'needs-consent', account: account?.label });
       return;
     }
 
-    const result = await fetchCopilotQuota({
-      token: session.accessToken,
-      editorVersion: `vscode/${vscode.version}`,
-      pluginVersion: this.pluginVersion ? `copilot-token-cost/${this.pluginVersion}` : undefined,
-    });
-
-    this.applyResult(result, session);
+    const result = await fetchCopilotQuota({ token: session.accessToken });
+    if (!this.disposed) {
+      this.applyResult(result, session);
+    }
   }
 
   private applyResult(result: QuotaFetchResult, session: vscode.AuthenticationSession): void {
     switch (result.kind) {
       case 'quota':
-        this.tokenRejected = false;
         this.clearBackoff();
-        this.setState({
-          kind: 'quota',
-          quota: result.quota,
-          account: session.account.label,
-        });
+        this.setState({ kind: 'quota', quota: result.quota, account: session.account.label });
         return;
       case 'no-quota':
-        this.tokenRejected = false;
         this.clearBackoff();
         this.setState({ kind: 'unavailable' });
         return;
       case 'unauthorized':
-        // The cached token is stale, and only a user gesture can mint a new
-        // one. Keep a row in the tree so re-granting is one click away instead
-        // of the quota silently disappearing.
-        this.tokenRejected = true;
-        this.setState({ kind: 'needs-consent' });
+        // The token is stale. Keep a row so the state shows. The fix is a fresh
+        // sign-in from the Accounts menu, which fires onDidChangeSessions and
+        // clears this backoff; re-sending the same token on a timer buys nothing.
+        this.setState({ kind: 'needs-consent', account: session.account.label });
         this.enterBackoff();
         return;
       case 'rate-limited':
-        this.enterBackoff(result.retryAfterMs);
+        this.retryLater(result.retryAfterMs);
         return;
       case 'error':
-        this.enterBackoff();
+        this.retryLater();
         return;
     }
   }
 
   private enterBackoff(retryAfterMs?: number): void {
-    const delay = retryAfterMs ?? this.backoffMs;
-    this.backoffUntil = Date.now() + delay;
+    this.backoffUntil = Date.now() + (retryAfterMs ?? this.backoffMs);
     this.backoffMs = Math.min(this.backoffMs * 2, MAX_BACKOFF_MS);
+  }
+
+  /**
+   * Back off, then retry on its own. With logging off there are no log writes
+   * to trigger a read, and the row would otherwise stay missing all session.
+   */
+  private retryLater(retryAfterMs?: number): void {
+    this.enterBackoff(retryAfterMs);
+    this.scheduleRefresh();
   }
 
   private clearBackoff(): void {
@@ -203,8 +244,7 @@ export class CopilotQuotaService implements vscode.Disposable {
   }
 
   private setState(state: QuotaState): void {
-    // Unchanged numbers must not redraw the tree once a minute. Comparing every
-    // field means no addition to the row can slip past unnoticed.
+    // Unchanged numbers must not redraw the tree once a minute.
     if (JSON.stringify(this.state) === JSON.stringify(state)) {
       return;
     }
@@ -227,36 +267,18 @@ export class CopilotQuotaService implements vscode.Disposable {
   }
 }
 
-function authProviderId(): string {
-  const configured = vscode.workspace
-    .getConfiguration()
-    .get<string>('github.copilot.advanced.authProvider');
-  if (configured === 'github-enterprise' || configured === 'github') {
-    return configured;
-  }
-
-  const enterpriseUri = vscode.workspace.getConfiguration().get<string>('github-enterprise.uri');
-  return enterpriseUri && enterpriseUri.trim().length > 0 ? 'github-enterprise' : 'github';
+async function hasSeveralAccounts(): Promise<boolean> {
+  return (await vscode.authentication.getAccounts(AUTH_PROVIDER_ID)).length > 1;
 }
 
-async function getGitHubSession(
-  interactive: boolean,
-  tokenRejected: boolean,
-): Promise<vscode.AuthenticationSession | undefined> {
-  const providerId = authProviderId();
-  // The GitHub provider matches scopes as an exact set, so an empty list is
-  // the only request that matches whatever session Copilot already established.
-  const session = await vscode.authentication.getSession(providerId, [], { silent: true });
-  if (!interactive || (session && !tokenRejected)) {
-    return session;
+async function copilotAccountSignedInHere(
+  source: CopilotAccountSource,
+): Promise<vscode.AuthenticationSessionAccountInformation | undefined> {
+  const login = await source.currentLogin();
+  if (login === undefined) {
+    return undefined;
   }
 
-  // Only reached from a user gesture. With no session this is a consent
-  // dialog for the one Copilot already holds; after GitHub rejected that
-  // token, replacing it is the only way back and needs a real sign-in.
-  return await vscode.authentication.getSession(
-    providerId,
-    [],
-    tokenRejected ? { forceNewSession: true } : { createIfNone: true },
-  );
+  const accounts = await vscode.authentication.getAccounts(AUTH_PROVIDER_ID);
+  return accounts.find((account) => account.label === login);
 }

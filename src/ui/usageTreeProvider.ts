@@ -8,7 +8,7 @@ import type {
 } from "../core/types";
 import { formatCredits, formatQuotaLabel } from "../core/quota";
 import type { QuotaState } from "../core/quotaService";
-import { clampCount, formatTokens, formatUsd } from "./formatters";
+import { formatTokens, formatUsd } from "./formatters";
 
 type BucketId = "today" | "yesterday" | "older";
 export type UsageTreeSortMode = "time" | "cost";
@@ -135,17 +135,11 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode>, vs
 
   getTreeItem(element: UsageNode): vscode.TreeItem {
     if (element.kind === "empty") {
-      const item = new vscode.TreeItem(
-        "No Copilot usage found",
-        vscode.TreeItemCollapsibleState.None,
-      );
-      item.id = "empty";
-      return item;
+      return new vscode.TreeItem("No Copilot usage found", vscode.TreeItemCollapsibleState.None);
     }
 
     if (element.kind === "error") {
       const item = new vscode.TreeItem("Scan failed", vscode.TreeItemCollapsibleState.None);
-      item.id = "error";
       item.iconPath = new vscode.ThemeIcon("error");
       item.tooltip = element.message;
       return item;
@@ -158,7 +152,6 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode>, vs
     if (element.kind === "setup") {
       const label = "Enable Copilot logs to see token use";
       const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
-      item.id = "setup";
       item.iconPath = new vscode.ThemeIcon("gear");
       item.command = { command: "copilotUsage.openCopilotLoggingSetting", title: label };
       return item;
@@ -181,14 +174,10 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode>, vs
         `Tokens: ${formatExactTokens(element.bucket.tokens)}`,
         ...formatCostTooltipLines(element.bucket.githubCopilot),
       ].join("\n");
-      // Without a stable id VS Code identifies rows by position, so the quota
-      // row arriving at the top would drop whatever the user had expanded.
-      item.id = `bucket:${element.bucket.id}`;
       return item;
     }
 
     const item = new vscode.TreeItem(element.chat.title, vscode.TreeItemCollapsibleState.None);
-    item.id = `chat:${element.bucketId}:${element.chat.chatId}`;
     item.description = formatChatDescription(element.chat, element.bucketId);
     item.tooltip = formatChatTooltip(element.chat);
     item.contextValue = "chat";
@@ -208,14 +197,17 @@ function showsQuotaRow(state: QuotaState): state is QuotaRowState {
 
 const QUOTA_CONNECT_TITLE = "Show AI Credit Quota";
 
+const QUOTA_CONNECT_COMMAND = { command: "copilotUsage.connectQuota", title: QUOTA_CONNECT_TITLE };
+
 function buildQuotaTreeItem(state: QuotaRowState): vscode.TreeItem {
   if (state.kind === "needs-consent") {
     const item = new vscode.TreeItem(QUOTA_CONNECT_TITLE, vscode.TreeItemCollapsibleState.None);
-    item.id = "quota";
     item.iconPath = new vscode.ThemeIcon("credit-card");
+    item.description = state.account;
     item.tooltip =
-      "Grant this extension access to your existing GitHub session to read your Copilot AI Credit quota.";
-    item.command = { command: "copilotUsage.connectQuota", title: QUOTA_CONNECT_TITLE };
+      "Grant this extension access to your GitHub account to read your Copilot AI Credit quota." +
+      (state.account ? ` Copilot Chat is signed in as ${state.account}.` : "");
+    item.command = QUOTA_CONNECT_COMMAND;
     return item;
   }
 
@@ -223,10 +215,10 @@ function buildQuotaTreeItem(state: QuotaRowState): vscode.TreeItem {
     formatQuotaLabel(state.quota),
     vscode.TreeItemCollapsibleState.None,
   );
-  item.id = "quota";
   item.iconPath = new vscode.ThemeIcon("credit-card");
-  item.description = "AI Credits left";
+  item.description = `AI Credits left · ${state.account}`;
   item.tooltip = formatQuotaTooltip(state);
+  item.command = QUOTA_CONNECT_COMMAND;
   return item;
 }
 
@@ -238,7 +230,7 @@ function formatQuotaTooltip(state: Extract<QuotaState, { kind: "quota" }>): stri
   } else {
     lines.push(
       `Remaining: ${formatCredits(state.quota.remaining)} of ${formatCredits(state.quota.entitlement)}`,
-      `Used: ${formatCredits(state.quota.used)}`,
+      `Used: ${formatCredits(state.quota.entitlement - state.quota.remaining)}`,
     );
   }
 
@@ -250,6 +242,7 @@ function formatQuotaTooltip(state: Extract<QuotaState, { kind: "quota" }>): stri
     lines.push(`Overage used: ${formatCredits(state.quota.overageCount)}`);
   }
 
+  lines.push("", "Follows the account Copilot Chat uses. Click to re-read.");
   return lines.join("\n");
 }
 
@@ -331,7 +324,7 @@ function hasDisplayableCost(cost: CopilotCostEstimate): boolean {
 }
 
 function formatExactTokens(tokens: number): string {
-  return `${Math.round(clampCount(tokens))}`;
+  return `${Math.round(tokens)}`;
 }
 
 function formatSessionCount(count: number): string {

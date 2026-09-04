@@ -12,14 +12,6 @@ describe('formatTokens', () => {
     expect(formatTokens(1_240_000)).toBe('1.2M');
     expect(formatTokens(22_000_000)).toBe('22M');
   });
-
-  it('shows zero rather than a nonsensical count', () => {
-    // A negative or non-finite total means a defect upstream; the tree must not
-    // print it either way.
-    expect(formatTokens(-150)).toBe('0');
-    expect(formatTokens(Number.NaN)).toBe('0');
-    expect(formatTokens(Number.POSITIVE_INFINITY)).toBe('0');
-  });
 });
 
 describe('formatUsd', () => {
