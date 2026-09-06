@@ -458,10 +458,10 @@ describe("formatStatusBarTooltip", () => {
         roots: [preview.root], config: createConfig(), now: preview.now,
       });
       const quota = preview.quotaState.kind === "quota" ? preview.quotaState.quota : undefined;
-      expect(formatStatusBarSummary(summary, quota, preview.now)).toBe("2.1M | 0.87$ • 44/100%");
+      expect(formatStatusBarSummary(summary, quota, preview.now)).toBe("2.1M | 0.87$ • 50/100%");
       const tooltip = formatStatusBarTooltip(summary).value;
-      expect(tooltip).toContain("<strong>Month:</strong> 7.8M (6.59$)");
-      expect(tooltip).toContain("<strong>All time:</strong> 13.5M (10.79$)");
+      expect(tooltip).toContain("<strong>Month:</strong> 8.7M (7.49$)");
+      expect(tooltip).toContain("<strong>All time:</strong> 15.1M (12.38$)");
       expect(tooltip).toContain("Investigate quota refresh behavior");
       expect(tooltip).toContain("Refactor the usage scanner");
       expect(tooltip).not.toContain("Last 30 days");

@@ -11,6 +11,10 @@ function decodeImages(html: string): string[] {
     .map((match) => Buffer.from(match[1], 'base64').toString());
 }
 
+function barHeight(svg: string): number {
+  return Number(svg.match(/width="9" height="([^"]+)"/)?.[1] ?? 0);
+}
+
 function record(date: Date, credits: number): UsageRecord {
   return {
     chatId: date.toISOString(), title: 'Usage', timestamp: date, model: 'model', filePath: 'mock.jsonl',
@@ -58,7 +62,7 @@ describe('tooltip graph calculations', () => {
     const html = formatTooltipGraphPrototype(summary, undefined, now);
     const images = decodeImages(html);
     expect(images).toHaveLength(31); // Thirty columns plus the date axis.
-    expect(images[28]).toContain('height="15" rx="1"');
+    expect(barHeight(images[28])).toBeCloseTo(17.84, 2);
     expect(images[29]).toContain('height="30" rx="1"');
     expect(images[0]).not.toContain('<rect');
     expect(html).toContain('title="23 Aug · no usage"');
@@ -70,6 +74,49 @@ describe('tooltip graph calculations', () => {
     const html = formatTooltipGraphPrototype(aggregateUsage([], now), undefined, now);
     expect(html.match(/ title="[^"]+no usage"/g)).toHaveLength(30);
     expect(decodeImages(html).join('')).not.toMatch(/NaN|Infinity/);
+  });
+
+  it.each([
+    { spike: 1500, smallHeight: 3.17 },
+    { spike: 3000, smallHeight: 1.89 },
+  ])('gently scales beside a $spike-credit spike while preserving hover values', ({ spike, smallHeight }) => {
+    const now = new Date(2026, 8, 21, 12);
+    const quota = {
+      entitlement: 1500, remaining: 0, percentRemaining: 0, unlimited: false, overageCount: 0,
+      resetDate: new Date('2026-10-01T00:00:00Z'),
+    };
+    const credits = [75, 75, 75, 75, 150, spike];
+    const summary = aggregateUsage(credits.map((value, i) =>
+      record(new Date(2026, 8, 16 + i, 12), value)), now);
+    const html = formatTooltipGraphPrototype(summary, quota, now);
+    const images = decodeImages(html);
+    expect(barHeight(images[24])).toBeCloseTo(smallHeight, 2);
+    expect(barHeight(images[28]) / barHeight(images[24])).toBeCloseTo(1.68, 2);
+    expect(barHeight(images[29])).toBe(30);
+    expect(images[29]).not.toContain('8l9 -3');
+    expect(html).toContain(`title="21 Sept · ${(spike / 15).toFixed(1)}% · 100 (${spike / 100}$)"`);
+    expect(html).not.toContain('capped');
+  });
+
+  it.each([
+    { credits: [75] },
+    { credits: [75, 75, 75, 1500] },
+    { credits: [75, 75, 75, 75, 75] },
+    { credits: [75, 75, 75, 1500, 1500] },
+    { credits: [0.001, 1500] },
+  ])('handles sparse, steady and tiny usage: $credits', ({ credits }) => {
+    const now = new Date(2026, 8, 21, 12);
+    const summary = aggregateUsage(credits.map((value, i) =>
+      record(new Date(2026, 8, 21 - credits.length + 1 + i, 12), value)), now);
+    const html = formatTooltipGraphPrototype(summary, undefined, now);
+    const images = decodeImages(html);
+    const heights = images.slice(0, 30).map(barHeight);
+    expect(heights.filter((height) => height > 0)).toHaveLength(credits.length);
+    expect(Math.max(...heights)).toBe(30);
+    expect(heights.every((height) => height === 0 || height >= 1.5)).toBe(true);
+    if (credits[0] === 0.001) expect(heights[28]).toBe(1.5);
+    expect(html).not.toContain('capped');
+    expect(images.join('')).not.toMatch(/NaN|Infinity/);
   });
 
   it.each([

@@ -3,12 +3,12 @@
 ## Current state and next step
 
 - Work stays on `menu-design`. This is a preview checkpoint, not a production rollout; do not merge, package, install, or wire the graph into the normal tooltip yet.
-- The user manually verified the graph, daily native tooltips, and early-period caption placement in the VS Code preview. More UI tweaks remain. A distinct today-bar style was discussed but not chosen.
-- Continue the remaining UI tweaks with the user in preview. Preserve the accepted native hover behavior and content. Production wiring needs a later explicit request.
+- The user accepted the shorter graph, `avg.` label with spaced ` / day`, the `0.75` power scale, and mock usage with quiet days and a few busier standouts. Daily native tooltips and early-period caption placement were manually verified in preview. A distinct today-bar style was discussed but not chosen.
+- Next, check the accepted preview in light and high-contrast themes; non-Windows font fallback also needs verification before production wiring. Preserve the accepted native hover behavior and content. Production wiring needs a later explicit request.
 - Run `npm run preview` from the repo root to compile and open an Extension Development Host with mock input. Hover the status bar and move across populated and empty columns. Each column should show its date and values or `no usage`; the caption should remain inside its existing axis row.
 - The default mock date is 1 October 2026 at local noon, with only one day in the new period. To inspect another date, change the default in `src/dev/usagePreview.ts` and rerun preview. The 21 September fixture remains in tests.
 - `src/dev/tooltipGraphPrototype.ts` renders thirty adjacent full-height SVG images with native HTML `title` attributes, plus an axis image. `src/extension.ts` appends it only when `COPILOT_USAGE_PREVIEW=1` and the extension runs in Development mode. Theme changes refresh the preview.
-- `src/dev/usagePreview.ts` writes temporary raw JSONL inputs for the normal `UsageIndex` pipeline and supplies mock quota. Preview does not read real usage or request account quota. `src/core/aggregator.ts` owns the daily rollup; `src/ui/formatters.ts` shares quota validation and formats the status percentage as `44/100%`.
+- `src/dev/usagePreview.ts` writes temporary raw JSONL inputs for the normal `UsageIndex` pipeline and supplies mock quota. The fixture is illustrative, not a measured average user. Preview does not read real usage or request account quota. `src/core/aggregator.ts` owns the daily rollup; `src/ui/formatters.ts` shares quota validation and formats the status percentage as `{spentPct}/100%`.
 - Verification commands are `npm run compile` and `npm test`. Graph tests cover empty days, fractional credits, caption placement, missing or stale quota, and local/UTC month disagreement. Extension tests cover preview isolation and theme refresh. Light/high-contrast appearance and non-Windows font fallback still need manual checks before production wiring.
 
 ## Behavior
@@ -29,7 +29,7 @@ Visual reference: `Tooltip-Spec-v32.html` (open in a browser; hover the bars). I
 
 Append below the existing tooltip content:
 
-1. `Last 30 days` header, right side `{avgTokens} ({avgUsd}$)/day`
+1. `Last 30 days` header, right side `avg. {avgTokens} ({avgUsd}$) / day`
 2. the graph (§2)
 3. the axis row (§3)
 
@@ -43,10 +43,16 @@ The colours in §5 are the dark-theme reference.
 Rolling 30 days, always. One slot per day for `today-29 … today`; zero-usage
 days keep their slot and draw no bar, so the axis stays linear in time.
 
-Bar height represents daily credit usage on a shared scale; every positive-usage
-day has a visible bar. Bars before the current period are dimmed, and bars inside
-it are brighter. Match the bar spacing, proportions, rounded corners, baseline,
-and period ticks in the visual reference.
+Bar height uses `max(1.5, (dayCredits / largestDayCredits) ** 0.75 * 30)` for
+positive usage. The largest day across all 30 days gets 30px; smaller days are
+gently lifted, so height ratios are not exact usage ratios. Zero days draw no bar.
+There are no caps or slash markers; hover values remain unchanged. The scale
+updates with the rolling window, independently of the account quota.
+
+Each column image is 44px tall, with a baseline at 35px and a separate 18px date
+axis. Bars before the current period are dimmed, and bars inside it are brighter.
+These accepted dimensions and scaling supersede the original visual reference;
+retain its bar spacing and rounded corners.
 
 Hover behaviour:
 

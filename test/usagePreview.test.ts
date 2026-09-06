@@ -19,11 +19,11 @@ describe('mock usage through the real pipeline', () => {
     expect(summary.today.tokens).toBe(2_100_000);
     expect(summary.today.githubCopilot.aiCredits).toBe(87);
     expect(summary.today.githubCopilot.usd).toBeCloseTo(0.87);
-    expect(summary.month.tokens).toBe(7_820_000);
-    expect(summary.month.githubCopilot.aiCredits).toBe(659);
-    expect(summary.allTime.tokens).toBe(13_520_000);
-    expect(summary.allTime.githubCopilot.aiCredits).toBe(1_079);
-    expect(summary.allTime.githubCopilot.usd).toBeCloseTo(10.79);
+    expect(summary.month.tokens).toBe(8_720_000);
+    expect(summary.month.githubCopilot.aiCredits).toBe(749);
+    expect(summary.allTime.tokens).toBe(15_110_000);
+    expect(summary.allTime.githubCopilot.aiCredits).toBe(1_238);
+    expect(summary.allTime.githubCopilot.usd).toBeCloseTo(12.38);
     expect(summary.topModels).toHaveLength(3);
     expect(summary.highestSessionToday?.title).toBe('Refactor the usage scanner');
     expect(summary.mostExpensiveSessionToday?.title).toBe('Investigate quota refresh behavior');
@@ -38,7 +38,7 @@ describe('mock usage through the real pipeline', () => {
     expect(preview.quotaState.kind).toBe('quota');
     if (preview.quotaState.kind === 'quota') {
       expect(preview.quotaState.quota.entitlement).toBe(1_500);
-      expect(preview.quotaState.quota.remaining).toBeCloseTo(841);
+      expect(preview.quotaState.quota.remaining).toBeCloseTo(751);
       expect(preview.quotaState.quota.resetDate).toEqual(new Date('2026-10-01T00:00:00.000Z'));
     }
   });

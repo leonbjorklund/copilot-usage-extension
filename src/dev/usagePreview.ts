@@ -6,9 +6,10 @@ import { parseCopilotQuota } from '../core/quota';
 import type { QuotaState } from '../core/quotaService';
 
 // Oldest to newest across the rolling 30-day window.
+// Illustrative mix of quiet days, ordinary work and a few busier sessions.
 export const PREVIEW_DAILY_CREDITS = [
-  0, 0, 12, 34, 28, 0, 0, 41, 55, 47, 33, 0, 0, 61, 52,
-  18, 0, 0, 44, 39, 58, 22, 0, 0, 48, 31, 26, 64, 29, 87,
+  0, 0, 12, 34, 28, 0, 0, 110, 55, 47, 33, 0, 0, 95, 52,
+  18, 0, 0, 44, 39, 58, 22, 0, 0, 48, 31, 26, 120, 29, 87,
 ];
 
 const MODELS = ['gpt-5.6-luna', 'claude-sonnet-4.6', 'gemini-3.5-flash'];

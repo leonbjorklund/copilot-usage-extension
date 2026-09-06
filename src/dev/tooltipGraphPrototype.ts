@@ -40,7 +40,8 @@ export function formatTooltipGraphPrototype(
   const columns = days.map((day, index) => {
     const columnWidth = edge(index + 1) - edge(index);
     const credits = day.total.githubCopilot.aiCredits;
-    const barHeight = credits > 0 ? Math.max(1.5, credits / maxCredits * 30) : 0;
+    // Gently lift smaller days while keeping the largest day at full height.
+    const barHeight = credits > 0 ? Math.max(1.5, (credits / maxCredits) ** 0.75 * 30) : 0;
     const inPeriod = day.date >= periodStart;
     const share = inPeriod && spentPct !== undefined && quota ? `${(credits / quota.entitlement * 100).toFixed(1)}% · ` : '';
     const value = credits > 0
