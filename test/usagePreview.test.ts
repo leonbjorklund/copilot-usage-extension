@@ -11,7 +11,7 @@ describe('mock usage through the real pipeline', () => {
   afterEach(() => preview?.dispose());
 
   it('derives daily tokens, credits, USD, model rows and quota from raw fixtures', async () => {
-    preview = createUsagePreview();
+    preview = createUsagePreview(new Date(2026, 8, 21, 12));
     const { summary, diagnostics } = await new UsageIndex().rebuild({
       roots: [preview.root], config, now: preview.now,
     });
@@ -44,7 +44,7 @@ describe('mock usage through the real pipeline', () => {
   });
 
   it('counts appended mock requests once through the normal incremental index', async () => {
-    preview = createUsagePreview();
+    preview = createUsagePreview(new Date(2026, 8, 21, 12));
     const index = new UsageIndex();
     await index.rebuild({ roots: [preview.root], config, now: preview.now });
     const filePath = join(preview.root, 'debug-logs', 'today-tokens', 'main.jsonl');

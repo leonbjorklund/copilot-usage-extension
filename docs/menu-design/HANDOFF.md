@@ -1,18 +1,27 @@
 # Tooltip graph handoff
 
+## Current state and next step
+
+- Work stays on `menu-design`. This is a preview checkpoint, not a production rollout; do not merge, package, install, or wire the graph into the normal tooltip yet.
+- The user manually verified the graph, daily native tooltips, and early-period caption placement in the VS Code preview. More UI tweaks remain. A distinct today-bar style was discussed but not chosen.
+- Continue the remaining UI tweaks with the user in preview. Preserve the accepted native hover behavior and content. Production wiring needs a later explicit request.
+- Run `npm run preview` from the repo root to compile and open an Extension Development Host with mock input. Hover the status bar and move across populated and empty columns. Each column should show its date and values or `no usage`; the caption should remain inside its existing axis row.
+- The default mock date is 1 October 2026 at local noon, with only one day in the new period. To inspect another date, change the default in `src/dev/usagePreview.ts` and rerun preview. The 21 September fixture remains in tests.
+- `src/dev/tooltipGraphPrototype.ts` renders thirty adjacent full-height SVG images with native HTML `title` attributes, plus an axis image. `src/extension.ts` appends it only when `COPILOT_USAGE_PREVIEW=1` and the extension runs in Development mode. Theme changes refresh the preview.
+- `src/dev/usagePreview.ts` writes temporary raw JSONL inputs for the normal `UsageIndex` pipeline and supplies mock quota. Preview does not read real usage or request account quota. `src/core/aggregator.ts` owns the daily rollup; `src/ui/formatters.ts` shares quota validation and formats the status percentage as `44/100%`.
+- Verification commands are `npm run compile` and `npm test`. Graph tests cover empty days, fractional credits, caption placement, missing or stale quota, and local/UTC month disagreement. Extension tests cover preview isolation and theme refresh. Light/high-contrast appearance and non-Windows font fallback still need manual checks before production wiring.
+
 ## Behavior
 
 - Keep the graph inside the existing status-bar hover popup without changing how it opens, closes, or responds to clicks.
-- Preserve existing content and overall styling while adding the remaining graph design in HANDOFF.md.
+- Preserve existing content and overall styling while refining the graph below.
 - Show daily AI-credit usage over the last 30 days, retain zero-usage days, and distinguish the current billing period.
 - Hovering a day's column shows its date and daily values from the handoff, including zero-usage days.
-- Prefer the daily label above the bar with some spacing; its exact styling and placement remain flexible.
+- Use native HTML image-title tooltips for daily details. Their appearance, position, and delay are controlled by VS Code's browser host and are accepted constraints. Bar highlighting on hover is not required.
 - Choose the simplest solution with the least ongoing overhead, regardless of how much code needs rewriting.
-- Leave technology choices open for research; flag any unmet requirement instead of changing the agreed behavior.
+- The per-column image approach is accepted. See `GRAPH-OPTIONS.md` for the research and verified outcome.
 
-These rules take precedence over the exact hover-label styling and placement below.
-
-Visual reference: `Tooltip-Spec-v32.html` (open in a browser; hover the bars).
+Visual reference: `Tooltip-Spec-v32.html` (open in a browser; hover the bars). It is the original design reference, not the current implementation. This handoff supersedes its custom hover chip, hover highlight, spaced status percentage, and unclamped axis caption. Its sample totals are illustrative; preview totals come from raw mock logs.
 
 ---
 
@@ -42,16 +51,10 @@ and period ticks in the visual reference.
 Hover behaviour:
 
 - hovering anywhere in a day's column shows its details, including zero-usage days
-- hovered bar's fill becomes `#ffffff`; all others revert to their base fill
-- the chip sits **above the hovered bar's top edge**, horizontally centred on it,
-  with background `#202020` so content behind it does not show through
-- keep the chip's centre within **20–74%** of the width so it never leaves the box
-- keep the chip above the bar without extending above the graph area
-- moving the pointer across the chip must not interrupt the day's hover details
-- chip content: date in `#8c8c8c`, value in `#ffffff`, 12px, tabular figures
-- when the pointer leaves the graph, hide the chip and restore bar colours
+- native tooltips show the date followed by the daily values below
+- bar fills stay unchanged on hover; the host controls tooltip placement, delay, styling, and dismissal
 
-Chip value formatting:
+Daily value formatting:
 
 | case | text |
 |---|---|
@@ -65,12 +68,14 @@ One row under the graph, 12px, tabular figures, positioned proportionally:
 
 - **flush left:** window start date (`today-29`, e.g. `23 Aug`), `#8c8c8c`
 - **centred on the period start tick:** period start date (`1 Sep`), `#8c8c8c`
-- **centred between the two ticks:** the caption (§4)
+- **prefer centred between the two ticks:** the caption (§4), shifted left only as needed to fit the right edge
 
 If the period start falls within ~56px of the window start, drop the period
-start label rather than let the two collide.
-
-
+start label rather than let the two collide. Also hide it if it overlaps the
+caption, keeping its tick and daily hover date. The caption may extend under
+older days; keep it on this same row without wrapping or shrinking its font.
+The preview estimates collisions using the fixed 12px Segoe UI font and uses
+right anchoring when the caption reaches the edge.
 
 ## 4. Numbers & caption
 
@@ -78,8 +83,8 @@ start label rather than let the two collide.
 Period {spentPct}% · {ratePct}%/day · {projectedPct}% projected
 ```
 
-`Period {spentPct}%` in `#cccccc`, the rest in `#8c8c8c`. Nothing else goes on
-this line.
+`Period {spentPct}%` in `#cccccc`, the rest in `#8c8c8c`. The caption shares
+the axis row with the date labels in §3.
 
 | value | formula |
 |---|---|
@@ -103,7 +108,6 @@ locks to them — it is always the last 30 days.
 | period ticks | `#9d9d9d` |
 | bars, in period | `#cccccc` |
 | bars, before period | `#4a4a4a` |
-| bar hover | `#ffffff` |
 | primary text | `#cccccc` |
 | secondary text | `#8c8c8c` |
 | body type | 13px / 19px |
@@ -117,7 +121,10 @@ Match VS Code's active theme; the values above are the dark-theme reference.
 
 Daily rollups come from **local logs**, so the graph renders offline. Only the
 percentages need account quota + period boundaries; when those are missing,
-render the graph and omit the caption.
+invalid, unlimited, or expired, render the graph and omit the caption and daily
+percentages. Daily slots use local calendar dates, including DST transitions.
+Quota resets use UTC; while the local and UTC month disagree, omit graph
+percentages rather than attribute another month's quota to the local period.
 
 ## 7. Explicitly rejected
 

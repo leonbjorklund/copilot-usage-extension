@@ -20,6 +20,32 @@ interface TitleCandidate {
  */
 const USD_PER_AI_CREDIT = 0.01;
 
+/** Rolling local calendar days, including empty days, using the same billing rules as the totals. */
+export function aggregateDailyUsage(records: UsageRecord[], now = new Date()): Array<{ date: Date; total: UsageTotal }> {
+  const days = Array.from({ length: 30 }, (_, index) => ({
+    date: new Date(now.getFullYear(), now.getMonth(), now.getDate() - 29 + index),
+    total: emptyTotal(),
+  }));
+  const totalsByDay = new Map(days.map((day) => [day.date.getTime(), day.total]));
+  const start = days[0].date.getTime();
+  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).getTime();
+
+  for (const record of records) {
+    const timestamp = record.timestamp.getTime();
+    if (timestamp < start || timestamp >= end || record.hiddenFromExplorer === true ||
+        record.metadataOnly === true || !hasPositiveAiCredits(record)) {
+      continue;
+    }
+    // Calendar keys, rather than elapsed 24-hour intervals, keep DST days in their own slots.
+    const date = record.timestamp;
+    const total = totalsByDay.get(new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime());
+    if (total) {
+      addToTotal(total, record.tokens.total, estimateRecordCost(record));
+    }
+  }
+  return days;
+}
+
 export function aggregateUsage(records: UsageRecord[], now = new Date()): UsageSummary {
   const today = emptyTotal();
   const week = emptyTotal();

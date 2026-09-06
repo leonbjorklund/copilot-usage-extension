@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { parseCopilotQuota } from '../core/quota';
 import type { QuotaState } from '../core/quotaService';
 
-// Oldest to newest, matching the handoff's 23 Aug through 21 Sep window.
+// Oldest to newest across the rolling 30-day window.
 export const PREVIEW_DAILY_CREDITS = [
   0, 0, 12, 34, 28, 0, 0, 41, 55, 47, 33, 0, 0, 61, 52,
   18, 0, 0, 44, 39, 58, 22, 0, 0, 48, 31, 26, 64, 29, 87,
@@ -22,7 +22,7 @@ export interface UsagePreview {
 }
 
 /** Substitute raw inputs only; the normal index calculates every displayed total. */
-export function createUsagePreview(now = new Date(2026, 8, 21, 12)): UsagePreview {
+export function createUsagePreview(now = new Date(2026, 9, 1, 12)): UsagePreview {
   const root = mkdtempSync(join(tmpdir(), 'copilot-usage-preview-'));
   let periodCredits = 0;
 

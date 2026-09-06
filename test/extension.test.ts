@@ -39,6 +39,7 @@ const {
 
 vi.mock("vscode", () => ({
   ExtensionMode: { Production: 1, Development: 2, Test: 3 },
+  ColorThemeKind: { Light: 1, Dark: 2, HighContrast: 3, HighContrastLight: 4 },
   MarkdownString: class {
     isTrusted?: boolean | { enabledCommands: string[] };
     supportHtml?: boolean;
@@ -85,6 +86,8 @@ vi.mock("vscode", () => ({
     onDidChangeSessions: vi.fn(() => ({ dispose: vi.fn() })),
   },
   window: {
+    activeColorTheme: { kind: 2 },
+    onDidChangeActiveColorTheme: vi.fn(() => ({ dispose: vi.fn() })),
     createStatusBarItem: vi.fn(),
     registerTreeDataProvider: vi.fn(),
     showInformationMessage: vi.fn(),
@@ -440,22 +443,22 @@ describe("formatStatusBarTooltip", () => {
       entitlement: 1500, remaining: 841, percentRemaining: 841 / 15,
       unlimited: false, overageCount: 0, resetDate: new Date("2026-10-01"),
     };
-    expect(formatStatusBarSummary(summary, quota, new Date("2026-09-21"))).toBe("2.1M | 8.29$ • 44 / 100%");
+    expect(formatStatusBarSummary(summary, quota, new Date("2026-09-21"))).toBe("2.1M | 8.29$ • 44/100%");
     expect(formatStatusBarSummary(summary)).toBe("2.1M | 8.29$");
     summary.today = createTotal(0);
-    expect(formatStatusBarSummary(summary, quota, new Date("2026-09-21"))).toBe("No sessions today • 44 / 100%");
+    expect(formatStatusBarSummary(summary, quota, new Date("2026-09-21"))).toBe("No sessions today • 44/100%");
   });
 
   it("renders the mock preview after its raw logs pass through the real index", async () => {
     const { UsageIndex: RealUsageIndex } = await vi.importActual<typeof import("../src/core/usageIndex")>("../src/core/usageIndex");
     const { createUsagePreview } = await import("../src/dev/usagePreview");
-    const preview = createUsagePreview();
+    const preview = createUsagePreview(new Date(2026, 8, 21, 12));
     try {
       const { summary } = await new RealUsageIndex().rebuild({
         roots: [preview.root], config: createConfig(), now: preview.now,
       });
       const quota = preview.quotaState.kind === "quota" ? preview.quotaState.quota : undefined;
-      expect(formatStatusBarSummary(summary, quota, preview.now)).toBe("2.1M | 0.87$ • 44 / 100%");
+      expect(formatStatusBarSummary(summary, quota, preview.now)).toBe("2.1M | 0.87$ • 44/100%");
       const tooltip = formatStatusBarTooltip(summary).value;
       expect(tooltip).toContain("<strong>Month:</strong> 7.8M (6.59$)");
       expect(tooltip).toContain("<strong>All time:</strong> 13.5M (10.79$)");
@@ -534,14 +537,27 @@ describe("activate", () => {
       const options = usageIndexInstances[0].rebuild.mock.calls[0][0];
       expect(options.roots).toHaveLength(1);
       expect(options.roots[0]).toContain("copilot-usage-preview-");
-      expect(options.now).toEqual(new Date(2026, 8, 21, 12));
+      expect(options.now).toEqual(new Date(2026, 9, 1, 12));
       const rows = await registeredTreeProvider().getChildren();
       expect(rows?.[0]).toMatchObject({ kind: "quota", state: { account: "mock-preview" } });
       const statusBar = vi.mocked(vscode.window.createStatusBarItem).mock.results[0].value;
-      expect(statusBar.text).toBe("No sessions today • 44 / 100%");
+      expect(statusBar.text).toBe("No sessions today • 6/100%");
       expect(statusBar.command).toBe("copilotUsage.openView");
       expect(statusBar.tooltip).toBeInstanceOf(vscode.MarkdownString);
+      const darkTooltip = statusBar.tooltip.value;
+      expect(darkTooltip).toContain("Last 30 days");
+      expect(darkTooltip.match(/ title="[^"]+no usage"/g)).toHaveLength(30);
+      const originalContent = formatStatusBarTooltip(state.usageIndexResult.summary).value;
+      expect(darkTooltip).toContain(originalContent);
+      vscode.window.activeColorTheme.kind = vscode.ColorThemeKind.Light;
+      const themeListener = vi.mocked(vscode.window.onDidChangeActiveColorTheme).mock.calls.at(-1)![0];
+      themeListener(vscode.window.activeColorTheme);
+      expect(statusBar.tooltip.value).not.toBe(darkTooltip);
+      expect(statusBar.tooltip.value).toContain(originalContent);
+      expect(statusBar.tooltip.value).toContain("Last 30 days");
+      expect(statusBar.command).toBe("copilotUsage.openView");
     } finally {
+      vscode.window.activeColorTheme.kind = vscode.ColorThemeKind.Dark;
       for (const disposable of context.subscriptions) { disposable.dispose?.(); }
     }
   });
@@ -553,6 +569,8 @@ describe("activate", () => {
       await activateExtension(context);
       expect(locateCopilotDataPaths).toHaveBeenCalled();
       expect(CopilotAccountWatcher).toHaveBeenCalled();
+      const statusBar = vi.mocked(vscode.window.createStatusBarItem).mock.results[0].value;
+      expect(statusBar.tooltip.value).not.toContain("Last 30 days");
     } finally {
       for (const disposable of context.subscriptions) { disposable.dispose?.(); }
     }
@@ -955,7 +973,7 @@ describe("activate", () => {
       respond(new Response(JSON.stringify({ quota_snapshots: { premium_models: {
         entitlement: 1500, percent_remaining: 841 / 15, reset_date: "2026-10-01",
       } } })));
-      await vi.waitFor(() => expect(statusBar.text).toBe("2.1M | 0.87$ • 44 / 100%"));
+      await vi.waitFor(() => expect(statusBar.text).toBe("2.1M | 0.87$ • 44/100%"));
       expect(statusBar.command).toBe("copilotUsage.openView");
       await commandCallback("copilotUsage.connectQuota")();
       expect(statusBar.text).toBe("2.1M | 0.87$");

@@ -10,9 +10,9 @@ describe('formatPeriodPercentage', () => {
   };
 
   it('shows rounded account spending, including overage', () => {
-    expect(formatPeriodPercentage(quota, now)).toBe('44 / 100%');
-    expect(formatPeriodPercentage({ ...quota, remaining: 0, overageCount: 150 }, now)).toBe('110 / 100%');
-    expect(formatPeriodPercentage({ ...quota, remaining: 1500 }, now)).toBe('0 / 100%');
+    expect(formatPeriodPercentage(quota, now)).toBe('44/100%');
+    expect(formatPeriodPercentage({ ...quota, remaining: 0, overageCount: 150 }, now)).toBe('110/100%');
+    expect(formatPeriodPercentage({ ...quota, remaining: 1500 }, now)).toBe('0/100%');
   });
 
   it('omits unknown, unlimited, invalid, or expired periods', () => {
@@ -29,7 +29,7 @@ describe('formatPeriodPercentage', () => {
   });
 
   it('handles the December rollover', () => {
-    expect(formatPeriodPercentage({ ...quota, resetDate: new Date('2027-01-01') }, new Date('2026-12-31T23:59:00Z'))).toBe('44 / 100%');
+    expect(formatPeriodPercentage({ ...quota, resetDate: new Date('2027-01-01') }, new Date('2026-12-31T23:59:00Z'))).toBe('44/100%');
   });
 });
 

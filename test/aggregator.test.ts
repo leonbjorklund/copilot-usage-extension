@@ -1,7 +1,35 @@
 import { describe, expect, it } from 'vitest';
 
-import { aggregateUsage } from '../src/core/aggregator';
+import { aggregateDailyUsage, aggregateUsage } from '../src/core/aggregator';
 import type { UsageRecord } from '../src/core/types';
+
+describe('aggregateDailyUsage', () => {
+  it.each([new Date(2026, 9, 26, 12), new Date(2028, 2, 1, 12), new Date(2027, 0, 1, 12)])(
+    'keeps 30 calendar slots and matches existing totals across date boundaries at %s', (now) => {
+      const atDay = (offset: number) => new Date(now.getFullYear(), now.getMonth(), now.getDate() + offset, 12);
+      const records = [
+        createBilledRecord('old', 'Old', atDay(-30), 'model', 999),
+        createBilledRecord('first', 'First', atDay(-29), 'model', 10, 0.123456789),
+        createBilledRecord('first', 'First again', atDay(-29), 'model', 20, 0.000000001),
+        createBilledRecord('today', 'Today', atDay(0), 'model', 30, 0.2),
+        createBilledRecord('future', 'Future', atDay(1), 'model', 999),
+        createRecord('tokens-only', 'Tokens only', atDay(0), 'model', 999),
+        createBilledRecord('zero', 'Zero', atDay(0), 'model', 999, 0),
+        { ...createBilledRecord('hidden', 'Hidden', atDay(0), 'model', 999), hiddenFromExplorer: true },
+        { ...createBilledRecord('title', 'Title', atDay(0), 'model', 999), metadataOnly: true },
+      ];
+      const days = aggregateDailyUsage(records, now);
+      expect(days).toHaveLength(30);
+      expect(days[0].date).toEqual(new Date(now.getFullYear(), now.getMonth(), now.getDate() - 29));
+      expect(new Set(days.map((day) => day.date.getTime())).size).toBe(30);
+      for (const day of days) {
+        expect(day.total).toEqual(aggregateUsage(records, day.date).today);
+      }
+      expect(days[1].total).toEqual(createTotal(0));
+      expect(days[29].total).toEqual(createTotal(30, 0.2));
+    },
+  );
+});
 
 describe('aggregateUsage', () => {
   it('aggregates positive AI Credit usage totals and chat summaries', () => {

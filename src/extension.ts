@@ -21,6 +21,7 @@ import type {
 } from "./core/types";
 import { UsageIndex } from "./core/usageIndex";
 import { createUsagePreview } from "./dev/usagePreview";
+import { formatTooltipGraphPrototype } from "./dev/tooltipGraphPrototype";
 import { formatPeriodPercentage, formatTokens, formatTotalUsd, formatUsd } from "./ui/formatters";
 import {
   formatDiagnostics,
@@ -286,6 +287,17 @@ export function activate(context: vscode.ExtensionContext): void {
     treeProvider.setSummary(result.summary);
     const quotaState = preview?.quotaState ?? quotaService?.getState();
     setStatusBarReady(statusBar, result.summary, quotaState?.kind === "quota" ? quotaState.quota : undefined, now());
+    if (preview) {
+      // Throwaway graph only in the mock preview; keep the normal Markdown hover and click action.
+      const tooltip = formatStatusBarTooltip(result.summary);
+      const theme = vscode.window.activeColorTheme.kind;
+      tooltip.value += "\n\n---\n\n" + formatTooltipGraphPrototype(
+        result.summary, quotaState?.kind === "quota" ? quotaState.quota : undefined, now(),
+        theme === vscode.ColorThemeKind.Light || theme === vscode.ColorThemeKind.HighContrastLight,
+        theme === vscode.ColorThemeKind.HighContrast || theme === vscode.ColorThemeKind.HighContrastLight,
+      );
+      statusBar.tooltip = tooltip;
+    }
   }
 
   function setSetupNeededContext(value: boolean): Thenable<unknown> {
@@ -461,6 +473,11 @@ export function activate(context: vscode.ExtensionContext): void {
       }),
     ] : []),
     ...(copilotAccount ? [copilotAccount] : []),
+    ...(preview ? [vscode.window.onDidChangeActiveColorTheme(() => {
+      if (readySummary && latestDiagnostics) {
+        applyResult({ summary: readySummary, diagnostics: latestDiagnostics });
+      }
+    })] : []),
     vscode.commands.registerCommand("copilotUsage.refresh", () => runRefresh()),
     vscode.commands.registerCommand("copilotUsage.connectQuota", () =>
       quotaService?.refreshNow({ interactive: true }),
