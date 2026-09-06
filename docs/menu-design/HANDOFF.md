@@ -1,5 +1,17 @@
 # Tooltip graph handoff
 
+## Behavior
+
+- Keep the graph inside the existing status-bar hover popup without changing how it opens, closes, or responds to clicks.
+- Preserve existing content and overall styling while adding the remaining graph design in HANDOFF.md.
+- Show daily AI-credit usage over the last 30 days, retain zero-usage days, and distinguish the current billing period.
+- Hovering a day's column shows its date and daily values from the handoff, including zero-usage days.
+- Prefer the daily label above the bar with some spacing; its exact styling and placement remain flexible.
+- Choose the simplest solution with the least ongoing overhead, regardless of how much code needs rewriting.
+- Leave technology choices open for research; flag any unmet requirement instead of changing the agreed behavior.
+
+These rules take precedence over the exact hover-label styling and placement below.
+
 Visual reference: `Tooltip-Spec-v32.html` (open in a browser; hover the bars).
 
 ---
