@@ -33,8 +33,8 @@ describe('tooltip graph calculations', () => {
     expect(axis).toContain('<text x="430" y="13" text-anchor="end"><tspan');
     expect(axis).toContain('Period 6%');
     expect(axis).not.toContain('>1 Oct</text>');
-    expect(images[30 - day]).toContain('x="0" y="53" width="1" height="6"');
-    expect(images[29]).toContain('x="13" y="53" width="1" height="6"');
+    expect(images[30 - day]).toContain('x="0" y="37" width="1" height="6"');
+    expect(images[29]).toContain('x="13" y="37" width="1" height="6"');
     expect(html).toContain('title="1 Oct ·');
   });
 
@@ -58,8 +58,8 @@ describe('tooltip graph calculations', () => {
     const html = formatTooltipGraphPrototype(summary, undefined, now);
     const images = decodeImages(html);
     expect(images).toHaveLength(31); // Thirty columns plus the date axis.
-    expect(images[28]).toContain('height="19" rx="1"');
-    expect(images[29]).toContain('height="38" rx="1"');
+    expect(images[28]).toContain('height="15" rx="1"');
+    expect(images[29]).toContain('height="30" rx="1"');
     expect(images[0]).not.toContain('<rect');
     expect(html).toContain('title="23 Aug · no usage"');
     expect(html.match(/ title=/g)).toHaveLength(30);

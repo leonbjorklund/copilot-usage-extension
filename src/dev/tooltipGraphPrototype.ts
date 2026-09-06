@@ -12,8 +12,8 @@ export function formatTooltipGraphPrototype(
   highContrast = false,
 ): string {
   const width = 430;
-  const height = 60;
-  const baseline = 51;
+  const height = 44;
+  const baseline = 35;
   const colors = lightTheme
     ? { bar: '#333333', old: '#b0b0b0', axis: '#d0d0d0', tick: '#616161', text: '#333333', muted: '#616161' }
     : { bar: '#cccccc', old: '#4a4a4a', axis: '#454545', tick: '#9d9d9d', text: '#cccccc', muted: '#8c8c8c' };
@@ -40,7 +40,7 @@ export function formatTooltipGraphPrototype(
   const columns = days.map((day, index) => {
     const columnWidth = edge(index + 1) - edge(index);
     const credits = day.total.githubCopilot.aiCredits;
-    const barHeight = credits > 0 ? Math.max(1.5, credits / maxCredits * 38) : 0;
+    const barHeight = credits > 0 ? Math.max(1.5, credits / maxCredits * 30) : 0;
     const inPeriod = day.date >= periodStart;
     const share = inPeriod && spentPct !== undefined && quota ? `${(credits / quota.entitlement * 100).toFixed(1)}% · ` : '';
     const value = credits > 0
@@ -50,10 +50,10 @@ export function formatTooltipGraphPrototype(
     const bar = credits > 0
       ? `<rect x="${(columnWidth - 9) / 2}" y="${baseline - barHeight}" width="9" height="${barHeight}" rx="1" fill="${inPeriod ? colors.bar : colors.old}"/>`
       : '';
-    const tick = index === periodIndex ? `<rect x="0" y="53" width="1" height="6" fill="${colors.tick}"/>` : '';
-    const endTick = index === 29 ? `<rect x="${columnWidth - 1}" y="53" width="1" height="6" fill="${colors.tick}"/>` : '';
+    const tick = index === periodIndex ? `<rect x="0" y="37" width="1" height="6" fill="${colors.tick}"/>` : '';
+    const endTick = index === 29 ? `<rect x="${columnWidth - 1}" y="37" width="1" height="6" fill="${colors.tick}"/>` : '';
     return svgImage(columnWidth, height,
-      `${bar}<path d="M0 51.5H${columnWidth}" stroke="${colors.axis}"/>${tick}${endTick}`, title);
+      `${bar}<path d="M0 35.5H${columnWidth}" stroke="${colors.axis}"/>${tick}${endTick}`, title);
   }).join('');
 
   const boundary = periodIndex < 0 ? 0 : edge(periodIndex);
@@ -86,7 +86,7 @@ export function formatTooltipGraphPrototype(
 
   return [
     '<table width="430">',
-    `<tr><td><strong>Last 30 days</strong></td><td align="right">${formatTokens(totalTokens / 30)} (${formatUsd(totalUsd / 30)})/day</td></tr>`,
+    `<tr><td><strong>Last 30 days</strong></td><td align="right">avg. ${formatTokens(totalTokens / 30)} (${formatUsd(totalUsd / 30)}) / day</td></tr>`,
     '</table>',
     `<p>${columns}<br>${axis}</p>`,
   ].join('\n');
