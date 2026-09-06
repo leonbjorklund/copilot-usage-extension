@@ -9,6 +9,7 @@
     "clean": "node -e \"const fs=require('node:fs'); for (const dir of ['dist','out']) fs.rmSync(dir,{recursive:true,force:true});\"",
     "check-types": "tsc --noEmit -p ./",
     "compile": "npm run check-types && node esbuild.js",
+    "preview": "npm run compile && powershell -NoProfile -ExecutionPolicy Bypass -File src/dev/preview.ps1",
     "compile:production": "npm run check-types && node esbuild.js --production",
     "vscode:prepublish": "npm run compile:production",
     "watch": "node esbuild.js --watch",

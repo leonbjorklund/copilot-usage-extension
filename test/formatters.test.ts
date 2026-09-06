@@ -1,6 +1,47 @@
 import { describe, expect, it } from 'vitest';
 
-import { formatTokens, formatUsd } from '../src/ui/formatters';
+import { formatPeriodPercentage, formatTokens, formatTotalUsd, formatUsd } from '../src/ui/formatters';
+
+describe('formatPeriodPercentage', () => {
+  const now = new Date('2026-09-21T12:00:00Z');
+  const quota = {
+    entitlement: 1500, remaining: 841, percentRemaining: 841 / 15,
+    unlimited: false, overageCount: 0, resetDate: new Date('2026-10-01'),
+  };
+
+  it('shows rounded account spending, including overage', () => {
+    expect(formatPeriodPercentage(quota, now)).toBe('44 / 100%');
+    expect(formatPeriodPercentage({ ...quota, remaining: 0, overageCount: 150 }, now)).toBe('110 / 100%');
+    expect(formatPeriodPercentage({ ...quota, remaining: 1500 }, now)).toBe('0 / 100%');
+  });
+
+  it('omits unknown, unlimited, invalid, or expired periods', () => {
+    expect(formatPeriodPercentage(undefined, now)).toBeUndefined();
+    for (const patch of [
+      { unlimited: true }, { entitlement: 0 }, { entitlement: Infinity },
+      { remaining: NaN }, { overageCount: NaN }, { resetDate: undefined },
+      { resetDate: new Date('invalid') }, { resetDate: new Date('2026-09-01') },
+      { resetDate: new Date('2026-10-15') },
+    ]) {
+      expect(formatPeriodPercentage({ ...quota, ...patch }, now)).toBeUndefined();
+    }
+    expect(formatPeriodPercentage(quota, new Date('2026-10-01'))).toBeUndefined();
+  });
+
+  it('handles the December rollover', () => {
+    expect(formatPeriodPercentage({ ...quota, resetDate: new Date('2027-01-01') }, new Date('2026-12-31T23:59:00Z'))).toBe('44 / 100%');
+  });
+});
+
+describe('formatTotalUsd', () => {
+  it('preserves cents without unnecessary trailing zeroes', () => {
+    expect(formatTotalUsd(0.87)).toBe('0.87$');
+    expect(formatTotalUsd(8.29)).toBe('8.29$');
+    expect(formatTotalUsd(476)).toBe('476$');
+    expect(formatTotalUsd(8.4)).toBe('8.4$');
+    expect(formatTotalUsd(0)).toBe('0$');
+  });
+});
 
 describe('formatTokens', () => {
   it('rounds thousands to whole k values', () => {

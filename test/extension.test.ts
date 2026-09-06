@@ -38,6 +38,7 @@ const {
 }));
 
 vi.mock("vscode", () => ({
+  ExtensionMode: { Production: 1, Development: 2, Test: 3 },
   MarkdownString: class {
     isTrusted?: boolean | { enabledCommands: string[] };
     supportHtml?: boolean;
@@ -134,6 +135,7 @@ vi.mock("vscode", () => ({
 }));
 
 import * as vscode from "vscode";
+import { CopilotAccountWatcher } from "../src/core/copilotAccount";
 
 vi.mock("../src/core/locator", () => ({ locateCopilotDataPaths }));
 vi.mock("../src/core/copilotAccount", () => ({
@@ -242,39 +244,36 @@ describe("formatStatusBarTooltip", () => {
     expect(tooltip.supportThemeIcons).toBe(true);
     expect(tooltip.value).not.toContain("<pre>");
     expect(formatStatusBarSummary(summary)).toBe("1.2M | 8.4$");
-    expect(
-      tooltip.value.startsWith(
-        'Cost is based on <a href="https://docs.github.com/en/copilot/concepts/billing/usage-based-billing-for-individuals">GitHub Copilot Usage-based billing $(link-external)</a>\n',
-      ),
-    ).toBe(true);
+    expect(tooltip.value.startsWith('<table width="430">\n<tr><td align="left"><strong>Today:</strong>')).toBe(true);
+    expect(tooltip.value).toContain('</td><td align="right"><a href="https://docs.github.com/en/copilot/');
+    expect(tooltip.value).toContain('href="https://docs.github.com/en/copilot/concepts/billing/usage-based-billing-for-individuals"');
+    expect(tooltip.value).toContain('title="USD is estimated from AI Credits using GitHub Copilot usage-based billing">$(info)</a>');
+    expect(tooltip.value).not.toContain("Cost is based on");
     expect(tooltip.value).not.toContain("## Today:");
     expect(tooltip.value).not.toContain("Week:");
     expect(tooltip.value).toContain(
-      "**Today:** 1.2M (8.4$) &nbsp; | &nbsp; **Month:** 8.9M (21.6$) &nbsp; | &nbsp; **All time:** 22M (42.2$)",
+      "<strong>Today:</strong> 1.2M (8.4$) &nbsp;|&nbsp; <strong>Month:</strong> 8.9M (21.59$) &nbsp;|&nbsp; <strong>All time:</strong> 22M (42.15$)",
     );
     expect(tooltip.value).toContain("---");
-    expect(tooltip.value).not.toContain("GitHub Copilot usage-based");
     expect(tooltip.value).toContain('<tr><td colspan="2"><strong>Model use:</strong></td></tr>');
     expect(tooltip.value).not.toContain('<strong>Model usage:</strong>');
     expect(tooltip.value).not.toContain('<strong>Top models:</strong>');
     expect(tooltip.value).toContain(
-      '<td>1. Claude opus 4.6</td><td align="right">12 sessions | 5.2M (8.4$)</td>',
+      '<td>1. Claude opus 4.6</td><td align="right">12 sessions · 5.2M (8.4$)</td>',
     );
     expect(tooltip.value).not.toContain("<em>Claude opus 4.6</em>");
     expect(tooltip.value).toContain(
-      '<tr><td colspan="2"><strong>Most tokens today:</strong></td></tr>',
+      '<tr><td colspan="2"><strong>Top sessions today:</strong></td></tr>',
     );
     expect(tooltip.value).toContain(
-      '<td>Feature work | Claude opus 4.6</td><td align="right">420k (2.1$)</td>',
+      '<td>Feature work <span style="color:var(--vscode-descriptionForeground);">Claude opus 4.6</span></td><td align="right">420k (2.1$)</td>',
     );
+    expect(tooltip.value).not.toContain("Most tokens today:");
+    expect(tooltip.value).not.toContain("Most expensive today:");
+    expect(tooltip.value.indexOf("Cost audit")).toBeLessThan(tooltip.value.indexOf("Feature work"));
+    expect(tooltip.value.match(/---/g)).toHaveLength(2);
     expect(tooltip.value).toContain(
-      '<td>Feature work | Claude opus 4.6</td><td align="right">420k (2.1$)</td></tr>\n</table>\n\n---\n\n<table width="100%">\n<tr><td colspan="2"><strong>Most expensive today:</strong></td></tr>',
-    );
-    expect(tooltip.value).toContain(
-      '<tr><td colspan="2"><strong>Most expensive today:</strong></td></tr>',
-    );
-    expect(tooltip.value).toContain(
-      '<td>Cost audit | Claude opus 4.7</td><td align="right">316k (4.8$)</td>',
+      '<td>Cost audit <span style="color:var(--vscode-descriptionForeground);">Claude opus 4.7</span></td><td align="right">316k (4.8$)</td>',
     );
     expect(tooltip.value).not.toContain("<thead>");
     expect(tooltip.value).not.toContain("<small>");
@@ -301,11 +300,7 @@ describe("formatStatusBarTooltip", () => {
 
     expect(formatStatusBarTooltip(summary).value).toContain(
       [
-        "**Today:** 0 &nbsp; | &nbsp; **Month:** 0 &nbsp; | &nbsp; **All time:** 0",
-        "",
-        "---",
-        "",
-        '<table width="100%">',
+        '<table width="430">',
         '<tr><td colspan="2"><strong>Model use:</strong></td></tr>',
         '<tr><td colspan="2">No sessions yet.</td></tr>',
         "</table>",
@@ -332,7 +327,8 @@ describe("formatStatusBarTooltip", () => {
     };
 
     expect(formatStatusBarSummary(summary)).toBe("1k");
-    expect(formatStatusBarTooltip(summary).value).not.toContain("GitHub Copilot usage-based");
+    expect(formatStatusBarTooltip(summary).value).toContain("<strong>Today:</strong> 1k &nbsp;|");
+    expect(formatStatusBarTooltip(summary).value).not.toContain("1.2$");
   });
 
   it("omits zero-credit cost from status text and tooltip", () => {
@@ -354,7 +350,7 @@ describe("formatStatusBarTooltip", () => {
     };
 
     expect(formatStatusBarSummary(summary)).toBe("1k");
-    expect(formatStatusBarTooltip(summary).value).toContain("**Today:** 1k");
+    expect(formatStatusBarTooltip(summary).value).toContain("<strong>Today:</strong> 1k");
     expect(formatStatusBarTooltip(summary).value).not.toContain("0$");
   });
 
@@ -391,7 +387,7 @@ describe("formatStatusBarTooltip", () => {
     };
 
     expect(formatStatusBarTooltip(summary).value).toContain(
-      ["**Today highlights:**", "No sessions today."].join("\n"),
+      '<strong>Top sessions today:</strong></td></tr>\n<tr><td colspan="2">No sessions today.</td></tr>',
     );
   });
 
@@ -419,12 +415,56 @@ describe("formatStatusBarTooltip", () => {
     const tooltip = formatStatusBarTooltip(summary);
 
     expect(tooltip.value).toContain(
-      '<td>1. model &lt;alpha&gt;</td><td align="right">1 session | 1</td>',
+      '<td>1. model &lt;alpha&gt;</td><td align="right">1 session · 1</td>',
     );
     expect(tooltip.value).not.toContain("<em>model &lt;alpha&gt;</em>");
     expect(tooltip.value).toContain("Fix &lt;parser&gt;");
     expect(tooltip.value).not.toContain("model <alpha>");
     expect(tooltip.value).not.toContain("Fix <parser>");
+  });
+
+  it("shows a session only once when it leads both highlights", () => {
+    const summary = createEmptySummary();
+    summary.highestSessionToday = {
+      chatId: "same", title: "Only highlight", model: "model", timestamp: new Date(),
+      tokens: 2_100_000, githubCopilot: createCost(8.29), records: [],
+    };
+    summary.mostExpensiveSessionToday = summary.highestSessionToday;
+    expect(formatStatusBarTooltip(summary).value.match(/Only highlight/g)).toHaveLength(1);
+  });
+
+  it("adds the account period share separately from today's local totals", () => {
+    const summary = createEmptySummary();
+    summary.today = createTotal(2_100_000, 8.29);
+    const quota = {
+      entitlement: 1500, remaining: 841, percentRemaining: 841 / 15,
+      unlimited: false, overageCount: 0, resetDate: new Date("2026-10-01"),
+    };
+    expect(formatStatusBarSummary(summary, quota, new Date("2026-09-21"))).toBe("2.1M | 8.29$ • 44 / 100%");
+    expect(formatStatusBarSummary(summary)).toBe("2.1M | 8.29$");
+    summary.today = createTotal(0);
+    expect(formatStatusBarSummary(summary, quota, new Date("2026-09-21"))).toBe("No sessions today • 44 / 100%");
+  });
+
+  it("renders the mock preview after its raw logs pass through the real index", async () => {
+    const { UsageIndex: RealUsageIndex } = await vi.importActual<typeof import("../src/core/usageIndex")>("../src/core/usageIndex");
+    const { createUsagePreview } = await import("../src/dev/usagePreview");
+    const preview = createUsagePreview();
+    try {
+      const { summary } = await new RealUsageIndex().rebuild({
+        roots: [preview.root], config: createConfig(), now: preview.now,
+      });
+      const quota = preview.quotaState.kind === "quota" ? preview.quotaState.quota : undefined;
+      expect(formatStatusBarSummary(summary, quota, preview.now)).toBe("2.1M | 0.87$ • 44 / 100%");
+      const tooltip = formatStatusBarTooltip(summary).value;
+      expect(tooltip).toContain("<strong>Month:</strong> 7.8M (6.59$)");
+      expect(tooltip).toContain("<strong>All time:</strong> 13.5M (10.79$)");
+      expect(tooltip).toContain("Investigate quota refresh behavior");
+      expect(tooltip).toContain("Refactor the usage scanner");
+      expect(tooltip).not.toContain("Last 30 days");
+    } finally {
+      preview.dispose();
+    }
   });
 });
 
@@ -458,6 +498,8 @@ describe("activate", () => {
   });
 
   afterEach(async () => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
     await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })));
     roots.length = 0;
   });
@@ -470,6 +512,49 @@ describe("activate", () => {
 
     for (const { command } of manifest.contributes.commands) {
       expect(vscode.commands.registerCommand).toHaveBeenCalledWith(command, expect.any(Function));
+    }
+  });
+
+  it("uses only mock input and no account calls in the development preview", async () => {
+    vi.stubEnv("COPILOT_USAGE_PREVIEW", "1");
+    const fetchMock = vi.fn(() => { throw new Error("Preview must stay offline"); });
+    vi.stubGlobal("fetch", fetchMock);
+    state.copilotFileLoggingEnabled = false;
+    const context = { ...createContext(), extensionMode: vscode.ExtensionMode.Development };
+    try {
+      await activateExtension(context);
+      await commandCallback("copilotUsage.connectQuota")();
+      await commandCallback("copilotUsage.refresh")();
+
+      expect(locateCopilotDataPaths).not.toHaveBeenCalled();
+      expect(CopilotAccountWatcher).not.toHaveBeenCalled();
+      expect(vscode.authentication.getSession).not.toHaveBeenCalled();
+      expect(vscode.authentication.onDidChangeSessions).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
+      const options = usageIndexInstances[0].rebuild.mock.calls[0][0];
+      expect(options.roots).toHaveLength(1);
+      expect(options.roots[0]).toContain("copilot-usage-preview-");
+      expect(options.now).toEqual(new Date(2026, 8, 21, 12));
+      const rows = await registeredTreeProvider().getChildren();
+      expect(rows?.[0]).toMatchObject({ kind: "quota", state: { account: "mock-preview" } });
+      const statusBar = vi.mocked(vscode.window.createStatusBarItem).mock.results[0].value;
+      expect(statusBar.text).toBe("No sessions today • 44 / 100%");
+      expect(statusBar.command).toBe("copilotUsage.openView");
+      expect(statusBar.tooltip).toBeInstanceOf(vscode.MarkdownString);
+    } finally {
+      for (const disposable of context.subscriptions) { disposable.dispose?.(); }
+    }
+  });
+
+  it("ignores the preview environment variable for an installed extension", async () => {
+    vi.stubEnv("COPILOT_USAGE_PREVIEW", "1");
+    const context = { ...createContext(), extensionMode: vscode.ExtensionMode.Production };
+    try {
+      await activateExtension(context);
+      expect(locateCopilotDataPaths).toHaveBeenCalled();
+      expect(CopilotAccountWatcher).toHaveBeenCalled();
+    } finally {
+      for (const disposable of context.subscriptions) { disposable.dispose?.(); }
     }
   });
 
@@ -846,6 +931,38 @@ describe("activate", () => {
 
     const rootChildren = (await registeredTreeProvider().getChildren()) ?? [];
     expect(rootChildren[0]).toEqual({ kind: "quota", state: { kind: "needs-consent" } });
+  });
+
+  it("updates the ready status when quota arrives and removes it when access is lost", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-21T12:00:00Z"));
+    state.usageIndexResult = {
+      summary: { ...createEmptySummary(), today: createTotal(2_100_000, 0.87) },
+      diagnostics: createDiagnostics(),
+    };
+    vi.mocked(vscode.authentication.getSession).mockResolvedValueOnce({
+      id: "test", accessToken: "test", scopes: [], account: { id: "test", label: "test" },
+    });
+    let respond!: (response: Response) => void;
+    const fetchMock = vi.fn(() => new Promise<Response>((resolve) => { respond = resolve; }));
+    vi.stubGlobal("fetch", fetchMock);
+    const context = createContext();
+    try {
+      await activateExtension(context);
+      await settle();
+      const statusBar = vi.mocked(vscode.window.createStatusBarItem).mock.results[0].value;
+      expect(statusBar.text).toBe("2.1M | 0.87$");
+      respond(new Response(JSON.stringify({ quota_snapshots: { premium_models: {
+        entitlement: 1500, percent_remaining: 841 / 15, reset_date: "2026-10-01",
+      } } })));
+      await vi.waitFor(() => expect(statusBar.text).toBe("2.1M | 0.87$ • 44 / 100%"));
+      expect(statusBar.command).toBe("copilotUsage.openView");
+      await commandCallback("copilotUsage.connectQuota")();
+      expect(statusBar.text).toBe("2.1M | 0.87$");
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      for (const disposable of context.subscriptions) { disposable.dispose?.(); }
+    }
   });
 
   it("asks for consent only when the user clicks the quota row", async () => {
