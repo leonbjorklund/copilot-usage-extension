@@ -11,6 +11,8 @@ import * as vscode from 'vscode';
  */
 /** Copilot writes several lines per request, so a burst becomes one read. */
 const READ_DELAY_MS = 500;
+/** Windows may defer file notifications while Copilot keeps its log open. */
+const POLL_INTERVAL_MS = 2_000;
 
 /** Copilot Chat's log sits beside this extension's own log folder. */
 export function copilotChatLogPath(extensionLogPath: string): string {
@@ -41,6 +43,8 @@ export class CopilotAccountWatcher implements CopilotAccountSource {
   private login: string | undefined;
   private reading: Promise<void>;
   private readTimer: ReturnType<typeof setTimeout> | undefined;
+  private pollTimer: ReturnType<typeof setTimeout> | undefined;
+  private disposed = false;
 
   readonly onDidChange = this.changeEmitter.event;
 
@@ -58,6 +62,7 @@ export class CopilotAccountWatcher implements CopilotAccountSource {
       watcher.onDidChange(() => this.scheduleRead()),
     );
     this.reading = this.read();
+    this.schedulePoll();
   }
 
   async currentLogin(): Promise<string | undefined> {
@@ -66,9 +71,14 @@ export class CopilotAccountWatcher implements CopilotAccountSource {
   }
 
   dispose(): void {
+    this.disposed = true;
     if (this.readTimer) {
       clearTimeout(this.readTimer);
       this.readTimer = undefined;
+    }
+    if (this.pollTimer) {
+      clearTimeout(this.pollTimer);
+      this.pollTimer = undefined;
     }
 
     for (const disposable of this.disposables) {
@@ -78,6 +88,9 @@ export class CopilotAccountWatcher implements CopilotAccountSource {
   }
 
   private scheduleRead(): void {
+    if (this.disposed) {
+      return;
+    }
     if (this.readTimer) {
       clearTimeout(this.readTimer);
     }
@@ -88,9 +101,28 @@ export class CopilotAccountWatcher implements CopilotAccountSource {
     }, READ_DELAY_MS);
   }
 
+  private schedulePoll(): void {
+    if (this.disposed) {
+      return;
+    }
+    this.pollTimer = setTimeout(() => {
+      this.pollTimer = undefined;
+      this.reading = this.reading.then(() => this.read());
+      // Check only this local log. An unchanged login emits no quota request.
+      // Wait for the read to finish so slow disk access cannot build a queue.
+      void this.reading.then(() => this.schedulePoll());
+    }, POLL_INTERVAL_MS);
+  }
+
   private async read(): Promise<void> {
+    if (this.disposed) {
+      return;
+    }
     try {
       const appended = await readAppendedLines(this.logPath, this.offset);
+      if (this.disposed) {
+        return;
+      }
       this.offset = appended.nextOffset;
       const login = lastLoginInLog(appended.text);
       if (login !== undefined && login !== this.login) {

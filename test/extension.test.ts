@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -993,6 +993,70 @@ describe("activate", () => {
       createIfNone: true,
       clearSessionPreference: true,
     });
+  });
+
+  it("updates status and tree quota after an account switch without file events or reload", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-21T12:00:00Z"));
+    const root = await mkdtemp(join(tmpdir(), "copilot-quota-switch-"));
+    roots.push(root);
+    const logFolder = join(root, "GitHub.copilot-chat");
+    const logPath = join(logFolder, "GitHub Copilot Chat.log");
+    await mkdir(logFolder);
+    await writeFile(logPath, "[info] Logged in as octocat\n");
+    const realAccount = await vi.importActual<typeof import("../src/core/copilotAccount")>("../src/core/copilotAccount");
+    vi.mocked(CopilotAccountWatcher).mockImplementationOnce(function (path) {
+      return new realAccount.CopilotAccountWatcher(path);
+    });
+    const accounts = ["octocat", "hubot"].map(label => ({ id: label, label }));
+    vi.mocked(vscode.authentication.getAccounts).mockResolvedValue(accounts);
+    vi.mocked(vscode.authentication.getSession).mockImplementation(async (_provider, _scopes, options) => ({
+      id: options?.account?.id ?? "octocat",
+      accessToken: options?.account?.label ?? "octocat",
+      scopes: [],
+      account: options?.account ?? accounts[0],
+    }));
+    const fetchMock = vi.fn(async (_url, options: RequestInit) => {
+      const isHubot = new Headers(options.headers).get("Authorization")?.includes("hubot");
+      return new Response(JSON.stringify({ quota_snapshots: { premium_models: {
+        entitlement: isHubot ? 3000 : 1500,
+        percent_remaining: isHubot ? 80 : 90,
+        reset_date: "2026-10-01",
+      } } }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    state.usageIndexResult = {
+      summary: { ...createEmptySummary(), today: createTotal(2_100_000, 0.87) },
+      diagnostics: createDiagnostics(),
+    };
+    const context = createContext();
+    Object.assign(context, { logUri: vscode.Uri.file(join(root, "copilot-usage-extension")) });
+    const writer = await open(logPath, "a");
+    try {
+      await activateExtension(context);
+      const statusBar = vi.mocked(vscode.window.createStatusBarItem).mock.results[0].value;
+      await vi.waitFor(() => expect(statusBar.text).toBe("2.1M | 0.87$ • 10/100%"));
+      expect((await registeredTreeProvider().getChildren())?.[0]).toMatchObject({
+        kind: "quota", state: { account: "octocat", quota: { remaining: 1350, entitlement: 1500 } },
+      });
+
+      await writer.write("[info] Logged in as hubot\n");
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.waitFor(() => expect(statusBar.text).toBe("2.1M | 0.87$ • 20/100%"));
+      expect((await registeredTreeProvider().getChildren())?.[0]).toMatchObject({
+        kind: "quota", state: { account: "hubot", quota: { remaining: 2400, entitlement: 3000 } },
+      });
+      expect(vscode.authentication.getSession).toHaveBeenLastCalledWith("github", [], {
+        silent: true, account: accounts[1],
+      });
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      for (const disposable of context.subscriptions) { disposable.dispose?.(); }
+      await writer.close();
+      vi.mocked(vscode.authentication.getSession).mockReset().mockResolvedValue(undefined);
+      vi.mocked(vscode.authentication.getAccounts).mockReset().mockResolvedValue([]);
+    }
   });
 
   it("re-reads the quota once a log write has settled", async () => {

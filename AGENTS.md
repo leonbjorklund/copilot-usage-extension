@@ -11,7 +11,7 @@
 - Install dependencies: `npm install`
 - Typecheck only: `npm run check-types`
 - Compile (typecheck + bundle): `npm run compile`
-- After code changes, run `npm run preview` to rebuild and open VS Code with mock usage.
+- After code changes, run `npm run preview` to rebuild and open the graph preview with the user's normal VS Code profile, real usage logs, and live quota.
 - Production bundle: `npm run compile:production`, which is what `vscode:prepublish` runs, so packaging always rebuilds
 - Rebuild on change: `npm run watch`, which bundles only, so run `npm run check-types` beside it
 - Delete build output: `npm run clean`

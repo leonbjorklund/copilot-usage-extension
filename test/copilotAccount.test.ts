@@ -1,4 +1,4 @@
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, open, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -175,6 +175,32 @@ describe('CopilotAccountWatcher', () => {
     await logWritten();
     expect(await watcher.currentLogin()).toBe('hubot');
     watcher.dispose();
+  });
+
+  it('detects a switch while the writer stays open and no file event arrives', async () => {
+    await writeFile(copilotLog, line('octocat'));
+    const watcher = new CopilotAccountWatcher(extensionLog);
+    const writer = await open(copilotLog, 'a');
+    const changes = vi.fn();
+    watcher.onDidChange(changes);
+    try {
+      expect(await watcher.currentLogin()).toBe('octocat');
+      await writer.write(line('hubot'));
+
+      // Windows can defer notifications until the writer closes its handle.
+      // Copilot keeps its log open, so no mocked file event is fired here.
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(await watcher.currentLogin()).toBe('hubot');
+      expect(changes).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(await watcher.currentLogin()).toBe('hubot');
+      expect(changes).toHaveBeenCalledTimes(2);
+    } finally {
+      watcher.dispose();
+      await writer.close();
+    }
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it('starts over when the log is replaced by a shorter one', async () => {

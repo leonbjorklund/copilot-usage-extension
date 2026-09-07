@@ -178,8 +178,9 @@ function setStatusBarSetupNeeded(statusBar: vscode.StatusBarItem): void {
 }
 
 export function activate(context: vscode.ExtensionContext): void {
+  const previewGraph = context.extensionMode === vscode.ExtensionMode.Development;
   const preview = process.env.COPILOT_USAGE_PREVIEW === "1" &&
-    context.extensionMode === vscode.ExtensionMode.Development
+    previewGraph
     ? createUsagePreview()
     : undefined;
   const now = () => preview?.now ?? new Date();
@@ -287,8 +288,8 @@ export function activate(context: vscode.ExtensionContext): void {
     treeProvider.setSummary(result.summary);
     const quotaState = preview?.quotaState ?? quotaService?.getState();
     setStatusBarReady(statusBar, result.summary, quotaState?.kind === "quota" ? quotaState.quota : undefined, now());
-    if (preview) {
-      // Throwaway graph only in the mock preview; keep the normal Markdown hover and click action.
+    if (previewGraph) {
+      // Throwaway graph only in development; keep the normal Markdown hover and click action.
       const tooltip = formatStatusBarTooltip(result.summary);
       const theme = vscode.window.activeColorTheme.kind;
       tooltip.value += "\n\n---\n\n" + formatTooltipGraphPrototype(
@@ -469,11 +470,14 @@ export function activate(context: vscode.ExtensionContext): void {
         treeProvider.setQuotaState(quotaState);
         if (readySummary) {
           statusBar.text = formatStatusBarSummary(readySummary, quotaState.kind === "quota" ? quotaState.quota : undefined, now());
+          if (previewGraph && latestDiagnostics) {
+            applyResult({ summary: readySummary, diagnostics: latestDiagnostics });
+          }
         }
       }),
     ] : []),
     ...(copilotAccount ? [copilotAccount] : []),
-    ...(preview ? [vscode.window.onDidChangeActiveColorTheme(() => {
+    ...(previewGraph ? [vscode.window.onDidChangeActiveColorTheme(() => {
       if (readySummary && latestDiagnostics) {
         applyResult({ summary: readySummary, diagnostics: latestDiagnostics });
       }
