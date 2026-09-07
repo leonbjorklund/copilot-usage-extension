@@ -29,6 +29,7 @@ export type UsageNode =
   | {
       kind: "error";
       message: string;
+      pending?: boolean;
     }
   | {
       kind: "quota";
@@ -51,7 +52,7 @@ export type UsageNode =
 export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode>, vscode.Disposable {
   private summary: UsageSummary | undefined;
   private setupNeeded = false;
-  private scanError: string | undefined;
+  private problem: Extract<UsageNode, { kind: "error" }> | undefined;
   private quotaState: QuotaState = { kind: "idle" };
   private readonly changeEmitter = new vscode.EventEmitter<UsageNode | undefined | null | void>();
 
@@ -72,24 +73,24 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode>, vs
     this.changeEmitter.fire();
   }
 
-  setSummary(summary: UsageSummary): void {
+  setSummary(summary: UsageSummary, problemMessage?: string): void {
     this.summary = summary;
     this.setupNeeded = false;
-    this.scanError = undefined;
+    this.problem = problemMessage ? { kind: "error", message: problemMessage } : undefined;
     this.changeEmitter.fire();
   }
 
   setSetupNeeded(): void {
     this.summary = undefined;
     this.setupNeeded = true;
-    this.scanError = undefined;
+    this.problem = undefined;
     this.changeEmitter.fire();
   }
 
-  setScanFailed(message: string): void {
+  setProblem(message: string, pending = false): void {
     this.summary = undefined;
     this.setupNeeded = false;
-    this.scanError = message;
+    this.problem = { kind: "error", message, ...(pending ? { pending: true } : {}) };
     this.changeEmitter.fire();
   }
 
@@ -119,8 +120,8 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode>, vs
       return quota.length > 0 ? [...quota, { kind: "setup" }] : [];
     }
 
-    if (this.scanError !== undefined) {
-      return [...quota, { kind: "error", message: this.scanError }];
+    if (this.problem && !this.summary) {
+      return [...quota, this.problem];
     }
 
     if (!this.summary) {
@@ -130,7 +131,7 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode>, vs
     const buckets = buildBuckets(this.summary, this.now(), this.sortMode).map(
       (bucket): UsageNode => ({ kind: "bucket", bucket }),
     );
-    return [...quota, ...(buckets.length > 0 ? buckets : [{ kind: "empty" } as UsageNode])];
+    return [...quota, ...buckets, ...(this.problem ? [this.problem] : buckets.length > 0 ? [] : [{ kind: "empty" } as UsageNode])];
   }
 
   getTreeItem(element: UsageNode): vscode.TreeItem {
@@ -139,9 +140,10 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode>, vs
     }
 
     if (element.kind === "error") {
-      const item = new vscode.TreeItem("Scan failed", vscode.TreeItemCollapsibleState.None);
-      item.iconPath = new vscode.ThemeIcon("error");
+      const item = new vscode.TreeItem(element.pending ? "Waiting for account evidence" : "Scan failed", vscode.TreeItemCollapsibleState.None);
+      item.iconPath = new vscode.ThemeIcon(element.pending ? "clock" : "error");
       item.tooltip = element.message;
+      if (element.pending) item.command = { command: "copilotUsage.showDiagnostics", title: "Show Scan Diagnostics" };
       return item;
     }
 

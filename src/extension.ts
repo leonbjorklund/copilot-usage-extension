@@ -1,5 +1,6 @@
 import { stat } from "node:fs/promises";
-import { basename } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { homedir } from "node:os";
 
 import * as vscode from "vscode";
 
@@ -22,6 +23,7 @@ import type {
 import { UsageIndex } from "./core/usageIndex";
 import { createUsagePreview } from "./dev/usagePreview";
 import { formatTooltipGraphPrototype } from "./dev/tooltipGraphPrototype";
+import { AccountUsagePoc, trackedUsageQuota, type AccountPocView } from "./dev/accountUsagePoc";
 import { formatPeriodPercentage, formatTokens, formatTotalUsd, formatUsd } from "./ui/formatters";
 import {
   formatDiagnostics,
@@ -159,12 +161,6 @@ function setStatusBarScanning(statusBar: vscode.StatusBarItem): void {
   statusBar.command = "copilotUsage.openView";
 }
 
-function setStatusBarReady(statusBar: vscode.StatusBarItem, summary: UsageSummary, quota: CopilotQuota | undefined, now: Date): void {
-  statusBar.text = formatStatusBarSummary(summary, quota, now);
-  statusBar.tooltip = formatStatusBarTooltip(summary);
-  statusBar.command = "copilotUsage.openView";
-}
-
 function setStatusBarFailed(statusBar: vscode.StatusBarItem, message: string): void {
   statusBar.text = STATUS_BAR_DISPLAY.failedText;
   statusBar.tooltip = message;
@@ -178,9 +174,10 @@ function setStatusBarSetupNeeded(statusBar: vscode.StatusBarItem): void {
 }
 
 export function activate(context: vscode.ExtensionContext): void {
-  const previewGraph = context.extensionMode === vscode.ExtensionMode.Development;
+  const graphEnabled = context.extensionMode === vscode.ExtensionMode.Development ||
+    context.extensionMode === vscode.ExtensionMode.Production;
   const preview = process.env.COPILOT_USAGE_PREVIEW === "1" &&
-    previewGraph
+    context.extensionMode === vscode.ExtensionMode.Development
     ? createUsagePreview()
     : undefined;
   const now = () => preview?.now ?? new Date();
@@ -190,6 +187,16 @@ export function activate(context: vscode.ExtensionContext): void {
   const usageIndex = new UsageIndex();
   const copilotAccount = preview ? undefined : new CopilotAccountWatcher(context.logUri.fsPath);
   const quotaService = copilotAccount ? new CopilotQuotaService(copilotAccount) : undefined;
+  const accountPoc = graphEnabled && !preview ? new AccountUsagePoc(
+    join(context.globalStorageUri.fsPath, 'account-poc'),
+    join(dirname(context.logUri.fsPath), 'GitHub.copilot-chat'),
+    [dirname(dirname(dirname(dirname(context.logUri.fsPath)))),
+      ...['Code', 'Code - Insiders'].map((editor) => join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), editor, 'logs'))],
+  ) : undefined;
+  let pocView: AccountPocView | undefined;
+  let rawSummary: UsageSummary | undefined;
+  let pocTimer: ReturnType<typeof setTimeout> | undefined;
+  let disposed = false;
   if (preview) {
     treeProvider.setQuotaState(preview.quotaState);
   }
@@ -208,8 +215,15 @@ export function activate(context: vscode.ExtensionContext): void {
   statusBar.show();
   void setSortModeContext(initialSortMode);
 
-  async function runRefresh(): Promise<void> {
+  function runRefresh(): Promise<void> {
     const refreshGeneration = ++generation;
+    // Rebuilds, file events, and polling mutate the same index. Never overlap.
+    updateChain = updateChain.then(() => rebuildUsage(refreshGeneration));
+    return updateChain;
+  }
+
+  async function rebuildUsage(refreshGeneration: number): Promise<void> {
+    if (disposed || refreshGeneration !== generation) return;
     readySummary = undefined;
     // The credit quota is not read from the logs, so it is fetched even when
     // logging is off and the tree is showing the setup row.
@@ -234,10 +248,11 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
 
-      applyResult(result);
+      await acceptResult(result, refreshGeneration);
+      if (disposed || refreshGeneration !== generation) return;
       syncWatchers(usageIndex.getWatchFolders());
     } catch (error) {
-      if (refreshGeneration === generation) {
+      if (!disposed && refreshGeneration === generation) {
         reportScanFailure(error);
       }
     }
@@ -247,7 +262,7 @@ export function activate(context: vscode.ExtensionContext): void {
     readySummary = undefined;
     const message = error instanceof Error ? error.message : String(error);
     setStatusBarFailed(statusBar, message);
-    treeProvider.setScanFailed(message);
+    treeProvider.setProblem(message);
   }
 
   async function openView(): Promise<void> {
@@ -285,21 +300,67 @@ export function activate(context: vscode.ExtensionContext): void {
   function applyResult(result: { summary: UsageSummary; diagnostics: UsageDiagnostics }): void {
     latestDiagnostics = result.diagnostics;
     readySummary = result.summary;
-    treeProvider.setSummary(result.summary);
+    treeProvider.setSummary(result.summary, pocView?.problem);
     const quotaState = preview?.quotaState ?? quotaService?.getState();
-    setStatusBarReady(statusBar, result.summary, quotaState?.kind === "quota" ? quotaState.quota : undefined, now());
-    if (previewGraph) {
-      // Throwaway graph only in development; keep the normal Markdown hover and click action.
-      const tooltip = formatStatusBarTooltip(result.summary);
+    const matchingQuota = quotaState?.kind === "quota" && (!accountPoc || quotaState.account.toLowerCase() === pocView?.account)
+      ? quotaState.quota : undefined;
+    if (accountPoc) treeProvider.setQuotaState(matchingQuota || (quotaState?.kind === 'needs-consent' &&
+      quotaState.account?.toLowerCase() === pocView?.account) ? quotaState! : { kind: 'idle' });
+    const displayQuota = matchingQuota && accountPoc ? trackedUsageQuota(matchingQuota, result.summary) : matchingQuota;
+    statusBar.text = formatStatusBarSummary(result.summary, matchingQuota, now());
+    statusBar.command = "copilotUsage.openView";
+    const tooltip = formatStatusBarTooltip(result.summary);
+    if (graphEnabled) {
+      // Preserve the native Markdown hover and click action in every window.
       const theme = vscode.window.activeColorTheme.kind;
       tooltip.value += "\n\n---\n\n" + formatTooltipGraphPrototype(
-        result.summary, quotaState?.kind === "quota" ? quotaState.quota : undefined, now(),
+        result.summary, displayQuota, now(),
         theme === vscode.ColorThemeKind.Light || theme === vscode.ColorThemeKind.HighContrastLight,
         theme === vscode.ColorThemeKind.HighContrast || theme === vscode.ColorThemeKind.HighContrastLight,
+        pocView?.startedAt,
       );
-      statusBar.tooltip = tooltip;
+      if (pocView?.excluded) tooltip.value += `\n\n${pocView.excluded} request(s) excluded around account switches. See Show Scan Diagnostics.`;
+      if (pocView?.problem) tooltip.value += `\n\n${escapeHtml(pocView.problem)}`;
+    }
+    statusBar.tooltip = tooltip;
+    if (pocView?.problem && !pocView.account) {
+      setStatusBarFailed(statusBar, pocView.problem);
+      statusBar.text = "Waiting for account evidence";
+      treeProvider.setProblem(pocView.problem, true);
     }
   }
+
+  async function acceptResult(result: { summary: UsageSummary; diagnostics: UsageDiagnostics }, acceptedGeneration: number): Promise<void> {
+    if (disposed || acceptedGeneration !== generation) return;
+    const nextPocView = await accountPoc?.refresh(result.summary, now());
+    if (disposed || acceptedGeneration !== generation) return;
+    rawSummary = result.summary;
+    pocView = nextPocView;
+    applyResult({ ...result, summary: pocView?.summary ?? result.summary });
+  }
+
+  function schedulePocPoll(): void {
+    if (!accountPoc || disposed) return;
+    pocTimer = setTimeout(() => {
+      pocTimer = undefined;
+      const pollGeneration = generation;
+      updateChain = updateChain.then(async () => {
+        if (disposed || pollGeneration !== generation || !rawSummary || !isCopilotFileLoggingEnabled()) return;
+        const result = await usageIndex.poll({ config: currentConfig, now: now() });
+        await acceptResult(result, pollGeneration);
+        if (disposed || pollGeneration !== generation) return;
+        syncWatchers(usageIndex.getWatchFolders());
+        // Preserve the quota service's settle delay and one-minute floor.
+        if (result.summary.allTime.githubCopilot.aiCredits !== rawCreditsAtLastPoll) {
+          rawCreditsAtLastPoll = result.summary.allTime.githubCopilot.aiCredits;
+          quotaService?.scheduleRefresh();
+        }
+      }).catch((error: unknown) => {
+        if (!disposed && pollGeneration === generation) reportScanFailure(error);
+      }).finally(schedulePocPoll);
+    }, 2_000);
+  }
+  let rawCreditsAtLastPoll = 0;
 
   function setSetupNeededContext(value: boolean): Thenable<unknown> {
     return vscode.commands.executeCommand("setContext", SETUP_NEEDED_CONTEXT, value);
@@ -374,8 +435,10 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   async function scheduleCreatedPath(path: string): Promise<void> {
+    const createdGeneration = generation;
     try {
       const fileStat = await stat(path);
+      if (disposed || createdGeneration !== generation) return;
       if (fileStat.isDirectory()) {
         syncWatchers([...usageIndex.getWatchFolders(), path]);
         scheduleFileUpdate(path, true);
@@ -426,7 +489,9 @@ export function activate(context: vscode.ExtensionContext): void {
       const flushGeneration = eventGeneration;
       updateChain = updateChain
         .then(() => processFileEvents(pathsToUpdate, pathsToDelete, flushGeneration))
-        .catch((error: unknown) => reportScanFailure(error));
+        .catch((error: unknown) => {
+          if (!disposed && flushGeneration === generation) reportScanFailure(error);
+        });
     }, 100);
   }
 
@@ -435,7 +500,7 @@ export function activate(context: vscode.ExtensionContext): void {
     pathsToDelete: string[],
     flushGeneration: number,
   ): Promise<void> {
-    if (flushGeneration !== generation) {
+    if (disposed || flushGeneration !== generation) {
       return;
     }
 
@@ -451,7 +516,8 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
 
-    applyResult(result);
+    await acceptResult(result, flushGeneration);
+    if (disposed || flushGeneration !== generation) return;
     syncWatchers(usageIndex.getWatchFolders());
     // Copilot has just billed credits; ask GitHub for the new total once the
     // log stops changing.
@@ -467,17 +533,19 @@ export function activate(context: vscode.ExtensionContext): void {
       quotaService,
       quotaService.onDidChange(() => {
         const quotaState = quotaService.getState();
-        treeProvider.setQuotaState(quotaState);
+        // Quota remains useful when logging is off or the scan cannot run.
+        if (!accountPoc || !readySummary) treeProvider.setQuotaState(quotaState);
         if (readySummary) {
-          statusBar.text = formatStatusBarSummary(readySummary, quotaState.kind === "quota" ? quotaState.quota : undefined, now());
-          if (previewGraph && latestDiagnostics) {
+          if (graphEnabled && latestDiagnostics) {
             applyResult({ summary: readySummary, diagnostics: latestDiagnostics });
+          } else {
+            statusBar.text = formatStatusBarSummary(readySummary, quotaState.kind === "quota" ? quotaState.quota : undefined, now());
           }
         }
       }),
     ] : []),
     ...(copilotAccount ? [copilotAccount] : []),
-    ...(previewGraph ? [vscode.window.onDidChangeActiveColorTheme(() => {
+    ...(graphEnabled ? [vscode.window.onDidChangeActiveColorTheme(() => {
       if (readySummary && latestDiagnostics) {
         applyResult({ summary: readySummary, diagnostics: latestDiagnostics });
       }
@@ -501,7 +569,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("copilotUsage.showDiagnostics", () =>
       vscode.window.showInformationMessage(
         latestDiagnostics
-          ? formatDiagnostics(latestDiagnostics)
+          ? formatDiagnostics(latestDiagnostics) + (pocView ? `\n\n${pocView.diagnostics}` : '')
           : "No Copilot usage scan has completed yet.",
         { modal: true },
       ),
@@ -517,6 +585,8 @@ export function activate(context: vscode.ExtensionContext): void {
       void runRefresh();
     }),
     new vscode.Disposable(() => {
+      disposed = true;
+      if (pocTimer) clearTimeout(pocTimer);
       disposeWatchers();
       if (eventTimer) {
         clearTimeout(eventTimer);
@@ -526,6 +596,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   void runRefresh();
+  schedulePocPoll();
 }
 
 function readPersistedSortMode(context: vscode.ExtensionContext): UsageTreeSortMode {

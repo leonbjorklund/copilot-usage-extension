@@ -40,6 +40,8 @@ export interface UsageRecord {
   hiddenFromExplorer?: boolean;
   metadataOnly?: boolean;
   titlePriority?: number;
+  /** Correlation evidence for account attribution. */
+  debugRequest?: { responseId: string; spanId: string; durationMs: number };
 }
 
 export interface ExtensionConfig {

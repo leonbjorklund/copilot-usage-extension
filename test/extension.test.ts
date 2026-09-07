@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, mkdtemp, open, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -139,6 +139,11 @@ vi.mock("vscode", () => ({
 
 import * as vscode from "vscode";
 import { CopilotAccountWatcher } from "../src/core/copilotAccount";
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs/promises")>();
+  return { ...actual, stat: vi.fn(actual.stat) };
+});
 
 vi.mock("../src/core/locator", () => ({ locateCopilotDataPaths }));
 vi.mock("../src/core/copilotAccount", () => ({
@@ -562,20 +567,6 @@ describe("activate", () => {
     }
   });
 
-  it("ignores the preview environment variable for an installed extension", async () => {
-    vi.stubEnv("COPILOT_USAGE_PREVIEW", "1");
-    const context = { ...createContext(), extensionMode: vscode.ExtensionMode.Production };
-    try {
-      await activateExtension(context);
-      expect(locateCopilotDataPaths).toHaveBeenCalled();
-      expect(CopilotAccountWatcher).toHaveBeenCalled();
-      const statusBar = vi.mocked(vscode.window.createStatusBarItem).mock.results[0].value;
-      expect(statusBar.tooltip.value).not.toContain("Last 30 days");
-    } finally {
-      for (const disposable of context.subscriptions) { disposable.dispose?.(); }
-    }
-  });
-
   it("shows setup action and skips scanning when Copilot file logging is disabled", async () => {
     state.copilotFileLoggingEnabled = false;
     const statusBar = {
@@ -833,6 +824,30 @@ describe("activate", () => {
     expect(usageIndexInstances[0].applyChanges).not.toHaveBeenCalled();
   });
 
+  it.each(['refresh', 'disposal'])('ignores created folders whose stat finishes after %s', async (change) => {
+    vi.useFakeTimers();
+    const context = createContext();
+    await activateExtension(context);
+    let finishStat!: (value: Awaited<ReturnType<typeof stat>>) => void;
+    vi.mocked(stat).mockImplementationOnce(() => new Promise((resolve) => { finishStat = resolve; }));
+    watcherRegistrations[0].handlers.create[0]({ fsPath: 'root/GitHub.copilot-chat/late-folder' });
+    expect(finishStat).toBeTypeOf('function');
+
+    if (change === 'refresh') {
+      state.watchFolders = ['new-root'];
+      await commandCallback('copilotUsage.refresh')();
+    } else {
+      for (const disposable of context.subscriptions) disposable.dispose?.();
+    }
+    const watcherCount = watcherRegistrations.length;
+    finishStat({ isDirectory: () => true } as Awaited<ReturnType<typeof stat>>);
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(watcherRegistrations).toHaveLength(watcherCount);
+    expect(usageIndexInstances[0].applyChanges).not.toHaveBeenCalled();
+    for (const disposable of context.subscriptions) disposable.dispose?.();
+  });
+
   it("removes watchers for folders no longer needed after file events", async () => {
     vi.useFakeTimers();
     state.watchFolders = ["root/GitHub.copilot-chat", "root/GitHub.copilot-chat/session"];
@@ -913,8 +928,9 @@ describe("activate", () => {
     await activateExtension();
 
     const refresh = commandCallback("copilotUsage.refresh");
-    await refresh();
+    const refreshing = refresh();
     rejectFirst(firstError);
+    await refreshing;
     await settle();
 
     expect(statusBar.text).not.toBe("Scan Failed");
@@ -934,6 +950,26 @@ describe("activate", () => {
     expect(watcherRegistrations).toHaveLength(2);
   });
 
+  it("waits for an active file update before rebuilding the same index", async () => {
+    vi.useFakeTimers();
+    await activateExtension();
+    const index = usageIndexInstances[0];
+    let finishUpdate!: (value: unknown) => void;
+    index.applyChanges.mockImplementationOnce(() => new Promise((resolve) => { finishUpdate = resolve; }));
+    watcherRegistrations[0].handlers.change[0]({ fsPath: "root/GitHub.copilot-chat/usage.jsonl" });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(index.applyChanges).toHaveBeenCalledTimes(1);
+    const refresh = commandCallback("copilotUsage.refresh")();
+    try {
+      await settle();
+      expect(index.rebuild).toHaveBeenCalledTimes(1);
+    } finally {
+      finishUpdate(state.usageIndexResult);
+      await refresh;
+    }
+    expect(index.rebuild).toHaveBeenCalledTimes(2);
+  });
+
   it("explains a failed scan in the tree instead of leaving it blank", async () => {
     locateCopilotDataPaths.mockRejectedValueOnce(new Error("profile folder is locked"));
 
@@ -949,6 +985,35 @@ describe("activate", () => {
 
     const rootChildren = (await registeredTreeProvider().getChildren()) ?? [];
     expect(rootChildren[0]).toEqual({ kind: "quota", state: { kind: "needs-consent" } });
+  });
+
+  it.each(['logging disabled', 'scan failed'])("keeps quota available in development with %s", async (failure) => {
+    vi.useFakeTimers();
+    const root = await mkdtemp(join(tmpdir(), 'copilot-quota-independent-'));
+    roots.push(root);
+    if (failure === 'logging disabled') state.copilotFileLoggingEnabled = false;
+    else locateCopilotDataPaths.mockRejectedValue(new Error('Cannot scan logs'));
+    const context = { ...createContext(), extensionMode: vscode.ExtensionMode.Development,
+      globalStorageUri: vscode.Uri.file(join(root, 'storage')) };
+    try {
+      activate(context);
+      await vi.waitFor(async () => expect((await registeredTreeProvider().getChildren())?.[0]).toEqual({
+        kind: 'quota', state: { kind: 'needs-consent' },
+      }));
+      vi.mocked(vscode.authentication.getSession).mockResolvedValue({
+        id: 'alice', accessToken: 'test', scopes: [], account: { id: 'alice', label: 'alice' },
+      });
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ quota_snapshots: { premium_models: {
+        entitlement: 100, percent_remaining: 50, reset_date: '2026-10-01',
+      } } }))));
+      await commandCallback('copilotUsage.connectQuota')();
+      const rows = await registeredTreeProvider().getChildren();
+      expect(rows?.[0]).toMatchObject({ kind: 'quota', state: { account: 'alice', quota: { remaining: 50 } } });
+      expect(rows?.[1].kind).toBe(failure === 'logging disabled' ? 'setup' : 'error');
+    } finally {
+      for (const disposable of context.subscriptions) disposable.dispose?.();
+      vi.mocked(vscode.authentication.getSession).mockReset().mockResolvedValue(undefined);
+    }
   });
 
   it("updates the ready status when quota arrives and removes it when access is lost", async () => {
@@ -993,6 +1058,171 @@ describe("activate", () => {
       createIfNone: true,
       clearSessionPreference: true,
     });
+  });
+
+  it.each([
+    { mode: vscode.ExtensionMode.Development, switchedAccount: 'bob' },
+    { mode: vscode.ExtensionMode.Development, switchedAccount: 'bob_company' },
+    { mode: vscode.ExtensionMode.Production, switchedAccount: 'bob' },
+    { mode: vscode.ExtensionMode.Production, switchedAccount: 'bob_company' },
+  ])("runs the real account pipeline in mode $mode and switches quota and usage to $switchedAccount", async ({ mode, switchedAccount }) => {
+    vi.useFakeTimers();
+    // An installed extension must ignore the mock-preview environment flag.
+    if (mode === vscode.ExtensionMode.Production) vi.stubEnv('COPILOT_USAGE_PREVIEW', '1');
+    const start = new Date(2026, 8, 21, 12);
+    vi.setSystemTime(start);
+    const root = await mkdtemp(join(tmpdir(), "copilot-poc-integration-"));
+    roots.push(root);
+    vi.stubEnv("APPDATA", join(root, "roaming"));
+    const host = join(root, "logs", "20260921T120000", "window1", "exthost");
+    const logFolder = join(host, "GitHub.copilot-chat");
+    await mkdir(logFolder, { recursive: true });
+    const log = join(logFolder, "GitHub Copilot Chat.log");
+    const stamp = (offset: number, text: string) => {
+      const d = new Date(start.getTime() + offset);
+      return `2026-09-21 12:00:${String(d.getSeconds()).padStart(2, '0')}.${String(d.getMilliseconds()).padStart(3, '0')} [info] ${text}\n`;
+    };
+    await writeFile(log, stamp(0, "Logged in as alice") + stamp(100, "Got Copilot token for alice"));
+    const dataRoot = join(root, "usage");
+    await mkdir(dataRoot);
+    async function writeRequest(chat: string, offset: number, credits: number, id: string) {
+      const folder = join(dataRoot, "debug-logs", chat);
+      await mkdir(folder, { recursive: true });
+      await writeFile(join(folder, "main.jsonl"), [
+        { type: "session_start", ts: start.getTime() + offset - 1_000 },
+        { type: "llm_request", ts: start.getTime() + offset, dur: 1000, spanId: id, sid: chat,
+          attrs: { model: "model", debugName: chat, responseId: id, inputTokens: 80, outputTokens: 20,
+            copilotUsageNanoAiu: credits * 1_000_000_000 } },
+      ].map((row) => JSON.stringify(row)).join('\n') + '\n');
+    }
+    await writeRequest("historical", -60_000, 99, "old");
+    const realIndex = await vi.importActual<typeof import("../src/core/usageIndex")>("../src/core/usageIndex");
+    const { UsageIndex } = await import("../src/core/usageIndex");
+    vi.mocked(UsageIndex).mockImplementationOnce(function () { return new realIndex.UsageIndex(); });
+    const realAccount = await vi.importActual<typeof import("../src/core/copilotAccount")>("../src/core/copilotAccount");
+    vi.mocked(CopilotAccountWatcher).mockImplementationOnce(function (path) { return new realAccount.CopilotAccountWatcher(path); });
+    locateCopilotDataPaths.mockResolvedValue([dataRoot]);
+    const accounts = ['alice', switchedAccount].map((label) => ({ id: label, label }));
+    vi.mocked(vscode.authentication.getAccounts).mockResolvedValue(accounts);
+    vi.mocked(vscode.authentication.getSession).mockImplementation(async (_provider, _scopes, options) => ({
+      id: options?.account?.id ?? 'alice', accessToken: 'test-token', scopes: [], account: options?.account ?? accounts[0],
+    }));
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ quota_snapshots: { premium_models: {
+      entitlement: 100, percent_remaining: 50, overage_count: 0, reset_date: '2026-10-01',
+    } } })));
+    vi.stubGlobal('fetch', fetchMock);
+    const context = { ...createContext(), extensionMode: mode,
+      logUri: vscode.Uri.file(join(host, "leonbjorklund.copilot-usage-extension")),
+      globalStorageUri: vscode.Uri.file(join(root, "storage")) };
+    try {
+      vi.setSystemTime(start.getTime() + 1_000);
+      activate(context);
+      const status = vi.mocked(vscode.window.createStatusBarItem).mock.results[0].value;
+      await vi.waitFor(() => expect(status.text).toBe('No sessions today • 50/100%'));
+      await writeRequest('alice-chat', 5_000, 2, 'alice-request');
+      await appendFile(log, stamp(6_000, 'request done: requestId: [alice-request] model deployment ID: []'));
+      await vi.advanceTimersByTimeAsync(10_000);
+      await vi.waitFor(() => expect(status.text).toBe('100 | 0.02$ • 50/100%'));
+      expect(status.tooltip.value).toContain('alice-chat');
+      expect(status.tooltip.value).not.toContain('historical');
+      expect(status.tooltip.value).toContain('20 Sept · not tracked');
+      expect(status.tooltip.value).toContain('avg. 100 (0.02$) / day');
+      expect(status.tooltip.value).toContain('Period 2%');
+      await appendFile(log, stamp(10_000, `Logged in as ${switchedAccount}`) + stamp(10_100, `Got Copilot token for ${switchedAccount}`));
+      await writeRequest('bob-chat', 14_000, 5, 'bob-request');
+      await appendFile(log, stamp(15_000, 'request done: requestId: [bob-request] model deployment ID: []'));
+      await vi.advanceTimersByTimeAsync(10_000);
+      await vi.waitFor(() => expect(status.text).toBe('100 | 0.05$ • 50/100%'));
+      expect(status.tooltip.value).toContain('bob-chat');
+      expect(status.tooltip.value).not.toContain('alice-chat');
+      const children = await registeredTreeProvider().getChildren();
+      expect(children?.[0]).toMatchObject({ kind: 'quota', state: { account: switchedAccount, quota: { remaining: 50 } } });
+      expect(children?.[1]).toMatchObject({ kind: 'bucket', bucket: { tokens: 100, githubCopilot: { aiCredits: 5 } } });
+      expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(3);
+      expect(vscode.authentication.getSession).toHaveBeenLastCalledWith('github', [], { silent: true, account: accounts[1] });
+
+      // A delayed completion from Alice must not hide Bob's confirmed usage.
+      await writeRequest('alice-delayed', 6_500, 3, 'delayed-request');
+      await vi.advanceTimersByTimeAsync(3_000);
+      await vi.waitFor(async () => {
+        await commandCallback('copilotUsage.showDiagnostics')();
+        expect(vi.mocked(vscode.window.showInformationMessage).mock.calls.at(-1)?.[0]).toContain('unresolved requests: 1');
+      });
+      expect(status.text).toBe('100 | 0.05$ • 50/100%');
+      expect(status.tooltip.value).toContain('Last 30 days');
+      expect(status.tooltip.value).toContain('bob-chat');
+      expect(status.tooltip.value).not.toContain('Waiting for account evidence');
+      expect((await registeredTreeProvider().getChildren())?.some((row) => row.kind === 'error')).toBe(false);
+      expect((await registeredTreeProvider().getChildren())?.some((row) => row.kind === 'bucket')).toBe(true);
+
+      await appendFile(log, stamp(7_500, 'request done: requestId: [delayed-request]'));
+      await vi.advanceTimersByTimeAsync(3_000);
+      await vi.waitFor(async () => {
+        await commandCallback('copilotUsage.showDiagnostics')();
+        expect(vi.mocked(vscode.window.showInformationMessage).mock.calls.at(-1)?.[0]).toContain('unresolved requests: 0');
+      });
+      expect(status.text).toBe('100 | 0.05$ • 50/100%');
+
+      // Switch back while quota is blocked on the network. Local saved usage
+      // must return without waiting for that request or mixing Bob's quota.
+      let finishQuota!: (response: Response) => void;
+      fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => { finishQuota = resolve; }));
+      const switchAt = Date.now() - start.getTime();
+      await appendFile(log, stamp(switchAt, 'Logged in as alice') + stamp(switchAt + 100, 'Got Copilot token for alice'));
+      await vi.advanceTimersByTimeAsync(3_000);
+      await vi.waitFor(() => expect(status.text).toBe('200 | 0.05$'));
+      expect(status.tooltip.value).toContain('alice-delayed');
+      expect(status.tooltip.value).not.toContain('bob-chat');
+      const aliceRows = await registeredTreeProvider().getChildren();
+      expect(aliceRows?.some((row) => row.kind === 'quota')).toBe(false);
+      const aliceBucket = aliceRows?.find((row) => row.kind === 'bucket');
+      expect(aliceBucket?.kind === 'bucket' && aliceBucket.bucket.chats.map((chat) => chat.title).sort()).toEqual(['alice-chat', 'alice-delayed']);
+      await vi.waitFor(() => expect(finishQuota).toBeTypeOf('function'));
+      finishQuota(new Response(JSON.stringify({ quota_snapshots: { premium_models: {
+        entitlement: 100, percent_remaining: 75, overage_count: 0, reset_date: '2026-10-01',
+      } } })));
+      await vi.waitFor(() => expect(status.text).toBe('200 | 0.05$ • 25/100%'));
+
+      // A second real pipeline shares the journal but follows its own window.
+      const secondHost = join(root, 'logs', '20260921T120000', 'window2', 'exthost');
+      const secondLogFolder = join(secondHost, 'GitHub.copilot-chat');
+      await mkdir(secondLogFolder, { recursive: true });
+      await writeFile(join(secondLogFolder, 'GitHub Copilot Chat.log'),
+        stamp(0, `Logged in as ${switchedAccount}`) + stamp(100, `Got Copilot token for ${switchedAccount}`));
+      const secondContext = { ...context, subscriptions: [], logUri: vscode.Uri.file(join(secondHost, 'leonbjorklund.copilot-usage-extension')) };
+      const secondStatus = { show: vi.fn() } as unknown as vscode.StatusBarItem;
+      vi.mocked(vscode.window.createStatusBarItem).mockReturnValueOnce(secondStatus);
+      vi.mocked(UsageIndex).mockImplementationOnce(function () { return new realIndex.UsageIndex(); });
+      vi.mocked(CopilotAccountWatcher).mockImplementationOnce(function (path) { return new realAccount.CopilotAccountWatcher(path); });
+      try {
+        activate(secondContext);
+        await vi.waitFor(() => expect(secondStatus.text).toBe('100 | 0.05$ • 50/100%'));
+        expect((secondStatus.tooltip as vscode.MarkdownString).value).toContain('bob-chat');
+        expect((secondStatus.tooltip as vscode.MarkdownString).value).not.toContain('alice-delayed');
+        await vi.advanceTimersByTimeAsync(3_000);
+        expect(status.text).toBe('200 | 0.05$ • 25/100%');
+        expect(secondStatus.text).toBe('100 | 0.05$ • 50/100%');
+      } finally {
+        for (const disposable of secondContext.subscriptions as vscode.Disposable[]) disposable.dispose?.();
+      }
+
+      // Restart with no usage logs. Persisted account totals and graph survive.
+      for (const disposable of context.subscriptions.splice(0)) disposable.dispose?.();
+      await rm(dataRoot, { recursive: true, force: true });
+      vi.mocked(UsageIndex).mockImplementationOnce(function () { return new realIndex.UsageIndex(); });
+      vi.mocked(CopilotAccountWatcher).mockImplementationOnce(function (path) { return new realAccount.CopilotAccountWatcher(path); });
+      vi.mocked(vscode.window.createStatusBarItem).mockReturnValueOnce(status);
+      activate(context);
+      await vi.waitFor(() => expect(status.text).toBe('200 | 0.05$ • 50/100%'));
+      expect(status.tooltip.value).toContain('alice-delayed');
+      expect(status.tooltip.value).toContain('Last 30 days');
+      expect(status.tooltip.value).not.toContain('bob-chat');
+    } finally {
+      for (const disposable of context.subscriptions) disposable.dispose?.();
+      vi.useRealTimers();
+      vi.mocked(vscode.authentication.getSession).mockReset().mockResolvedValue(undefined);
+      vi.mocked(vscode.authentication.getAccounts).mockReset().mockResolvedValue([]);
+    }
   });
 
   it("updates status and tree quota after an account switch without file events or reload", async () => {

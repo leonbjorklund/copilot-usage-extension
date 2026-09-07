@@ -102,6 +102,36 @@ export class UsageIndex {
     return this.summarize(options);
   }
 
+  /** Reconcile disk state when writers delay filesystem notifications. */
+  async poll(options: UsageIndexUpdateOptions): Promise<UsageServiceResult> {
+    const scan = await scanUsageFiles(this.roots, {
+      maxFileSizeBytes: options.config.maxFileSizeMb * 1024 * 1024,
+      maxDepth: options.config.maxScanDepth,
+      broadRootPaths: customDataRoots(options.config),
+      includeFilesOutsideUsageFolders: false,
+    });
+    this.scanDiagnostics = scan.diagnostics;
+    this.watchFolders = scan.watchFolders;
+    const scannedFiles = new Map<string, string>();
+    await forEachLimited(scan.files, MAX_CONCURRENT_FILE_PARSES, async (file) => {
+      scannedFiles.set(await fileStateKey(file), file);
+    });
+    for (const key of this.files.keys()) {
+      if (!scannedFiles.has(key)) {
+        this.files.delete(key);
+        this.invalidateCaches();
+      }
+    }
+    const files = [...scannedFiles.values()];
+    await forEachLimited(files.filter((file) => !isMetadataPath(file)), MAX_CONCURRENT_FILE_PARSES,
+      (file) => this.updateFileState(file, options.config));
+    await forEachLimited(files.filter(isMetadataPath), MAX_CONCURRENT_FILE_PARSES,
+      (file) => this.updateFileState(file, options.config));
+    this.pruneMetadataForBilledChats(this.getBilledChatIds());
+    this.summaryCache = undefined;
+    return this.summarize(options);
+  }
+
   private summarize(options: UsageIndexUpdateOptions): UsageServiceResult {
     const now = options.now ?? new Date();
     const localDateKey = formatLocalDateKey(now);

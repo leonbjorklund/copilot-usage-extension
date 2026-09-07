@@ -70,6 +70,44 @@ describe('UsageIndex', () => {
     });
   });
 
+  it('polls missed deletions and drops metadata for deleted billed chats', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    const folder = join(root, 'debug-logs', 'billed');
+    await mkdir(folder, { recursive: true });
+    const file = join(folder, 'main.jsonl');
+    await writeFile(file, JSON.stringify(usageRecord('billed', 7)) + '\n');
+    await writeFile(join(folder, 'title-response.jsonl'), JSON.stringify({
+      type: 'agent_response', ts: Date.parse('2026-05-28T08:00:01.000Z'),
+      attrs: { response: JSON.stringify([{ role: 'assistant', parts: [{ type: 'text', content: 'Billed title' }] }]) },
+    }));
+    const index = new UsageIndex();
+    const options = { config: configForRoot(root), now: new Date('2026-05-28T12:00:00Z') };
+    expect((await index.rebuild({ roots: [root], ...options })).summary.allTime.tokens).toBe(7);
+
+    await rm(file);
+    const result = await index.poll(options);
+    expect(result.summary.chats).toEqual([]);
+    expect(result.diagnostics.files).toBe(0);
+    expect(result.diagnostics.normalizedRecords).toBe(0);
+  });
+
+  it('polls files that exceeded the size limit without a notification', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    const file = join(root, 'usage.jsonl');
+    await writeFile(file, JSON.stringify(usageRecord('billed', 7)) + '\n');
+    const index = new UsageIndex();
+    const options = { config: { ...configForRoot(root), maxFileSizeMb: 0.001 } };
+    expect((await index.rebuild({ roots: [root], ...options })).summary.allTime.tokens).toBe(7);
+
+    await appendFile(file, ' '.repeat(2048));
+    const result = await index.poll(options);
+    expect(result.summary.allTime.tokens).toBe(0);
+    expect(result.diagnostics.files).toBe(0);
+    expect(result.diagnostics.oversizedFiles).toBe(1);
+  });
+
   it('skips files without AI Credit markers before parsing usage content', async () => {
     const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
     roots.push(root);

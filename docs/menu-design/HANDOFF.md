@@ -2,14 +2,23 @@
 
 ## Current state and next step
 
-- Work stays on `menu-design`. This is a preview checkpoint, not a production rollout; do not merge, package, install, or wire the graph into the normal tooltip yet.
+- Work stays on `menu-design`. The user authorized local installation of the graph and account-specific tracking on September 7. Both now run in normal installed windows as well as development windows. Merging and publication remain separate actions.
 - The user accepted the shorter graph, `avg.` label with spaced ` / day`, the `0.75` power scale, and mock usage with quiet days and a few busier standouts. Daily native tooltips and early-period caption placement were manually verified in preview. A distinct today-bar style was discussed but not chosen.
-- Next, check the accepted preview in light and high-contrast themes; non-Windows font fallback also needs verification before production wiring. Preserve the accepted native hover behavior and content. Production wiring needs a later explicit request.
-- Run `npm run preview` from the repo root to compile and open an Extension Development Host with mock input. Hover the status bar and move across populated and empty columns. Each column should show its date and values or `no usage`; the caption should remain inside its existing axis row.
-- The default mock date is 1 October 2026 at local noon, with only one day in the new period. To inspect another date, change the default in `src/dev/usagePreview.ts` and rerun preview. The 21 September fixture remains in tests.
-- `src/dev/tooltipGraphPrototype.ts` renders thirty adjacent full-height SVG images with native HTML `title` attributes, plus an axis image. `src/extension.ts` appends it only when `COPILOT_USAGE_PREVIEW=1` and the extension runs in Development mode. Theme changes refresh the preview.
-- `src/dev/usagePreview.ts` writes temporary raw JSONL inputs for the normal `UsageIndex` pipeline and supplies mock quota. The fixture is illustrative, not a measured average user. Preview does not read real usage or request account quota. `src/core/aggregator.ts` owns the daily rollup; `src/ui/formatters.ts` shares quota validation and formats the status percentage as `{spentPct}/100%`.
-- Verification commands are `npm run compile` and `npm test`. Graph tests cover empty days, fractional credits, caption placement, missing or stale quota, and local/UTC month disagreement. Extension tests cover preview isolation and theme refresh. Light/high-contrast appearance and non-Windows font fallback still need manual checks before production wiring.
+- Next step after committing and pushing this branch: install the audited build locally, reload existing windows, and verify live account switching and light/high-contrast hover appearance before merging or publishing. Non-Windows font fallback remains unverified. Preserve the accepted native hover behavior and content.
+- Run `npm run preview` from the repo root to compile and open an Extension Development Host with the normal profile, real usage logs, and live quota. Run `npm run install:local` to package and install the same behavior. Existing normal windows need Developer: Reload Window to load the new build.
+- The default mock date is 1 October 2026 at local noon, with only one day in the new period. Mock input requires launching a Development host with `COPILOT_USAGE_PREVIEW=1`; `npm run preview` clears that flag and always uses real data. The 21 September fixture remains in tests.
+- `src/dev/tooltipGraphPrototype.ts` renders thirty adjacent full-height SVG images with native HTML `title` attributes, plus an axis image. `src/extension.ts` appends it in installed and development windows. Theme changes refresh the graph.
+- `COPILOT_USAGE_PREVIEW=1` selects isolated mock input only in Development mode; installed windows ignore that flag. `src/dev/usagePreview.ts` supplies those temporary fixtures and mock quota. Normal activation uses the persisted local account ledger and live quota. `src/core/aggregator.ts` owns the daily rollup; `src/ui/formatters.ts` shares quota validation and formats the status percentage as `{spentPct}/100%`.
+- Verification commands are `npm run compile` and `npm test`. The September 7 cleanup passed all 285 tests, compilation, and VSIX packaging. A replay of copied saved data preserved both accounts' totals across repeated refreshes and restarts; the real-data preview activated. Tests cover account switches, concurrent windows, delayed evidence, interrupted writes, quota failures, polling, graph calculations, and preview isolation. These checks do not establish live GitHub billing correctness or native theme appearance. The cleanup build has not been installed into normal windows by this task.
+
+## Account tracking
+
+- `src/dev/accountUsagePoc.ts` owns forward-only attribution. Its ledger lives in `context.globalStorageUri/account-poc`; each process appends its own observer journal. Preserve existing journals and `start.json`. Clearing them loses saved observations and resets the tracking boundary.
+- A billed request needs a unique window match and successful authentication evidence. Requests around account switches and chats that predate a switch are excluded. A delayed session header can recover attribution later. Historical usage before the saved start time is never assigned to the current account.
+- Confirmed usage stays visible when other requests cannot be attributed. Unresolved records remain in diagnostics and are retried; they do not create a permanent waiting banner. Unknown current account identity shows a waiting state. Window-log read failures show an error while available confirmed usage remains visible.
+- After successful sign-in evidence arrives, polling displays that account's saved usage without waiting for quota. Status-bar percentage and the quota row use the matching account's live GitHub balance. Graph percentages use only its tracked spending and live quota capacity, so they can differ from the live balance.
+- The ledger reader stops with an error above 256 observer journals or 32 MiB per file; log discovery stops above 512 window folders. Automatic compaction is not implemented. Preserve data if these limits are reached; do not reset or delete journals as recovery.
+- [Account attribution research](ACCOUNT-ATTRIBUTION-RESEARCH.md) records the original source investigation and correlation limitations. This handoff describes the accepted implementation.
 
 ## Behavior
 
@@ -66,7 +75,9 @@ Daily value formatting:
 |---|---|
 | day inside the period | `{dayPct}% · {tokens} ({usd}$)` |
 | day before the period | `{tokens} ({usd}$)` — no quota to be a share of |
-| zero-usage day | `no usage` |
+| tracked zero-usage day | `no usage` |
+| day before tracking began | `not tracked` |
+| first partially tracked day | append `tracked since {time}` to the daily value |
 
 ## 3. Axis row
 
@@ -94,10 +105,16 @@ the axis row with the date labels in §3.
 
 | value | formula |
 |---|---|
-| `spentPct` | credits spent in period ÷ quota, rounded |
-| `ratePct` | `spentPct` ÷ days elapsed in period, 1 decimal |
-| `projectedPct` | `ratePct` × days in period, rounded |
-| `avg` | 30-day window total ÷ 30 |
+| `spentPct` | account's tracked credits in the local month ÷ quota, rounded |
+| `ratePct` | `spentPct` ÷ tracked calendar days in the current month, 1 decimal |
+| `projectedPct` | `spentPct` + `ratePct` × calendar days after today in the month, rounded |
+| `avg` | 30-day window total ÷ tracked calendar days in that window, capped at 30 |
+
+Count today as one day, including on the first tracked day. Averages and the
+period caption have no 24-hour gate. The tracking boundary is the ledger's
+saved start time. With mock input, which has no tracking boundary, use 30 days
+for the average, the current day of the month for the rate, and
+`ratePct × days in period` for the projection.
 
 Period boundaries are calendar-monthly (1 Aug → 1 Sep …). The graph never
 locks to them — it is always the last 30 days.
@@ -125,7 +142,7 @@ Match VS Code's active theme; the values above are the dark-theme reference.
 
 ## 6. Data source
 
-Daily rollups come from **local logs**, so the graph renders offline. Only the
+Daily rollups come from the **local account ledger**, populated from logs, so the graph renders offline. Only the
 percentages need account quota + period boundaries; when those are missing,
 invalid, unlimited, or expired, render the graph and omit the caption and daily
 percentages. Daily slots use local calendar dates, including DST transitions.

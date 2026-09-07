@@ -24,6 +24,51 @@ function record(date: Date, credits: number): UsageRecord {
 }
 
 describe('tooltip graph calculations', () => {
+  it('shows current usage averages and period text on the first tracked day', () => {
+    const now = new Date(2026, 8, 21, 12);
+    const startedAt = new Date(2026, 8, 21, 10);
+    const quota = { entitlement: 100, remaining: 98, percentRemaining: 98, unlimited: false,
+      overageCount: 0, resetDate: new Date('2026-10-01T00:00:00Z') };
+    const html = formatTooltipGraphPrototype(aggregateUsage([record(now, 2)], now), quota, now, false, false, startedAt);
+    expect(html).toContain('20 Sept · not tracked');
+    expect(html).toContain('tracked since');
+    expect(html).toContain('avg. 100 (0.02$) / day');
+    expect(html).not.toContain('available after');
+    expect(decodeImages(html).at(-1)).toContain('Period 2%');
+    expect(decodeImages(html).at(-1)).toContain('2.0%/day · 20% projected');
+    expect(barHeight(decodeImages(html)[29])).toBe(30);
+  });
+
+  it('projects tracked spending plus future days without filling missing earlier history', () => {
+    const now = new Date(2026, 8, 21, 12);
+    const startedAt = new Date(2026, 8, 19, 12);
+    const quota = { entitlement: 100, remaining: 96, percentRemaining: 96, unlimited: false,
+      overageCount: 0, resetDate: new Date('2026-10-01T00:00:00Z') };
+    const html = formatTooltipGraphPrototype(aggregateUsage([record(now, 4)], now), quota, now, false, false, startedAt);
+    expect(html).toContain('avg. 33 (0.01$) / day');
+    expect(decodeImages(html).at(-1)).toContain('Period 4%');
+    expect(decodeImages(html).at(-1)).toContain('1.3%/day · 16% projected');
+  });
+
+  it.each([
+    ['2026-09-20T23:30:00', '2026-09-21T00:30:00'],
+    ['2026-10-24T12:00:00', '2026-10-25T12:00:00'],
+  ])('counts local calendar days instead of elapsed hours since %s', (start, current) => {
+    vi.stubEnv('TZ', 'Europe/Stockholm');
+    const now = new Date(current);
+    const html = formatTooltipGraphPrototype(aggregateUsage([record(now, 4)], now), undefined, now, false, false, new Date(start));
+    expect(html).toContain('avg. 50 (0.02$) / day');
+  });
+
+  it('uses the whole billing month for the rate while limiting the graph average to thirty days', () => {
+    const now = new Date(2026, 9, 31, 12);
+    const quota = { entitlement: 100, remaining: 7, percentRemaining: 7, unlimited: false,
+      overageCount: 0, resetDate: new Date('2026-11-01T00:00:00Z') };
+    const html = formatTooltipGraphPrototype(aggregateUsage([record(now, 93)], now), quota, now, false, false, new Date(2026, 8, 1));
+    expect(html).toContain('avg. 3 (0.03$) / day');
+    expect(decodeImages(html).at(-1)).toContain('3.0%/day · 93% projected');
+  });
+
   it.each([1, 2, 6])('keeps the early-month caption inside the same row and hides its overlapping date on day %i', (day) => {
     const now = new Date(2026, 9, day, 12);
     const quota = {

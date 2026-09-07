@@ -40,6 +40,31 @@ import type { ChatUsageSummary, CopilotCostEstimate, UsageRecord, UsageSummary, 
 const QUOTA_CLICK_HINT = 'Follows the account Copilot Chat uses. Click to re-read.';
 
 describe('UsageTreeProvider', () => {
+  it('keeps confirmed sessions visible while reporting a log read failure', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setSummary(createSummary(), 'Cannot read Copilot account log.');
+    const rows = (await provider.getChildren())!;
+    expect(rows.some((row) => row.kind === 'bucket')).toBe(true);
+    const problem = rows.find((row) => row.kind === 'error')!;
+    const item = provider.getTreeItem(problem);
+    expect(item.label).toBe('Scan failed');
+    expect(item.iconPath).toMatchObject({ id: 'error' });
+    expect(item.tooltip).toBe('Cannot read Copilot account log.');
+  });
+
+  it('distinguishes pending account evidence from a failed scan and clears it on success', async () => {
+    const provider = new UsageTreeProvider();
+    provider.setProblem('Waiting for one request.', true);
+    const rows = (await provider.getChildren())!;
+    const item = provider.getTreeItem(rows[0]);
+    expect(item.label).toBe('Waiting for account evidence');
+    expect(item.iconPath).toMatchObject({ id: 'clock' });
+    expect(item.command).toMatchObject({ command: 'copilotUsage.showDiagnostics' });
+    provider.setSummary(createSummary([]));
+    expect(provider.getTreeItem((await provider.getChildren())![0]).label).toBe('No Copilot usage found');
+    provider.setProblem('Cannot read logs.');
+    expect(provider.getTreeItem((await provider.getChildren())![0]).label).toBe('Scan failed');
+  });
   it('returns no tree rows when Copilot file logging is disabled so the welcome view renders', async () => {
     const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
     provider.setSetupNeeded();
@@ -391,7 +416,7 @@ describe('UsageTreeProvider', () => {
 
   it('explains a failed scan instead of drawing an empty tree', async () => {
     const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
-    provider.setScanFailed('profile folder is locked');
+    provider.setProblem('profile folder is locked');
 
     const rootChildren = (await provider.getChildren()) ?? [];
 

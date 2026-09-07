@@ -10,6 +10,7 @@ export function formatTooltipGraphPrototype(
   now: Date,
   lightTheme = false,
   highContrast = false,
+  trackingStartedAt?: Date,
 ): string {
   const width = 430;
   const height = 44;
@@ -31,6 +32,15 @@ export function formatTooltipGraphPrototype(
   // mismatch, omit percentages rather than attribute another billing month's spending.
   const sameBillingMonth = now.getFullYear() === now.getUTCFullYear() && now.getMonth() === now.getUTCMonth();
   const spentPct = sameBillingMonth ? getPeriodSpentPercentage(quota, now) : undefined;
+  const trackingStart = trackingStartedAt?.getTime();
+  // Count local calendar dates, including today, without a first-day delay or
+  // changes caused by a daylight-saving transition or the time of day.
+  const trackedCalendarDays = trackingStartedAt ? Math.max(1, 1 + Math.round((
+    Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) -
+    Date.UTC(trackingStartedAt.getFullYear(), trackingStartedAt.getMonth(), trackingStartedAt.getDate())
+  ) / 86_400_000)) : Infinity;
+  const trackedDays = Math.min(30, trackedCalendarDays);
+  const rateDays = Math.min(now.getDate(), trackedCalendarDays);
   const totalTokens = days.reduce((sum, day) => sum + day.total.tokens, 0);
   const totalUsd = days.reduce((sum, day) => sum + day.total.githubCopilot.usd, 0);
   const dateLabel = (date: Date) => date.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
@@ -44,9 +54,12 @@ export function formatTooltipGraphPrototype(
     const barHeight = credits > 0 ? Math.max(1.5, (credits / maxCredits) ** 0.75 * 30) : 0;
     const inPeriod = day.date >= periodStart;
     const share = inPeriod && spentPct !== undefined && quota ? `${(credits / quota.entitlement * 100).toFixed(1)}% · ` : '';
-    const value = credits > 0
+    const nextDay = new Date(day.date.getFullYear(), day.date.getMonth(), day.date.getDate() + 1).getTime();
+    const untracked = trackingStart !== undefined && nextDay <= trackingStart;
+    const partial = trackingStart !== undefined && day.date.getTime() < trackingStart && !untracked;
+    const value = untracked ? 'not tracked' : (credits > 0
       ? `${share}${formatTokens(day.total.tokens)} (${formatUsd(day.total.githubCopilot.usd)})`
-      : 'no usage';
+      : 'no usage') + (partial ? ` · tracked since ${trackingStartedAt!.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : '');
     const title = `${dateLabel(day.date)} · ${value}`;
     const bar = credits > 0
       ? `<rect x="${(columnWidth - 9) / 2}" y="${baseline - barHeight}" width="9" height="${barHeight}" rx="1" fill="${inPeriod ? colors.bar : colors.old}"/>`
@@ -63,9 +76,10 @@ export function formatTooltipGraphPrototype(
   let captionLeft = width;
   let captionRight = width;
   if (spentPct !== undefined) {
-    const ratePct = Math.round(spentPct / now.getDate() * 10) / 10;
+    const ratePct = Math.round(spentPct / rateDays * 10) / 10;
     const daysInPeriod = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
-    const projectedPct = Math.round(ratePct * daysInPeriod);
+    const projectedPct = Math.round(trackingStart === undefined ? ratePct * daysInPeriod
+      : spentPct + ratePct * (daysInPeriod - now.getDate()));
     caption = `Period ${spentPct}% · ${ratePct.toFixed(1)}%/day · ${projectedPct}% projected`;
     const captionWidth = estimateAxisTextWidth(caption);
     const center = (boundary + width) / 2;
@@ -87,7 +101,7 @@ export function formatTooltipGraphPrototype(
 
   return [
     '<table width="430">',
-    `<tr><td><strong>Last 30 days</strong></td><td align="right">avg. ${formatTokens(totalTokens / 30)} (${formatUsd(totalUsd / 30)}) / day</td></tr>`,
+    `<tr><td><strong>Last 30 days</strong></td><td align="right">avg. ${formatTokens(totalTokens / trackedDays)} (${formatUsd(totalUsd / trackedDays)}) / day</td></tr>`,
     '</table>',
     `<p>${columns}<br>${axis}</p>`,
   ].join('\n');

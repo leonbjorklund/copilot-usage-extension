@@ -43,6 +43,8 @@ export class CopilotQuotaService implements vscode.Disposable {
   private disposed = false;
   private backoffUntil = 0;
   private backoffMs = DEFAULT_BACKOFF_MS;
+  private lastAccount: string | undefined;
+  private rateLimited = false;
 
   readonly onDidChange = this.changeEmitter.event;
 
@@ -70,17 +72,30 @@ export class CopilotQuotaService implements vscode.Disposable {
 
   /** Copilot switched account: re-read at once, after any read already running. */
   private async followCopilotAccount(): Promise<void> {
-    await this.inFlight;
     const login = await this.copilotAccount.currentLogin();
     if (this.disposed || login === undefined) {
       return;
     }
 
-    if (this.state.kind === 'quota' && this.state.account === login) {
+    if (this.state.kind === 'quota' && this.state.account.toLowerCase() === login.toLowerCase()) {
+      return;
+    }
+
+    this.setState({ kind: 'idle' });
+    await this.inFlight;
+    if (!(await this.isCurrentLogin(login))) {
+      return;
+    }
+    // Initial account discovery can join a refresh already reading that account.
+    if (this.state.kind === 'quota' && this.state.account.toLowerCase() === login.toLowerCase()) {
       return;
     }
 
     // A switch is rare and the user's own doing, so it skips the floor.
+    // Keep an explicit rate limit, which can also apply across tokens/IPs.
+    if (this.lastAccount !== login.toLowerCase() && !this.rateLimited) {
+      this.clearBackoff();
+    }
     this.lastFetchAt = 0;
     void this.refreshNow();
   }
@@ -160,11 +175,23 @@ export class CopilotQuotaService implements vscode.Disposable {
   private async run(interactive: boolean): Promise<void> {
     this.lastFetchAt = Date.now();
 
-    // Follow the account Copilot Chat reports. When it reports none that is
-    // signed in here, VS Code falls back to the account this extension was
-    // allowed for. The GitHub provider matches scopes as an exact set, so an
+    // Follow the account Copilot Chat reports. Only an unknown login may use
+    // this extension's allowed account. The provider matches scopes exactly, so an
     // empty list is the only request that matches Copilot's own session.
-    const account = await copilotAccountSignedInHere(this.copilotAccount);
+    const login = await this.copilotAccount.currentLogin();
+    const account = await copilotAccountSignedInHere(login);
+    if (!(await this.isCurrentLogin(login))) {
+      return;
+    }
+    if (login !== undefined && !account) {
+      this.setState({ kind: 'needs-consent', account: login });
+      if (interactive) {
+        void vscode.window.showInformationMessage(
+          `Copilot reports the GitHub account ${login}, but VS Code has no matching signed-in account. Open the VS Code Accounts menu, sign in to GitHub as ${login}, then run Show AI Credit Quota again.`,
+        );
+      }
+      return;
+    }
     const target = account ? { account } : {};
     let session = await vscode.authentication.getSession(AUTH_PROVIDER_ID, [], {
       silent: true,
@@ -174,6 +201,11 @@ export class CopilotQuotaService implements vscode.Disposable {
       interactive &&
       (!session || (!account && (this.state.kind !== 'quota' || (await hasSeveralAccounts()))))
     ) {
+      // Authentication can outlive an account switch or extension teardown.
+      // Check again before opening a dialog for the captured account.
+      if (!(await this.isCurrentLogin(login))) {
+        return;
+      }
       // VS Code asks for consent to Copilot's account. Only when that account
       // is unknown does it show its picker instead, which also offers signing
       // in again; clearing the preference is what brings the picker back.
@@ -183,19 +215,28 @@ export class CopilotQuotaService implements vscode.Disposable {
       });
     }
 
-    if (this.disposed) {
+    if (!(await this.isCurrentLogin(login))) {
       return;
     }
 
-    if (!session) {
+    if (!session || (login !== undefined && session.account.label.toLowerCase() !== login.toLowerCase())) {
       this.setState({ kind: 'needs-consent', account: account?.label });
       return;
     }
 
+    this.lastAccount = session.account.label.toLowerCase();
     const result = await fetchCopilotQuota({ token: session.accessToken });
-    if (!this.disposed) {
+    const currentLogin = await this.isCurrentLogin(login);
+    // A rate-limit response governs future requests even if its account is no
+    // longer selected. It publishes no account data, so retain its retry delay.
+    if (currentLogin || (!this.disposed && result.kind === 'rate-limited')) {
       this.applyResult(result, session);
     }
+  }
+
+  private async isCurrentLogin(login: string | undefined): Promise<boolean> {
+    const current = await this.copilotAccount.currentLogin();
+    return !this.disposed && current?.toLowerCase() === login?.toLowerCase();
   }
 
   private applyResult(result: QuotaFetchResult, session: vscode.AuthenticationSession): void {
@@ -216,6 +257,7 @@ export class CopilotQuotaService implements vscode.Disposable {
         this.enterBackoff();
         return;
       case 'rate-limited':
+        this.rateLimited = true;
         this.retryLater(result.retryAfterMs);
         return;
       case 'error':
@@ -241,6 +283,7 @@ export class CopilotQuotaService implements vscode.Disposable {
   private clearBackoff(): void {
     this.backoffUntil = 0;
     this.backoffMs = DEFAULT_BACKOFF_MS;
+    this.rateLimited = false;
   }
 
   private setState(state: QuotaState): void {
@@ -272,13 +315,12 @@ async function hasSeveralAccounts(): Promise<boolean> {
 }
 
 async function copilotAccountSignedInHere(
-  source: CopilotAccountSource,
+  login: string | undefined,
 ): Promise<vscode.AuthenticationSessionAccountInformation | undefined> {
-  const login = await source.currentLogin();
   if (login === undefined) {
     return undefined;
   }
 
   const accounts = await vscode.authentication.getAccounts(AUTH_PROVIDER_ID);
-  return accounts.find((account) => account.label === login);
+  return accounts.find((account) => account.label.toLowerCase() === login.toLowerCase());
 }
