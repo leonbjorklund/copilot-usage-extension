@@ -1,5 +1,6 @@
 import { stat } from "node:fs/promises";
-import { basename } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { homedir } from "node:os";
 
 import * as vscode from "vscode";
 
@@ -10,16 +11,19 @@ import {
 } from "./core/config";
 import { CopilotAccountWatcher } from "./core/copilotAccount";
 import { locateCopilotDataPaths } from "./core/locator";
+import type { CopilotQuota } from "./core/quota";
 import { CopilotQuotaService } from "./core/quotaService";
 import { isSameOrInsidePath, pathContainsUsageFolder } from "./core/scanner";
 import type {
   CopilotCostEstimate,
   ExtensionConfig,
   UsageDiagnostics,
+  UsageRecord,
   UsageSummary,
 } from "./core/types";
 import { UsageIndex } from "./core/usageIndex";
-import { formatTokens, formatUsd } from "./ui/formatters";
+import { AccountUsagePoc, type AccountPocView } from "./dev/accountUsagePoc";
+import { formatPeriodPercentage, formatTokens, formatTotalUsd, formatUsd } from "./ui/formatters";
 import {
   formatDiagnostics,
   UsageTreeProvider,
@@ -43,7 +47,7 @@ const USAGE_WATCH_GLOB =
 const CUSTOM_DATA_PATH_WATCH_GLOB = "**/*.{json,jsonl}";
 const GITHUB_COPILOT_USAGE_BASED_BILLING_URL =
   "https://docs.github.com/en/copilot/concepts/billing/usage-based-billing-for-individuals";
-const TOOLTIP_TITLE = `Cost is based on <a href="${GITHUB_COPILOT_USAGE_BASED_BILLING_URL}">GitHub Copilot Usage-based billing $(link-external)</a>`;
+const TOOLTIP_INFO = `<a href="${GITHUB_COPILOT_USAGE_BASED_BILLING_URL}" title="USD is estimated from AI Credits using GitHub Copilot usage-based billing">$(info)</a>`;
 
 interface SourceLogPick extends vscode.QuickPickItem {
   filePath: string;
@@ -58,17 +62,18 @@ function formatSessionCount(count: number): string {
   return `${count} ${count === 1 ? "session" : "sessions"}`;
 }
 
-function formatStatusBarCost(cost: CopilotCostEstimate): string | undefined {
-  return cost.available && cost.aiCredits > 0 ? formatUsd(cost.usd) : undefined;
-}
-
 export function formatStatusBarTooltip(summary: UsageSummary): vscode.MarkdownString {
   const summaryItems = [
     formatTooltipSummaryItem("Today", summary.today),
     formatTooltipSummaryItem("Month", summary.month),
     formatTooltipSummaryItem("All time", summary.allTime),
   ];
-  const lines = [TOOLTIP_TITLE, "", summaryItems.join(" &nbsp; | &nbsp; "), "", "---", ""];
+  const lines = [
+    ...formatTooltipTable([
+      `<tr><td align="left">${summaryItems.join(" &nbsp;|&nbsp; ")}</td><td align="right">${TOOLTIP_INFO}</td></tr>`,
+    ]),
+    "", "---", "",
+  ];
 
   const topModelRows = summary.topModels.map((model, index) =>
     formatTopModelTableRow(
@@ -88,11 +93,13 @@ export function formatStatusBarTooltip(summary: UsageSummary): vscode.MarkdownSt
 }
 
 function formatTooltipSummaryItem(label: string, total: UsageSummary["today"]): string {
-  return `**${label}:** ${formatTokensWithCost(total.tokens, total.githubCopilot)}`;
+  const cost = total.githubCopilot.available && total.githubCopilot.aiCredits > 0
+    ? ` (${formatTotalUsd(total.githubCopilot.usd)})` : "";
+  return `<strong>${label}:</strong> ${formatTokens(total.tokens)}${cost}`;
 }
 
 function formatTokensWithCost(tokens: number, costEstimate: CopilotCostEstimate): string {
-  const cost = formatStatusBarCost(costEstimate);
+  const cost = costEstimate.available && costEstimate.aiCredits > 0 ? formatUsd(costEstimate.usd) : undefined;
   return `${formatTokens(tokens)}${cost ? ` (${cost})` : ""}`;
 }
 
@@ -102,7 +109,7 @@ function formatTopModelTableRow(
   sessions: number,
   value: string,
 ): string {
-  return `<tr><td>${index + 1}. ${escapeHtml(model)}</td><td align="right">${formatSessionCount(sessions)} | ${escapeHtml(value)}</td></tr>`;
+  return `<tr><td>${index + 1}. ${escapeHtml(model)}</td><td align="right">${formatSessionCount(sessions)} · ${escapeHtml(value)}</td></tr>`;
 }
 
 function formatTopModelsTooltipRows(rows: string[]): string[] {
@@ -113,65 +120,43 @@ function formatTopModelsTooltipRows(rows: string[]): string[] {
 }
 
 function formatTooltipTable(rows: string[]): string[] {
-  return ['<table width="100%">', ...rows, "</table>"];
+  return ['<table width="430">', ...rows, "</table>"];
 }
 
 function formatHighestTodayTooltipRows(summary: UsageSummary): string[] {
-  if (!summary.highestSessionToday) {
-    return ["**Today highlights:**", "No sessions today."];
-  }
-
-  const rows = formatTooltipTable(
-    formatTodayHighlightTableRows("Most tokens today", summary.highestSessionToday),
-  );
-  if (summary.mostExpensiveSessionToday) {
-    rows.push(
-      "",
-      "---",
-      "",
-      ...formatTooltipTable(
-        formatTodayHighlightTableRows("Most expensive today", summary.mostExpensiveSessionToday),
-      ),
-    );
-  }
-
-  return rows;
+  const highlights = [summary.mostExpensiveSessionToday, summary.highestSessionToday]
+    .filter((chat): chat is NonNullable<typeof chat> => chat !== undefined)
+    .filter((chat, index, chats) => chats.findIndex((other) => other.chatId === chat.chatId) === index);
+  return formatTooltipTable([
+    '<tr><td colspan="2"><strong>Top sessions today:</strong></td></tr>',
+    ...(highlights.length > 0 ? highlights.map(formatTodayHighlightTableRow)
+      : ['<tr><td colspan="2">No sessions today.</td></tr>']),
+  ]);
 }
 
-function formatTodayHighlightTableRows(
-  label: string,
+function formatTodayHighlightTableRow(
   chat: NonNullable<UsageSummary["highestSessionToday"]>,
-): string[] {
-  return [
-    `<tr><td colspan="2"><strong>${label}:</strong></td></tr>`,
-    `<tr><td>${escapeHtml(chat.title)} | ${escapeHtml(chat.model)}</td><td align="right">${escapeHtml(formatTokensWithCost(chat.tokens, chat.githubCopilot))}</td></tr>`,
-  ];
+): string {
+  return `<tr><td>${escapeHtml(chat.title)} <span style="color:var(--vscode-descriptionForeground);">${escapeHtml(chat.model)}</span></td><td align="right">${escapeHtml(formatTokensWithCost(chat.tokens, chat.githubCopilot))}</td></tr>`;
 }
 
 function escapeHtml(value: string): string {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-export function formatStatusBarSummary(summary: UsageSummary): string {
-  if (summary.today.tokens === 0) {
-    return "No sessions today";
-  }
-
-  const cost = formatStatusBarCost(summary.today.githubCopilot);
-  return cost
+export function formatStatusBarSummary(summary: UsageSummary, quota?: CopilotQuota, now = new Date()): string {
+  const cost = summary.today.githubCopilot.available && summary.today.githubCopilot.aiCredits > 0
+    ? formatTotalUsd(summary.today.githubCopilot.usd) : undefined;
+  const today = summary.today.tokens === 0 ? "No sessions today" : cost
     ? [formatTokens(summary.today.tokens), cost].join(STATUS_BAR_DISPLAY.separator)
     : formatTokens(summary.today.tokens);
+  const period = formatPeriodPercentage(quota, now);
+  return `${today}${period ? ` • ${period}` : ""}`;
 }
 
 function setStatusBarScanning(statusBar: vscode.StatusBarItem): void {
   statusBar.text = STATUS_BAR_DISPLAY.scanningText;
   statusBar.tooltip = STATUS_BAR_DISPLAY.tooltip;
-  statusBar.command = "copilotUsage.openView";
-}
-
-function setStatusBarReady(statusBar: vscode.StatusBarItem, summary: UsageSummary): void {
-  statusBar.text = formatStatusBarSummary(summary);
-  statusBar.tooltip = formatStatusBarTooltip(summary);
   statusBar.command = "copilotUsage.openView";
 }
 
@@ -188,13 +173,27 @@ function setStatusBarSetupNeeded(statusBar: vscode.StatusBarItem): void {
 }
 
 export function activate(context: vscode.ExtensionContext): void {
+  const accountTrackingEnabled = context.extensionMode === vscode.ExtensionMode.Development ||
+    context.extensionMode === vscode.ExtensionMode.Production;
+  const now = () => new Date();
   const initialSortMode = readPersistedSortMode(context);
-  const treeProvider = new UsageTreeProvider(() => new Date(), initialSortMode);
+  const treeProvider = new UsageTreeProvider(now, initialSortMode);
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   const usageIndex = new UsageIndex();
   const copilotAccount = new CopilotAccountWatcher(context.logUri.fsPath);
-  const quotaService = new CopilotQuotaService(copilotAccount);
+  const quotaService = copilotAccount ? new CopilotQuotaService(copilotAccount) : undefined;
+  const accountPoc = accountTrackingEnabled ? new AccountUsagePoc(
+    join(context.globalStorageUri.fsPath, 'account-poc'),
+    join(dirname(context.logUri.fsPath), 'GitHub.copilot-chat'),
+    [dirname(dirname(dirname(dirname(context.logUri.fsPath)))),
+      ...['Code', 'Code - Insiders'].map((editor) => join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), editor, 'logs'))],
+  ) : undefined;
+  let pocView: AccountPocView | undefined;
+  let rawSummary: UsageSummary | undefined;
+  let pocTimer: ReturnType<typeof setTimeout> | undefined;
+  let disposed = false;
   let latestDiagnostics: UsageDiagnostics | undefined;
+  let readySummary: UsageSummary | undefined;
   let currentConfig: ExtensionConfig = readConfig();
   let generation = 0;
   const watcherDisposablesByFolder = new Map<string, vscode.Disposable[]>();
@@ -208,11 +207,19 @@ export function activate(context: vscode.ExtensionContext): void {
   statusBar.show();
   void setSortModeContext(initialSortMode);
 
-  async function runRefresh(): Promise<void> {
+  function runRefresh(): Promise<void> {
     const refreshGeneration = ++generation;
+    // Rebuilds, file events, and polling mutate the same index. Never overlap.
+    updateChain = updateChain.then(() => rebuildUsage(refreshGeneration));
+    return updateChain;
+  }
+
+  async function rebuildUsage(refreshGeneration: number): Promise<void> {
+    if (disposed || refreshGeneration !== generation) return;
+    readySummary = undefined;
     // The credit quota is not read from the logs, so it is fetched even when
     // logging is off and the tree is showing the setup row.
-    void quotaService.refreshNow();
+    void quotaService?.refreshNow();
     try {
       if (!isCopilotFileLoggingEnabled()) {
         treeProvider.setSetupNeeded();
@@ -228,24 +235,26 @@ export function activate(context: vscode.ExtensionContext): void {
       setStatusBarScanning(statusBar);
 
       const roots = await locateCopilotDataPaths(config.dataPath);
-      const result = await usageIndex.rebuild({ roots, config });
+      const result = await usageIndex.rebuild({ roots, config, now: now(), retainedChatIds: accountPoc?.getRetainedChatIds() });
       if (refreshGeneration !== generation) {
         return;
       }
 
-      applyResult(result);
+      await acceptResult(result, refreshGeneration);
+      if (disposed || refreshGeneration !== generation) return;
       syncWatchers(usageIndex.getWatchFolders());
     } catch (error) {
-      if (refreshGeneration === generation) {
+      if (!disposed && refreshGeneration === generation) {
         reportScanFailure(error);
       }
     }
   }
 
   function reportScanFailure(error: unknown): void {
+    readySummary = undefined;
     const message = error instanceof Error ? error.message : String(error);
     setStatusBarFailed(statusBar, message);
-    treeProvider.setScanFailed(message);
+    treeProvider.setProblem(message);
   }
 
   async function openView(): Promise<void> {
@@ -282,9 +291,59 @@ export function activate(context: vscode.ExtensionContext): void {
 
   function applyResult(result: { summary: UsageSummary; diagnostics: UsageDiagnostics }): void {
     latestDiagnostics = result.diagnostics;
-    treeProvider.setSummary(result.summary);
-    setStatusBarReady(statusBar, result.summary);
+    readySummary = result.summary;
+    treeProvider.setSummary(result.summary, pocView?.problem);
+    const quotaState = quotaService?.getState();
+    const matchingQuota = quotaState?.kind === "quota" && (!accountPoc || quotaState.account.toLowerCase() === pocView?.account)
+      ? quotaState.quota : undefined;
+    if (accountPoc) treeProvider.setQuotaState(matchingQuota || (quotaState?.kind === 'needs-consent' &&
+      quotaState.account?.toLowerCase() === pocView?.account) ? quotaState! : { kind: 'idle' });
+    statusBar.text = formatStatusBarSummary(result.summary, matchingQuota, now());
+    statusBar.command = "copilotUsage.openView";
+    const tooltip = formatStatusBarTooltip(result.summary);
+    if (accountTrackingEnabled) {
+      if (pocView?.excluded) tooltip.value += `\n\n${pocView.excluded} request(s) excluded around account switches. See Show Scan Diagnostics.`;
+      if (pocView?.problem) tooltip.value += `\n\n${escapeHtml(pocView.problem)}`;
+    }
+    statusBar.tooltip = tooltip;
+    if (pocView?.problem && !pocView.account) {
+      setStatusBarFailed(statusBar, pocView.problem);
+      statusBar.text = "Waiting for account evidence";
+      treeProvider.setProblem(pocView.problem, true);
+    }
   }
+
+  async function acceptResult(result: { summary: UsageSummary; diagnostics: UsageDiagnostics; titleMetadata?: UsageRecord[] }, acceptedGeneration: number): Promise<void> {
+    if (disposed || acceptedGeneration !== generation) return;
+    const nextPocView = await accountPoc?.refresh(result.summary, now(), result.titleMetadata);
+    if (disposed || acceptedGeneration !== generation) return;
+    rawSummary = result.summary;
+    pocView = nextPocView;
+    applyResult({ ...result, summary: pocView?.summary ?? result.summary });
+  }
+
+  function schedulePocPoll(): void {
+    if (!accountPoc || disposed) return;
+    pocTimer = setTimeout(() => {
+      pocTimer = undefined;
+      const pollGeneration = generation;
+      updateChain = updateChain.then(async () => {
+        if (disposed || pollGeneration !== generation || !rawSummary || !isCopilotFileLoggingEnabled()) return;
+        const result = await usageIndex.poll({ config: currentConfig, now: now(), retainedChatIds: accountPoc.getRetainedChatIds() });
+        await acceptResult(result, pollGeneration);
+        if (disposed || pollGeneration !== generation) return;
+        syncWatchers(usageIndex.getWatchFolders());
+        // Preserve the quota service's settle delay and one-minute floor.
+        if (result.summary.allTime.githubCopilot.aiCredits !== rawCreditsAtLastPoll) {
+          rawCreditsAtLastPoll = result.summary.allTime.githubCopilot.aiCredits;
+          quotaService?.scheduleRefresh();
+        }
+      }).catch((error: unknown) => {
+        if (!disposed && pollGeneration === generation) reportScanFailure(error);
+      }).finally(schedulePocPoll);
+    }, 2_000);
+  }
+  let rawCreditsAtLastPoll = 0;
 
   function setSetupNeededContext(value: boolean): Thenable<unknown> {
     return vscode.commands.executeCommand("setContext", SETUP_NEEDED_CONTEXT, value);
@@ -359,8 +418,10 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   async function scheduleCreatedPath(path: string): Promise<void> {
+    const createdGeneration = generation;
     try {
       const fileStat = await stat(path);
+      if (disposed || createdGeneration !== generation) return;
       if (fileStat.isDirectory()) {
         syncWatchers([...usageIndex.getWatchFolders(), path]);
         scheduleFileUpdate(path, true);
@@ -411,7 +472,9 @@ export function activate(context: vscode.ExtensionContext): void {
       const flushGeneration = eventGeneration;
       updateChain = updateChain
         .then(() => processFileEvents(pathsToUpdate, pathsToDelete, flushGeneration))
-        .catch((error: unknown) => reportScanFailure(error));
+        .catch((error: unknown) => {
+          if (!disposed && flushGeneration === generation) reportScanFailure(error);
+        });
     }, 100);
   }
 
@@ -420,7 +483,7 @@ export function activate(context: vscode.ExtensionContext): void {
     pathsToDelete: string[],
     flushGeneration: number,
   ): Promise<void> {
-    if (flushGeneration !== generation) {
+    if (disposed || flushGeneration !== generation) {
       return;
     }
 
@@ -429,17 +492,20 @@ export function activate(context: vscode.ExtensionContext): void {
       pathsToDelete,
       pathsToUpdate,
       config,
+      now: now(),
+      retainedChatIds: accountPoc?.getRetainedChatIds(),
     });
 
     if (flushGeneration !== generation) {
       return;
     }
 
-    applyResult(result);
+    await acceptResult(result, flushGeneration);
+    if (disposed || flushGeneration !== generation) return;
     syncWatchers(usageIndex.getWatchFolders());
     // Copilot has just billed credits; ask GitHub for the new total once the
     // log stops changing.
-    quotaService.scheduleRefresh();
+    quotaService?.scheduleRefresh();
   }
 
   context.subscriptions.push(
@@ -447,12 +513,25 @@ export function activate(context: vscode.ExtensionContext): void {
     // Unregister the view before the provider tears its event emitter down.
     vscode.window.registerTreeDataProvider("copilotUsage.views.usage", treeProvider),
     treeProvider,
-    quotaService,
-    copilotAccount,
-    quotaService.onDidChange(() => treeProvider.setQuotaState(quotaService.getState())),
+    ...(quotaService ? [
+      quotaService,
+      quotaService.onDidChange(() => {
+        const quotaState = quotaService.getState();
+        // Quota remains useful when logging is off or the scan cannot run.
+        if (!accountPoc || !readySummary) treeProvider.setQuotaState(quotaState);
+        if (readySummary) {
+          if (accountTrackingEnabled && latestDiagnostics) {
+            applyResult({ summary: readySummary, diagnostics: latestDiagnostics });
+          } else {
+            statusBar.text = formatStatusBarSummary(readySummary, quotaState.kind === "quota" ? quotaState.quota : undefined, now());
+          }
+        }
+      }),
+    ] : []),
+    ...(copilotAccount ? [copilotAccount] : []),
     vscode.commands.registerCommand("copilotUsage.refresh", () => runRefresh()),
     vscode.commands.registerCommand("copilotUsage.connectQuota", () =>
-      quotaService.refreshNow({ interactive: true }),
+      quotaService?.refreshNow({ interactive: true }),
     ),
     vscode.commands.registerCommand("copilotUsage.openView", () => openView()),
     vscode.commands.registerCommand("copilotUsage.openSourceLog", (node?: UsageNode) =>
@@ -469,7 +548,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("copilotUsage.showDiagnostics", () =>
       vscode.window.showInformationMessage(
         latestDiagnostics
-          ? formatDiagnostics(latestDiagnostics)
+          ? formatDiagnostics(latestDiagnostics) + (pocView ? `\n\n${pocView.diagnostics}` : '')
           : "No Copilot usage scan has completed yet.",
         { modal: true },
       ),
@@ -485,6 +564,8 @@ export function activate(context: vscode.ExtensionContext): void {
       void runRefresh();
     }),
     new vscode.Disposable(() => {
+      disposed = true;
+      if (pocTimer) clearTimeout(pocTimer);
       disposeWatchers();
       if (eventTimer) {
         clearTimeout(eventTimer);
@@ -493,6 +574,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   void runRefresh();
+  schedulePocPoll();
 }
 
 function readPersistedSortMode(context: vscode.ExtensionContext): UsageTreeSortMode {

@@ -6,6 +6,10 @@ Dollar amounts use GitHub's [Copilot usage-based billing docs](https://docs.gith
 
 > Only sessions with AI Credits are counted. Older logs that predate usage-based billing are ignored.
 
+Totals follow the Copilot account in each window. Tracking starts on first use and reuses that saved start on later launches; it does not assign earlier usage to your current account. Confirmed usage is saved locally and remains visible when other requests lack account evidence. The quota row and status percentage use GitHub's live balance.
+
+After switching accounts, start a new chat. Requests around a switch and chats that predate it are excluded when ownership is uncertain. Show Scan Diagnostics explains excluded or unresolved requests. Account attribution requires Copilot Chat logs at Info or Trace level.
+
 #### Status Bar
 
 <img src="https://github.com/leonbjorklund/copilot-usage-extension/raw/main/docs/statusbar-tooltip.png?v=2" width="400" alt="Status bar tooltip" />

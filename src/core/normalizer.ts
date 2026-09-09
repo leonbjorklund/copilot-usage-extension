@@ -347,6 +347,10 @@ function normalizeCopilotDebugLogRecord(item: RawUsageItem, value: RecordValue):
           : TITLE_PRIORITY.record,
       tokens: { ...tokens, cachedInput, cacheWriteInput, source: 'recorded' },
       billing,
+      ...(typeof attrs.responseId === 'string' && typeof value.spanId === 'string' &&
+        typeof value.dur === 'number' && Number.isFinite(value.dur) && value.dur >= 0
+        ? { debugRequest: { responseId: attrs.responseId, spanId: value.spanId, durationMs: value.dur } }
+        : {}),
       filePath: item.filePath,
     },
   ];

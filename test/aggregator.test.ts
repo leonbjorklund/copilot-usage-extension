@@ -1,7 +1,24 @@
 import { describe, expect, it } from 'vitest';
 
 import { aggregateUsage } from '../src/core/aggregator';
+import { TITLE_PRIORITY } from '../src/core/types';
 import type { UsageRecord } from '../src/core/types';
+
+describe('title source ordering', () => {
+  it.each([
+    [TITLE_PRIORITY.prompt, 'First title'],
+    [TITLE_PRIORITY.generated, 'Later title'],
+    [TITLE_PRIORITY.custom, 'Later title'],
+  ])('preserves within-file title order at priority %s', (titlePriority, expected) => {
+    const at = new Date('2026-05-28T08:00:00Z');
+    const billed = createBilledRecord('chat', 'panel/editAgent', at, 'model', 100);
+    const first = { ...billed, filePath: 'title.jsonl', metadataOnly: true,
+      title: 'First title', titlePriority, titleModifiedAt: at.getTime() };
+    const later = { ...first, title: 'Later title' };
+    expect(aggregateUsage([billed, first, later]).chats[0].title).toBe(expected);
+    expect(aggregateUsage([billed, first, { ...later, filePath: 'other-title.jsonl' }]).chats[0].title).toBe('First title');
+  });
+});
 
 describe('aggregateUsage', () => {
   it('aggregates positive AI Credit usage totals and chat summaries', () => {

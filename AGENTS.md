@@ -3,14 +3,16 @@
 ## Project Shape
 
 - VS Code extension in TypeScript. Entry point: `src/extension.ts`; esbuild bundles to `dist/extension.js` (the manifest `main`). Nothing builds from `tsconfig.json`: `check-types` passes `--noEmit`, and esbuild produces every shipped file.
-- Purpose: scan local VS Code/Copilot debug logs, count rows with positive AI Credits, and show token/cost results in the status bar plus a "Copilot Sessions" tree (view `copilotUsage.views.usage`) in its own Activity Bar container (`copilotUsage`). The tree leads with an AI Credit quota row read from GitHub, the one row not derived from the logs.
-- Privacy constraint: keep work local. Do not add telemetry, and add no network access beyond the one request the user asked for: the AI Credit quota row reads `copilot_internal/user` under the rules below. Nothing about the user's logs or usage leaves the machine. The account the row follows comes from Copilot Chat's own log in the window (`copilotAccount.ts`); only the login is read from it.
+- Purpose: attribute positive-AI-Credit requests from local VS Code/Copilot logs to accounts, persist tracked usage locally, and show the current account's totals in the status bar, hover tooltip, and "Copilot Sessions" tree (view `copilotUsage.views.usage`). The tree leads with an AI Credit quota row read from GitHub, the one row not derived from local usage.
+- Privacy constraint: keep work local. Do not add telemetry, and add no network access beyond the AI Credit quota request to `copilot_internal/user` under the rules below. The quota watcher reads the login from this window's Copilot Chat log; account attribution also reads authentication and request markers across retained window logs. Nothing about the user's logs or usage leaves the machine.
+- Before changing account attribution, persistence, or preview behavior, read [the current handoff](docs/account-tracking/HANDOFF.md). It records accepted behavior, storage limits, and remaining live verification.
 
 ## Commands
 
 - Install dependencies: `npm install`
 - Typecheck only: `npm run check-types`
 - Compile (typecheck + bundle): `npm run compile`
+- After code changes, run `npm run preview` to rebuild and open the development preview with the user's normal VS Code profile, real usage logs, and live quota.
 - Production bundle: `npm run compile:production`, which is what `vscode:prepublish` runs, so packaging always rebuilds
 - Rebuild on change: `npm run watch`, which bundles only, so run `npm run check-types` beside it
 - Delete build output: `npm run clean`
@@ -27,6 +29,7 @@ Run `npm run compile` and relevant `npm test` coverage before claiming code chan
 - `src/ui/formatters.ts`: token and cost display formatting shared by the status bar and tree.
 - `src/core/config.ts`: reads `copilotUsage.*` settings and checks the `github.copilot.chat.agentDebugLog.fileLogging.enabled` prerequisite.
 - `src/core/usageIndex.ts`: caches scanned usage records and handles incremental rebuilds.
+- `src/dev/accountUsagePoc.ts`: account attribution and the append-only local ledger, used in installed and development windows despite the original prototype name.
 - `src/core/locator.ts`: finds VS Code Stable/Insiders storage roots plus optional configured path.
 - `src/core/scanner.ts`: recursively scans only `.json` and `.jsonl`, respecting max size and depth.
 - `src/core/parser.ts`: parses JSON arrays, known container keys, single JSON records, and JSONL lines.
