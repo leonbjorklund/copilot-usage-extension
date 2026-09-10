@@ -37,7 +37,6 @@ import * as vscode from 'vscode';
 import { differenceInLocalCalendarDays, UsageTreeProvider } from '../src/ui/usageTreeProvider';
 import type { ChatUsageSummary, CopilotCostEstimate, UsageRecord, UsageSummary, UsageTotal } from '../src/core/types';
 
-const QUOTA_CLICK_HINT = 'Follows the account Copilot Chat uses. Click to re-read.';
 
 describe('UsageTreeProvider', () => {
   it('keeps confirmed sessions visible while reporting a log read failure', async () => {
@@ -329,24 +328,16 @@ describe('UsageTreeProvider', () => {
 
     expect(rootChildren).toHaveLength(3);
     const item = provider.getTreeItem(rootChildren[0]);
-    expect(item.label).toBe('537 / 1,500 | 36%');
-    expect(item.description).toBe('AI Credits left · octocat');
+    expect(item.label).toBe('963 / 1,500 | 64%');
+    expect(item.description).toBe('AI Credits · octocat');
     expect(item.collapsibleState).toBe(vscode.TreeItemCollapsibleState.None);
-    expect(item.tooltip).toBe(
-      [
-        'Account: octocat',
-        'Remaining: 537 of 1,500',
-        'Used: 963',
-        '',
-        QUOTA_CLICK_HINT,
-      ].join('\n'),
-    );
-    // The filled row stays clickable: that click is the account picker.
+    expect(item.tooltip).toBeUndefined();
+    // Clicking the filled row requests a fresh quota snapshot.
     expect(item.command).toMatchObject({ command: 'copilotUsage.connectQuota' });
     expect(provider.getTreeItem(rootChildren[1]).label).toBe('Today');
   });
 
-  it('describes an unlimited plan, the reset date and any overage in the tooltip', async () => {
+  it('shows an unlimited plan without a quota tooltip', async () => {
     const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
     provider.setSummary(createSummary());
     const resetDate = new Date(2026, 9, 1);
@@ -366,16 +357,8 @@ describe('UsageTreeProvider', () => {
     const item = provider.getTreeItem(((await provider.getChildren()) ?? [])[0]);
 
     expect(item.label).toBe('Unlimited AI Credits');
-    expect(item.tooltip).toBe(
-      [
-        'Account: octocat',
-        'AI Credits: unlimited',
-        `Resets: ${resetDate.toLocaleDateString()}`,
-        'Overage used: 12',
-        '',
-        QUOTA_CLICK_HINT,
-      ].join('\n'),
-    );
+    expect(item.description).toBe('AI Credits · octocat');
+    expect(item.tooltip).toBeUndefined();
   });
 
   it('offers a one-click consent row instead of the quota when access is not granted', async () => {

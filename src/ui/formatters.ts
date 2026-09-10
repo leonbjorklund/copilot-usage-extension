@@ -1,4 +1,4 @@
-import type { CopilotQuota } from '../core/quota';
+import { getSpentCredits, type CopilotQuota } from '../core/quota';
 
 /** Only show a percentage when the snapshot belongs to this calendar billing month. */
 export function formatPeriodPercentage(quota: CopilotQuota | undefined, now = new Date()): string | undefined {
@@ -17,7 +17,7 @@ export function getPeriodSpentPercentage(quota: CopilotQuota | undefined, now = 
     return undefined;
   }
 
-  const spent = Math.max(0, quota.entitlement - quota.remaining) + Math.max(0, quota.overageCount);
+  const spent = getSpentCredits(quota);
   return Math.round(spent / quota.entitlement * 100);
 }
 

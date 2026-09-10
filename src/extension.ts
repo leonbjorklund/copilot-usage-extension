@@ -93,6 +93,9 @@ export function formatStatusBarTooltip(summary: UsageSummary): vscode.MarkdownSt
 }
 
 function formatTooltipSummaryItem(label: string, total: UsageSummary["today"]): string {
+  if (label === "Today" && total.tokens === 0 && total.githubCopilot.aiCredits === 0) {
+    return "<strong>Today:</strong> No session";
+  }
   const cost = total.githubCopilot.available && total.githubCopilot.aiCredits > 0
     ? ` (${formatUsd(total.githubCopilot.usd)})` : "";
   return `<strong>${label}:</strong> ${formatTokens(total.tokens)}${cost}`;

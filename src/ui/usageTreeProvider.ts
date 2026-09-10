@@ -6,7 +6,7 @@ import type {
   UsageDiagnostics,
   UsageSummary,
 } from "../core/types";
-import { formatCredits, formatQuotaLabel } from "../core/quota";
+import { formatQuotaLabel } from "../core/quota";
 import type { QuotaState } from "../core/quotaService";
 import { formatTokens, formatUsd } from "./formatters";
 
@@ -218,34 +218,9 @@ function buildQuotaTreeItem(state: QuotaRowState): vscode.TreeItem {
     vscode.TreeItemCollapsibleState.None,
   );
   item.iconPath = new vscode.ThemeIcon("credit-card");
-  item.description = `AI Credits left · ${state.account}`;
-  item.tooltip = formatQuotaTooltip(state);
+  item.description = `AI Credits · ${state.account}`;
   item.command = QUOTA_CONNECT_COMMAND;
   return item;
-}
-
-function formatQuotaTooltip(state: Extract<QuotaState, { kind: "quota" }>): string {
-  const lines = [`Account: ${state.account}`];
-
-  if (state.quota.unlimited) {
-    lines.push("AI Credits: unlimited");
-  } else {
-    lines.push(
-      `Remaining: ${formatCredits(state.quota.remaining)} of ${formatCredits(state.quota.entitlement)}`,
-      `Used: ${formatCredits(state.quota.entitlement - state.quota.remaining)}`,
-    );
-  }
-
-  if (state.quota.resetDate) {
-    lines.push(`Resets: ${state.quota.resetDate.toLocaleDateString()}`);
-  }
-
-  if (state.quota.overageCount > 0) {
-    lines.push(`Overage used: ${formatCredits(state.quota.overageCount)}`);
-  }
-
-  lines.push("", "Follows the account Copilot Chat uses. Click to re-read.");
-  return lines.join("\n");
 }
 
 function buildBuckets(

@@ -189,9 +189,14 @@ export function formatQuotaLabel(quota: CopilotQuota): string {
     return 'Unlimited AI Credits';
   }
 
-  const remaining = formatCredits(quota.remaining);
+  const spent = getSpentCredits(quota);
   const entitlement = formatCredits(quota.entitlement);
-  return `${remaining} / ${entitlement} | ${Math.round(quota.percentRemaining)}%`;
+  const percentage = quota.entitlement > 0 ? ` | ${Math.round(spent / quota.entitlement * 100)}%` : '';
+  return `${formatCredits(spent)} / ${entitlement}${percentage}`;
+}
+
+export function getSpentCredits(quota: CopilotQuota): number {
+  return Math.max(0, quota.entitlement - quota.remaining) + Math.max(0, quota.overageCount);
 }
 
 export function formatCredits(value: number): string {

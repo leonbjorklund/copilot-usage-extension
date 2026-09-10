@@ -374,6 +374,9 @@ describe("formatStatusBarTooltip", () => {
     };
 
     expect(formatStatusBarSummary(summary)).toBe("No sessions today");
+    expect(formatStatusBarTooltip(summary).value).toContain(
+      "<strong>Today:</strong> No session &nbsp;|&nbsp; <strong>Month:</strong> 0 &nbsp;|&nbsp; <strong>All time:</strong> 0",
+    );
   });
 
   it("formats today fallback when no session exists today", () => {

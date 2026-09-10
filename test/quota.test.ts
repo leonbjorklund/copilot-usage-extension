@@ -88,10 +88,21 @@ describe('parseCopilotQuota', () => {
 });
 
 describe('formatQuotaLabel', () => {
-  it('shows remaining, entitlement and percentage', () => {
+  it('shows spent credits, entitlement and spent percentage', () => {
     const quota = parseCopilotQuota(proPayload({ entitlement: 1500, percent_remaining: 35.8 }));
 
-    expect(formatQuotaLabel(quota!)).toBe('537 / 1,500 | 36%');
+    expect(formatQuotaLabel(quota!)).toBe('963 / 1,500 | 64%');
+    expect(formatQuotaLabel(parseCopilotQuota(proPayload({ percent_remaining: 87 }))!)).toBe('195 / 1,500 | 13%');
+  });
+
+  it('includes overage in spent credits and percentage', () => {
+    const quota = parseCopilotQuota(proPayload({ percent_remaining: 0, overage_count: 150 }));
+    expect(formatQuotaLabel(quota!)).toBe('1,650 / 1,500 | 110%');
+  });
+
+  it('omits the percentage when there is no included allowance', () => {
+    const quota = parseCopilotQuota(proPayload({ entitlement: 0, percent_remaining: 0, overage_count: 12 }));
+    expect(formatQuotaLabel(quota!)).toBe('12 / 0');
   });
 });
 
