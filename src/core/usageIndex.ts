@@ -1,3 +1,4 @@
+import { createHash, type Hash } from 'node:crypto';
 import { open, realpath, stat } from 'node:fs/promises';
 import { basename, dirname, extname, resolve, sep } from 'node:path';
 
@@ -52,6 +53,7 @@ interface FileUsageState {
   mtimeMs: number;
   jsonlOffsetBytes: number;
   canAppendJsonl: boolean;
+  jsonlPrefixHash?: Hash;
 }
 
 const MAX_CONCURRENT_FILE_PARSES = 8;
@@ -134,9 +136,10 @@ export class UsageIndex {
     const files = [...scannedFiles.values()];
     await forEachLimited(files.filter((file) => !isMetadataPath(file)), MAX_CONCURRENT_FILE_PARSES,
       (file) => this.updateFileState(file, options.config));
+    const billedChatIds = this.getBilledChatIds();
     await forEachLimited(files.filter(isMetadataPath), MAX_CONCURRENT_FILE_PARSES,
-      (file) => this.updateFileState(file, options.config));
-    this.pruneMetadataForBilledChats(this.getBilledChatIds());
+      (file) => this.updateFileState(file, options.config, billedChatIds));
+    this.pruneMetadataForBilledChats(billedChatIds);
     this.summaryCache = undefined;
     return this.summarize(options);
   }
@@ -170,7 +173,7 @@ export class UsageIndex {
     return pruneNestedFolders(Array.from(folders));
   }
 
-  private async updateFileState(filePath: string, config: ExtensionConfig): Promise<void> {
+  private async updateFileState(filePath: string, config: ExtensionConfig, billedChatIds?: Set<string>): Promise<void> {
     const resolvedPath = resolve(filePath);
     const stateKey = await fileStateKey(resolvedPath);
     if (isIgnoredUsageCacheFile(resolvedPath) || !isSupportedUsageFile(resolvedPath)) {
@@ -200,8 +203,8 @@ export class UsageIndex {
 
     const extension = extname(resolvedPath).toLowerCase();
     const existing = this.files.get(stateKey);
-    const billedChatIds = this.getBilledChatIds();
-    const metadataChatId = metadataChatIdFromPath(resolvedPath, billedChatIds);
+    const metadataChatId = isMetadataPath(resolvedPath)
+      ? metadataChatIdFromPath(resolvedPath, billedChatIds ?? this.getBilledChatIds()) : undefined;
     if (isMetadataPath(resolvedPath) && metadataChatId === undefined) {
       if (this.files.delete(stateKey)) {
         this.invalidateCaches();
@@ -211,7 +214,7 @@ export class UsageIndex {
 
     const mode = metadataChatId ? 'metadata' : 'billed-usage';
     if (
-      extension === '.json' &&
+      (extension === '.json' || existing?.canAppendJsonl === true) &&
       existing?.mode === mode &&
       existing.skippedMalformedFiles === 0 &&
       fileStat.size === existing.sizeBytes &&
@@ -226,10 +229,11 @@ export class UsageIndex {
       existing.mode === mode &&
       fileStat.size >= existing.jsonlOffsetBytes &&
       !sameSizeRewrite &&
-      // A rewrite that ends up longer than the old file also passes the size
-      // check, so confirm the resume point still lands on a line boundary in
-      // the file as it stands now.
-      (await endsAtLineBoundary(resolvedPath, existing.jsonlOffsetBytes))
+      // A rewrite can preserve the old line boundary. Verify all previously
+      // parsed bytes before treating growth as an append.
+      existing.jsonlPrefixHash !== undefined &&
+      (await hashFilePrefix(resolvedPath, existing.jsonlOffsetBytes))?.copy().digest('hex') ===
+        existing.jsonlPrefixHash.copy().digest('hex')
     ) {
       await this.appendJsonlFile(resolvedPath, fileStat.size, fileStat.mtimeMs, existing);
     } else {
@@ -301,17 +305,21 @@ export class UsageIndex {
       return;
     }
 
-    let content: string;
+    let content: Buffer;
     try {
-      content = await readUtf8Range(filePath, state.jsonlOffsetBytes, sizeBytes - state.jsonlOffsetBytes);
+      content = await readFileRange(filePath, state.jsonlOffsetBytes, sizeBytes - state.jsonlOffsetBytes);
     } catch {
       await this.reparseFile(filePath, { mode: state.mode, keepEmpty: state.mode === 'metadata' });
       return;
     }
+    // An early EOF can race with a rewrite. Keep the snapshot retryable even
+    // when the next stat reports the originally requested size and revision.
+    sizeBytes = state.jsonlOffsetBytes + content.length;
 
-    const parsed = parseCompleteJsonlLines(content, filePath);
+    const parsed = parseCompleteJsonlLines(content.toString('utf8'), filePath);
     if (parsed.consumedBytes === 0) {
       state.sizeBytes = sizeBytes;
+      state.mtimeMs = mtimeMs;
       return;
     }
 
@@ -320,6 +328,7 @@ export class UsageIndex {
     state.parsedRecords += parsed.items.length;
     state.skippedRecords += parsed.malformedRecords + normalized.skippedRecords;
     state.jsonlOffsetBytes += parsed.consumedBytes;
+    state.jsonlPrefixHash?.update(content.subarray(0, parsed.consumedBytes));
     state.sizeBytes = sizeBytes;
     state.mtimeMs = mtimeMs;
     if (parsed.items.length > 0 || parsed.malformedRecords > 0) {
@@ -342,9 +351,16 @@ export class UsageIndex {
       // before the read, so Copilot appending mid-read would leave those bytes
       // both parsed and ahead of the offset, and the next append would count
       // them a second time.
-      const canAppendJsonl =
+      let canAppendJsonl =
         extname(resolvedPath).toLowerCase() === '.jsonl' &&
         (await endsAtLineBoundary(resolvedPath, parsed.consumedBytes));
+      const jsonlPrefixHash = canAppendJsonl ? await hashFilePrefix(resolvedPath, parsed.consumedBytes) : undefined;
+      if (canAppendJsonl) {
+        const after = await stat(resolvedPath);
+        // Do not associate parsed records with a digest from a different
+        // revision if a writer changed the file during the initial read.
+        canAppendJsonl = jsonlPrefixHash !== undefined && after.size === fileStat.size && after.mtimeMs === fileStat.mtimeMs;
+      }
       const state = buildState(
         resolvedPath,
         mode,
@@ -353,6 +369,7 @@ export class UsageIndex {
         parsed,
         canAppendJsonl,
       );
+      state.jsonlPrefixHash = canAppendJsonl ? jsonlPrefixHash : undefined;
       state.countInDiagnostics = keepEmpty || state.records.length > 0 || state.skippedRecords > 0 || state.skippedMalformedFiles > 0;
       // Cache successful marker-free JSON reads too, without adding them to usage diagnostics.
       if (state.countInDiagnostics || extname(resolvedPath).toLowerCase() === '.json') {
@@ -653,13 +670,40 @@ async function endsAtLineBoundary(filePath: string, sizeBytes: number): Promise<
   }
 }
 
-async function readUtf8Range(filePath: string, start: number, length: number): Promise<string> {
+async function readFileRange(filePath: string, start: number, length: number): Promise<Buffer> {
   const file = await open(filePath, 'r');
   try {
     const buffer = Buffer.alloc(length);
-    const { bytesRead } = await file.read(buffer, 0, length, start);
-    return buffer.subarray(0, bytesRead).toString('utf8');
+    let read = 0;
+    while (read < length) {
+      const { bytesRead } = await file.read(buffer, read, length - read, start + read);
+      if (bytesRead === 0) break;
+      read += bytesRead;
+    }
+    return buffer.subarray(0, read);
   } finally {
     await file.close();
+  }
+}
+
+/** Hash with bounded scratch space; unchanged polls never read the prefix. */
+async function hashFilePrefix(filePath: string, length: number): Promise<Hash | undefined> {
+  let file;
+  try {
+    file = await open(filePath, 'r');
+    const hash = createHash('sha256');
+    const buffer = Buffer.alloc(Math.min(length, 64 * 1024));
+    let offset = 0;
+    while (offset < length) {
+      const { bytesRead } = await file.read(buffer, 0, Math.min(buffer.length, length - offset), offset);
+      if (bytesRead === 0) return undefined;
+      hash.update(buffer.subarray(0, bytesRead));
+      offset += bytesRead;
+    }
+    return hash;
+  } catch {
+    return undefined;
+  } finally {
+    await file?.close();
   }
 }

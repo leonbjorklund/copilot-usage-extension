@@ -23,7 +23,7 @@ import type {
 } from "./core/types";
 import { UsageIndex } from "./core/usageIndex";
 import { AccountUsagePoc, type AccountPocView } from "./dev/accountUsagePoc";
-import { formatPeriodPercentage, formatTokens, formatTotalUsd, formatUsd } from "./ui/formatters";
+import { formatPeriodPercentage, formatTokens, formatUsd } from "./ui/formatters";
 import {
   formatDiagnostics,
   UsageTreeProvider,
@@ -94,7 +94,7 @@ export function formatStatusBarTooltip(summary: UsageSummary): vscode.MarkdownSt
 
 function formatTooltipSummaryItem(label: string, total: UsageSummary["today"]): string {
   const cost = total.githubCopilot.available && total.githubCopilot.aiCredits > 0
-    ? ` (${formatTotalUsd(total.githubCopilot.usd)})` : "";
+    ? ` (${formatUsd(total.githubCopilot.usd)})` : "";
   return `<strong>${label}:</strong> ${formatTokens(total.tokens)}${cost}`;
 }
 
@@ -146,7 +146,7 @@ function escapeHtml(value: string): string {
 
 export function formatStatusBarSummary(summary: UsageSummary, quota?: CopilotQuota, now = new Date()): string {
   const cost = summary.today.githubCopilot.available && summary.today.githubCopilot.aiCredits > 0
-    ? formatTotalUsd(summary.today.githubCopilot.usd) : undefined;
+    ? formatUsd(summary.today.githubCopilot.usd) : undefined;
   const today = summary.today.tokens === 0 ? "No sessions today" : cost
     ? [formatTokens(summary.today.tokens), cost].join(STATUS_BAR_DISPLAY.separator)
     : formatTokens(summary.today.tokens);
@@ -181,7 +181,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   const usageIndex = new UsageIndex();
   const copilotAccount = new CopilotAccountWatcher(context.logUri.fsPath);
-  const quotaService = copilotAccount ? new CopilotQuotaService(copilotAccount) : undefined;
+  const quotaService = new CopilotQuotaService(copilotAccount);
   const accountPoc = accountTrackingEnabled ? new AccountUsagePoc(
     join(context.globalStorageUri.fsPath, 'account-poc'),
     join(dirname(context.logUri.fsPath), 'GitHub.copilot-chat'),
@@ -219,7 +219,7 @@ export function activate(context: vscode.ExtensionContext): void {
     readySummary = undefined;
     // The credit quota is not read from the logs, so it is fetched even when
     // logging is off and the tree is showing the setup row.
-    void quotaService?.refreshNow();
+    void quotaService.refreshNow();
     try {
       if (!isCopilotFileLoggingEnabled()) {
         treeProvider.setSetupNeeded();
@@ -293,11 +293,11 @@ export function activate(context: vscode.ExtensionContext): void {
     latestDiagnostics = result.diagnostics;
     readySummary = result.summary;
     treeProvider.setSummary(result.summary, pocView?.problem);
-    const quotaState = quotaService?.getState();
-    const matchingQuota = quotaState?.kind === "quota" && (!accountPoc || quotaState.account.toLowerCase() === pocView?.account)
+    const quotaState = quotaService.getState();
+    const matchingQuota = quotaState.kind === "quota" && (!accountPoc || quotaState.account.toLowerCase() === pocView?.account)
       ? quotaState.quota : undefined;
-    if (accountPoc) treeProvider.setQuotaState(matchingQuota || (quotaState?.kind === 'needs-consent' &&
-      quotaState.account?.toLowerCase() === pocView?.account) ? quotaState! : { kind: 'idle' });
+    if (accountPoc) treeProvider.setQuotaState(matchingQuota || (quotaState.kind === 'needs-consent' &&
+      quotaState.account?.toLowerCase() === pocView?.account) ? quotaState : { kind: 'idle' });
     statusBar.text = formatStatusBarSummary(result.summary, matchingQuota, now());
     statusBar.command = "copilotUsage.openView";
     const tooltip = formatStatusBarTooltip(result.summary);
@@ -336,7 +336,7 @@ export function activate(context: vscode.ExtensionContext): void {
         // Preserve the quota service's settle delay and one-minute floor.
         if (result.summary.allTime.githubCopilot.aiCredits !== rawCreditsAtLastPoll) {
           rawCreditsAtLastPoll = result.summary.allTime.githubCopilot.aiCredits;
-          quotaService?.scheduleRefresh();
+          quotaService.scheduleRefresh();
         }
       }).catch((error: unknown) => {
         if (!disposed && pollGeneration === generation) reportScanFailure(error);
@@ -505,7 +505,7 @@ export function activate(context: vscode.ExtensionContext): void {
     syncWatchers(usageIndex.getWatchFolders());
     // Copilot has just billed credits; ask GitHub for the new total once the
     // log stops changing.
-    quotaService?.scheduleRefresh();
+    quotaService.scheduleRefresh();
   }
 
   context.subscriptions.push(
@@ -513,25 +513,23 @@ export function activate(context: vscode.ExtensionContext): void {
     // Unregister the view before the provider tears its event emitter down.
     vscode.window.registerTreeDataProvider("copilotUsage.views.usage", treeProvider),
     treeProvider,
-    ...(quotaService ? [
-      quotaService,
-      quotaService.onDidChange(() => {
-        const quotaState = quotaService.getState();
-        // Quota remains useful when logging is off or the scan cannot run.
-        if (!accountPoc || !readySummary) treeProvider.setQuotaState(quotaState);
-        if (readySummary) {
-          if (accountTrackingEnabled && latestDiagnostics) {
-            applyResult({ summary: readySummary, diagnostics: latestDiagnostics });
-          } else {
-            statusBar.text = formatStatusBarSummary(readySummary, quotaState.kind === "quota" ? quotaState.quota : undefined, now());
-          }
+    quotaService,
+    quotaService.onDidChange(() => {
+      const quotaState = quotaService.getState();
+      // Quota remains useful when logging is off or the scan cannot run.
+      if (!accountPoc || !readySummary) treeProvider.setQuotaState(quotaState);
+      if (readySummary) {
+        if (accountTrackingEnabled && latestDiagnostics) {
+          applyResult({ summary: readySummary, diagnostics: latestDiagnostics });
+        } else {
+          statusBar.text = formatStatusBarSummary(readySummary, quotaState.kind === "quota" ? quotaState.quota : undefined, now());
         }
-      }),
-    ] : []),
-    ...(copilotAccount ? [copilotAccount] : []),
+      }
+    }),
+    copilotAccount,
     vscode.commands.registerCommand("copilotUsage.refresh", () => runRefresh()),
     vscode.commands.registerCommand("copilotUsage.connectQuota", () =>
-      quotaService?.refreshNow({ interactive: true }),
+      quotaService.refreshNow({ interactive: true }),
     ),
     vscode.commands.registerCommand("copilotUsage.openView", () => openView()),
     vscode.commands.registerCommand("copilotUsage.openSourceLog", (node?: UsageNode) =>

@@ -1,7 +1,12 @@
-import { appendFile, mkdir, mkdtemp, rm, truncate, utimes, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, open, rm, truncate, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const fs = await importOriginal<typeof import('node:fs/promises')>();
+  return { ...fs, open: vi.fn(fs.open) };
+});
 
 import * as parser from '../src/core/parser';
 import { UsageIndex } from '../src/core/usageIndex';
@@ -22,6 +27,7 @@ describe('UsageIndex', () => {
 
   afterEach(async () => {
     vi.restoreAllMocks();
+    vi.mocked(open).mockImplementation((await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).open);
     await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })));
     roots.length = 0;
   });
@@ -96,6 +102,28 @@ describe('UsageIndex', () => {
 
     expect(parse).not.toHaveBeenCalled();
     expect(result).toEqual(initial);
+  });
+
+  it('collects billed chat IDs only once while polling unchanged usage and title files', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    for (let chat = 0; chat < 20; chat++) {
+      const folder = join(root, 'debug-logs', `chat-${chat}`);
+      await mkdir(folder, { recursive: true });
+      await writeFile(join(folder, 'main.json'), JSON.stringify(usageRecord(`chat-${chat}`, 7)));
+      await writeFile(join(folder, 'title-response.json'), JSON.stringify({
+        type: 'agent_response', ts: Date.parse('2026-05-28T08:00:01Z'),
+        attrs: { response: JSON.stringify([{ role: 'assistant', parts: [{ type: 'text', content: `Title ${chat}` }] }]) },
+      }));
+    }
+    const index = new UsageIndex();
+    const options = { config: configForRoot(root), now: new Date('2026-05-28T12:00:00Z') };
+    const initial = await index.rebuild({ roots: [root], ...options });
+    // Each collection walks every cached record, so its count must not grow
+    // with the number of unchanged files visited by the automatic poll.
+    const collectIds = vi.spyOn(index as unknown as { getBilledChatIds(): Set<string> }, 'getBilledChatIds');
+    expect(await index.poll(options)).toEqual(initial);
+    expect(collectIds).toHaveBeenCalledTimes(1);
   });
 
   it('polls same-size JSON usage and delayed title rewrites', async () => {
@@ -516,6 +544,111 @@ describe('UsageIndex', () => {
 
     expect(result.summary.allTime.tokens).toBe(3);
     expect(result.summary.chats.map((chat) => chat.chatId)).toEqual(['third']);
+  });
+
+  it('reparses longer JSONL rewrites even when the old offset remains a line boundary', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    const filePath = join(root, 'usage.jsonl');
+    const original = JSON.stringify(usageRecord('first', 1)) + '\n';
+    const replacement = JSON.stringify(usageRecord('third', 3)) + '\n';
+    expect(Buffer.byteLength(replacement)).toBe(Buffer.byteLength(original));
+    await writeFile(filePath, original);
+    const index = new UsageIndex();
+    const options = { config: configForRoot(root), now: new Date('2026-05-28T12:00:00Z') };
+    await index.rebuild({ roots: [root], ...options });
+
+    await writeFile(filePath, replacement + JSON.stringify(usageRecord('second', 2)) + '\n');
+    const result = await index.poll(options);
+
+    expect(result.summary.allTime.tokens).toBe(5);
+    expect(result.summary.chats.map((chat) => chat.chatId).sort()).toEqual(['second', 'third']);
+    expect(result).toEqual(await new UsageIndex().rebuild({ roots: [root], ...options }));
+  });
+
+  it('discovers a retained title after a longer JSONL rewrite at the same old line boundary', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    await mkdir(join(root, 'chatSessions'));
+    const filePath = join(root, 'chatSessions', 'saved-chat.jsonl');
+    const original = JSON.stringify({ kind: 0, v: {
+      sessionId: 'saved-chat', customTitle: 'Title A', creationDate: Date.parse('2026-05-28T08:00:00Z'),
+    } }) + '\n';
+    await writeFile(filePath, original);
+    const index = new UsageIndex();
+    const options = { config: configForRoot(root), now: new Date('2026-05-28T12:00:00Z'), retainedChatIds: ['saved-chat'] };
+    expect((await index.rebuild({ roots: [root], ...options })).titleMetadata?.[0].title).toBe('Title A');
+
+    await writeFile(filePath, original.replace('Title A', 'Title B') + '\n');
+    const result = await index.poll(options);
+
+    expect(result.titleMetadata?.[0].title).toBe('Title B');
+    expect(result.summary.chats).toEqual([]);
+    expect(result).toEqual(await new UsageIndex().rebuild({ roots: [root], ...options }));
+  });
+
+  it('skips unchanged JSONL content reads and parses only appended lines on growth', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    const filePath = join(root, 'usage.jsonl');
+    await writeFile(filePath, JSON.stringify(usageRecord('first', 1)) + '\n');
+    const index = new UsageIndex();
+    const options = { config: configForRoot(root), now: new Date('2026-05-28T12:00:00Z') };
+    await index.rebuild({ roots: [root], ...options });
+    vi.mocked(open).mockClear();
+    const parse = vi.spyOn(parser, 'parseUsageFile');
+
+    await index.poll(options);
+    await index.poll(options);
+    expect(open).not.toHaveBeenCalled();
+    expect(parse).not.toHaveBeenCalled();
+
+    await appendFile(filePath, JSON.stringify(usageRecord('second', 2)) + '\n');
+    expect((await index.poll(options)).summary.allTime.tokens).toBe(3);
+    expect(parse).not.toHaveBeenCalled();
+  });
+
+  it('does not resume from a digest of contents rewritten after the initial parse', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    const filePath = join(root, 'usage.jsonl');
+    await writeFile(filePath, JSON.stringify(usageRecord('first', 1)) + '\n');
+    const parse = parser.parseUsageFile;
+    vi.spyOn(parser, 'parseUsageFile').mockImplementationOnce(async (...args) => {
+      const parsed = await parse(...args);
+      await writeFile(filePath, JSON.stringify(usageRecord('third', 3)) + '\n' + JSON.stringify(usageRecord('second', 2)) + '\n');
+      return parsed;
+    });
+    const index = new UsageIndex();
+    const options = { config: configForRoot(root), now: new Date('2026-05-28T12:00:00Z') };
+    await index.rebuild({ roots: [root], ...options });
+
+    const result = await index.poll(options);
+
+    expect(result.summary.allTime.tokens).toBe(5);
+    expect(result.summary.chats.map((chat) => chat.chatId).sort()).toEqual(['second', 'third']);
+  });
+
+  it('reads all appended bytes when filesystem reads return short chunks', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    const filePath = join(root, 'usage.jsonl');
+    await writeFile(filePath, JSON.stringify(usageRecord('first', 1)) + '\n');
+    const index = new UsageIndex();
+    const options = { config: configForRoot(root), now: new Date('2026-05-28T12:00:00Z') };
+    await index.rebuild({ roots: [root], ...options });
+    await appendFile(filePath, JSON.stringify(usageRecord('second', 2)) + '\n' + JSON.stringify(usageRecord('third', 3)) + '\n');
+    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    vi.mocked(open).mockImplementation(async (...args) => {
+      const handle = await actual.open(...args);
+      const read = handle.read.bind(handle);
+      Object.defineProperty(handle, 'read', { value: (buffer: Buffer, offset: number, length: number, position: number | null) =>
+        read(buffer, offset, Math.min(length, 7), position) });
+      return handle;
+    });
+
+    expect((await index.poll(options)).summary.allTime.tokens).toBe(6);
+    expect((await index.poll(options)).summary.allTime.tokens).toBe(6);
   });
 
   it.skipIf(process.platform !== 'win32')('does not duplicate cached records when a Windows file event changes drive letter casing', async () => {

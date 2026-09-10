@@ -1,4 +1,4 @@
-import { appendFile, mkdir, mkdtemp, open, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, open, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -214,6 +214,21 @@ describe('CopilotAccountWatcher', () => {
     expect(await watcher.currentLogin()).toBe('hubot');
     watcher.dispose();
   });
+
+  it.each(['', '2026-09-04 11:40:00.000 [info] Request completed\n'])(
+    'detects an account switch before the old offset in a replacement log with suffix %j', async (suffix) => {
+    await writeFile(copilotLog, line('alice'));
+    const watcher = new CopilotAccountWatcher(extensionLog);
+    try {
+      expect(await watcher.currentLogin()).toBe('alice');
+      await writeFile(copilotLog, line('bobby') + suffix);
+      await utimes(copilotLog, new Date(), new Date('2026-09-05T12:00:00Z'));
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(await watcher.currentLogin()).toBe('bobby');
+    } finally {
+      watcher.dispose();
+    }
+    });
 
   it('reports no login while Copilot Chat has written no log', async () => {
     const watcher = new CopilotAccountWatcher(extensionLog);

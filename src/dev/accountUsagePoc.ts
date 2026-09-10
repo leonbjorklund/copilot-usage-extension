@@ -149,7 +149,6 @@ export class AccountUsagePoc {
   private readonly offsets = new Map<string, { size: number; modified: number }>();
   private readonly sessionStarts = new Map<string, number | undefined>();
   private readonly writer: string;
-  private writerBytes = 0;
   private incompleteWrite = false;
   private startedAt = 0;
   private initialized = false;
@@ -172,12 +171,16 @@ export class AccountUsagePoc {
 
   private async refreshOnce(summary: UsageSummary, now: Date, titleMetadata: UsageRecord[]): Promise<AccountPocView> {
     await this.initialize(now.getTime());
-    // Only this observer writes this journal. Remove a failed append before
-    // reading or retrying it, so a partial line cannot corrupt the next entry.
+    // Only this observer writes this journal. Another observer may have already
+    // displayed complete lines from a failed append, so preserve them and remove
+    // only the unfinished tail before reading or retrying it.
     if (this.incompleteWrite) {
-      await truncate(this.writer, this.writerBytes).catch((error: NodeJS.ErrnoException) => {
-        if (error.code !== 'ENOENT') throw error;
-      });
+      try {
+        const written = await readFile(this.writer);
+        await truncate(this.writer, written.lastIndexOf(10) + 1);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
       this.incompleteWrite = false;
     }
     await this.readJournals();
@@ -234,7 +237,6 @@ export class AccountUsagePoc {
         const text = additions.map((entry) => JSON.stringify(entry)).join('\n') + '\n';
         this.incompleteWrite = true;
         await appendFile(this.writer, text, 'utf8');
-        this.writerBytes += Buffer.byteLength(text);
         this.incompleteWrite = false;
       } catch (error) {
         for (const entry of additions) {
@@ -316,8 +318,11 @@ export class AccountUsagePoc {
       if (previous.kind !== 'bill' || entry.kind !== 'bill') return;
       const priority = entry.record.titlePriority ?? TITLE_PRIORITY.record;
       const previousPriority = previous.record.titlePriority ?? TITLE_PRIORITY.record;
-      const laterTitle = entry.titleTimestamp! > previous.titleTimestamp! ||
-        (entry.titleTimestamp === previous.titleTimestamp && (entry.titleModifiedAt ?? 0) > (previous.titleModifiedAt ?? 0));
+      const laterTitle = priority === TITLE_PRIORITY.custom && entry.titleModifiedAt !== undefined &&
+        previous.titleModifiedAt !== undefined && entry.titleModifiedAt !== previous.titleModifiedAt
+        ? entry.titleModifiedAt > previous.titleModifiedAt
+        : entry.titleTimestamp! > previous.titleTimestamp! ||
+          (entry.titleTimestamp === previous.titleTimestamp && (entry.titleModifiedAt ?? 0) > (previous.titleModifiedAt ?? 0));
       // Older journals saved resolved labels with request-level priority. Keep
       // descriptive labels until their source is rediscovered or a custom title
       // replaces them, since their original priority cannot be recovered.
@@ -351,7 +356,8 @@ export class AccountUsagePoc {
           const entry = JSON.parse(line) as Entry;
           if (entry.kind === 'bill') {
             entry.record.timestamp = new Date(entry.record.timestamp);
-            if (!Number.isFinite(entry.record.timestamp.getTime()) || entry.key !== billKey(entry.record) || !(entry.record.billing?.aiCredits! > 0)) {
+            if (!Number.isFinite(entry.record.timestamp.getTime()) || entry.key !== billKey(entry.record) ||
+              typeof entry.record.billing?.aiCredits !== 'number' || !Number.isFinite(entry.record.billing.aiCredits) || entry.record.billing.aiCredits <= 0) {
               throw new Error('Invalid account POC request journal. Tracking data was left untouched.');
             }
             if ((entry.titleTimestamp !== undefined && (!Number.isFinite(entry.titleTimestamp) || !Number.isFinite(entry.record.titlePriority))) ||

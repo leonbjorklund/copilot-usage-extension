@@ -260,7 +260,7 @@ describe("formatStatusBarTooltip", () => {
     expect(tooltip.value).not.toContain("## Today:");
     expect(tooltip.value).not.toContain("Week:");
     expect(tooltip.value).toContain(
-      "<strong>Today:</strong> 1.2M (8.4$) &nbsp;|&nbsp; <strong>Month:</strong> 8.9M (21.59$) &nbsp;|&nbsp; <strong>All time:</strong> 22M (42.15$)",
+      "<strong>Today:</strong> 1.2M (8.4$) &nbsp;|&nbsp; <strong>Month:</strong> 8.9M (21.6$) &nbsp;|&nbsp; <strong>All time:</strong> 22M (42.2$)",
     );
     expect(tooltip.value).toContain("---");
     expect(tooltip.value).toContain('<tr><td colspan="2"><strong>Model use:</strong></td></tr>');
@@ -448,8 +448,8 @@ describe("formatStatusBarTooltip", () => {
       entitlement: 1500, remaining: 841, percentRemaining: 841 / 15,
       unlimited: false, overageCount: 0, resetDate: new Date("2026-10-01"),
     };
-    expect(formatStatusBarSummary(summary, quota, new Date("2026-09-21"))).toBe("2.1M | 8.29$ • 44/100%");
-    expect(formatStatusBarSummary(summary)).toBe("2.1M | 8.29$");
+    expect(formatStatusBarSummary(summary, quota, new Date("2026-09-21"))).toBe("2.1M | 8.3$ • 44/100%");
+    expect(formatStatusBarSummary(summary)).toBe("2.1M | 8.3$");
     summary.today = createTotal(0);
     expect(formatStatusBarSummary(summary, quota, new Date("2026-09-21"))).toBe("No sessions today • 44/100%");
   });
@@ -971,14 +971,14 @@ describe("activate", () => {
       await activateExtension(context);
       await settle();
       const statusBar = vi.mocked(vscode.window.createStatusBarItem).mock.results[0].value;
-      expect(statusBar.text).toBe("2.1M | 0.87$");
+      expect(statusBar.text).toBe("2.1M | 0.9$");
       respond(new Response(JSON.stringify({ quota_snapshots: { premium_models: {
         entitlement: 1500, percent_remaining: 841 / 15, reset_date: "2026-10-01",
       } } })));
-      await vi.waitFor(() => expect(statusBar.text).toBe("2.1M | 0.87$ • 44/100%"));
+      await vi.waitFor(() => expect(statusBar.text).toBe("2.1M | 0.9$ • 44/100%"));
       expect(statusBar.command).toBe("copilotUsage.openView");
       await commandCallback("copilotUsage.connectQuota")();
-      expect(statusBar.text).toBe("2.1M | 0.87$");
+      expect(statusBar.text).toBe("2.1M | 0.9$");
       expect(fetchMock).toHaveBeenCalledTimes(1);
     } finally {
       for (const disposable of context.subscriptions) { disposable.dispose?.(); }
@@ -1057,7 +1057,7 @@ describe("activate", () => {
       await writeRequest('alice-chat', 5_000, 2, 'alice-request');
       await appendFile(log, stamp(6_000, 'request done: requestId: [alice-request] model deployment ID: []'));
       await vi.advanceTimersByTimeAsync(10_000);
-      await vi.waitFor(() => expect(status.text).toBe('100 | 0.02$ • 50/100%'));
+      await vi.waitFor(() => expect(status.text).toBe('100 | 0$ • 50/100%'));
       expect(status.tooltip.value).toContain('alice-chat');
       expect(status.tooltip.value).not.toContain('historical');
       expect(status.tooltip.value).not.toContain('Last 30 days');
@@ -1065,7 +1065,7 @@ describe("activate", () => {
       await writeRequest('bob-chat', 14_000, 5, 'bob-request');
       await appendFile(log, stamp(15_000, 'request done: requestId: [bob-request] model deployment ID: []'));
       await vi.advanceTimersByTimeAsync(10_000);
-      await vi.waitFor(() => expect(status.text).toBe('100 | 0.05$ • 50/100%'));
+      await vi.waitFor(() => expect(status.text).toBe('100 | 0.1$ • 50/100%'));
       expect(status.tooltip.value).toContain('bob-chat');
       expect(status.tooltip.value).not.toContain('alice-chat');
       const children = await registeredTreeProvider().getChildren();
@@ -1081,7 +1081,7 @@ describe("activate", () => {
         await commandCallback('copilotUsage.showDiagnostics')();
         expect(vi.mocked(vscode.window.showInformationMessage).mock.calls.at(-1)?.[0]).toContain('unresolved requests: 1');
       });
-      expect(status.text).toBe('100 | 0.05$ • 50/100%');
+      expect(status.text).toBe('100 | 0.1$ • 50/100%');
       expect(status.tooltip.value).not.toContain('Last 30 days');
       expect(status.tooltip.value).toContain('bob-chat');
       expect(status.tooltip.value).not.toContain('Waiting for account evidence');
@@ -1094,7 +1094,7 @@ describe("activate", () => {
         await commandCallback('copilotUsage.showDiagnostics')();
         expect(vi.mocked(vscode.window.showInformationMessage).mock.calls.at(-1)?.[0]).toContain('unresolved requests: 0');
       });
-      expect(status.text).toBe('100 | 0.05$ • 50/100%');
+      expect(status.text).toBe('100 | 0.1$ • 50/100%');
 
       // Switch back while quota is blocked on the network. Local saved usage
       // must return without waiting for that request or mixing Bob's quota.
@@ -1103,7 +1103,7 @@ describe("activate", () => {
       const switchAt = Date.now() - start.getTime();
       await appendFile(log, stamp(switchAt, 'Logged in as alice') + stamp(switchAt + 100, 'Got Copilot token for alice'));
       await vi.advanceTimersByTimeAsync(3_000);
-      await vi.waitFor(() => expect(status.text).toBe('200 | 0.05$'));
+      await vi.waitFor(() => expect(status.text).toBe('200 | 0.1$'));
       expect(status.tooltip.value).toContain('alice-delayed');
       expect(status.tooltip.value).not.toContain('bob-chat');
       const aliceRows = await registeredTreeProvider().getChildren();
@@ -1114,7 +1114,7 @@ describe("activate", () => {
       finishQuota(new Response(JSON.stringify({ quota_snapshots: { premium_models: {
         entitlement: 100, percent_remaining: 75, overage_count: 0, reset_date: '2026-10-01',
       } } })));
-      await vi.waitFor(() => expect(status.text).toBe('200 | 0.05$ • 25/100%'));
+      await vi.waitFor(() => expect(status.text).toBe('200 | 0.1$ • 25/100%'));
 
       // A second real pipeline shares the journal but follows its own window.
       const secondHost = join(root, 'logs', '20260921T120000', 'window2', 'exthost');
@@ -1129,12 +1129,12 @@ describe("activate", () => {
       vi.mocked(CopilotAccountWatcher).mockImplementationOnce(function (path) { return new realAccount.CopilotAccountWatcher(path); });
       try {
         activate(secondContext);
-        await vi.waitFor(() => expect(secondStatus.text).toBe('100 | 0.05$ • 50/100%'));
+        await vi.waitFor(() => expect(secondStatus.text).toBe('100 | 0.1$ • 50/100%'));
         expect((secondStatus.tooltip as vscode.MarkdownString).value).toContain('bob-chat');
         expect((secondStatus.tooltip as vscode.MarkdownString).value).not.toContain('alice-delayed');
         await vi.advanceTimersByTimeAsync(3_000);
-        expect(status.text).toBe('200 | 0.05$ • 25/100%');
-        expect(secondStatus.text).toBe('100 | 0.05$ • 50/100%');
+        expect(status.text).toBe('200 | 0.1$ • 25/100%');
+        expect(secondStatus.text).toBe('100 | 0.1$ • 50/100%');
       } finally {
         for (const disposable of secondContext.subscriptions as vscode.Disposable[]) disposable.dispose?.();
       }
@@ -1146,7 +1146,7 @@ describe("activate", () => {
       vi.mocked(CopilotAccountWatcher).mockImplementationOnce(function (path) { return new realAccount.CopilotAccountWatcher(path); });
       vi.mocked(vscode.window.createStatusBarItem).mockReturnValueOnce(status);
       activate(context);
-      await vi.waitFor(() => expect(status.text).toBe('200 | 0.05$ • 50/100%'));
+      await vi.waitFor(() => expect(status.text).toBe('200 | 0.1$ • 50/100%'));
       expect(status.tooltip.value).toContain('alice-delayed');
       expect(status.tooltip.value).not.toContain('Last 30 days');
       expect(status.tooltip.value).not.toContain('bob-chat');
@@ -1157,7 +1157,7 @@ describe("activate", () => {
       } }));
       await vi.advanceTimersByTimeAsync(3_000);
       await vi.waitFor(() => expect(status.tooltip.value).toContain('Alice retained rename'));
-      expect(status.text).toBe('200 | 0.05$ • 50/100%');
+      expect(status.text).toBe('200 | 0.1$ • 50/100%');
       expect(status.tooltip.value).not.toContain('bob-chat');
       expect(status.tooltip.value).not.toContain('Last 30 days');
     } finally {
@@ -1208,14 +1208,14 @@ describe("activate", () => {
     try {
       await activateExtension(context);
       const statusBar = vi.mocked(vscode.window.createStatusBarItem).mock.results[0].value;
-      await vi.waitFor(() => expect(statusBar.text).toBe("2.1M | 0.87$ • 10/100%"));
+      await vi.waitFor(() => expect(statusBar.text).toBe("2.1M | 0.9$ • 10/100%"));
       expect((await registeredTreeProvider().getChildren())?.[0]).toMatchObject({
         kind: "quota", state: { account: "octocat", quota: { remaining: 1350, entitlement: 1500 } },
       });
 
       await writer.write("[info] Logged in as hubot\n");
       await vi.advanceTimersByTimeAsync(2_000);
-      await vi.waitFor(() => expect(statusBar.text).toBe("2.1M | 0.87$ • 20/100%"));
+      await vi.waitFor(() => expect(statusBar.text).toBe("2.1M | 0.9$ • 20/100%"));
       expect((await registeredTreeProvider().getChildren())?.[0]).toMatchObject({
         kind: "quota", state: { account: "hubot", quota: { remaining: 2400, entitlement: 3000 } },
       });

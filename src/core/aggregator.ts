@@ -246,6 +246,14 @@ function isBetterTitleCandidate(candidate: TitleCandidate, existing: TitleCandid
     return candidate.timestamp < existing.timestamp;
   }
 
+  if (candidate.priority === TITLE_PRIORITY.custom &&
+    candidate.modifiedAt !== undefined && existing.modifiedAt !== undefined) {
+    // Chat snapshots retain creationDate; rename deltas may have no timestamp.
+    // Their file revision and row order describe which custom title is current.
+    if (candidate.modifiedAt !== existing.modifiedAt) return candidate.modifiedAt > existing.modifiedAt;
+    if (candidate.filePath === existing.filePath) return true;
+  }
+
   if (candidate.timestamp.getTime() === existing.timestamp.getTime()) {
     // A rebuilt JSONL file gives every row the same revision. Preserve its
     // later title row, as incremental appends do, without ordering other files.

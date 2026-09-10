@@ -42,7 +42,7 @@ export interface UsageRecord {
   titlePriority?: number;
   /** Source time of a retained chat title, separate from the billed request time. */
   titleTimestamp?: Date;
-  /** Metadata file revision, used only when non-prompt title source times tie. */
+  /** Metadata file revision, orders custom titles and breaks other non-prompt timestamp ties. */
   titleModifiedAt?: number;
   /** Correlation evidence for account attribution. */
   debugRequest?: { responseId: string; spanId: string; durationMs: number };

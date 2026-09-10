@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { formatPeriodPercentage, formatTokens, formatTotalUsd, formatUsd } from '../src/ui/formatters';
+import { formatPeriodPercentage, formatTokens, formatUsd } from '../src/ui/formatters';
 
 describe('formatPeriodPercentage', () => {
   const now = new Date('2026-09-21T12:00:00Z');
@@ -33,16 +33,6 @@ describe('formatPeriodPercentage', () => {
   });
 });
 
-describe('formatTotalUsd', () => {
-  it('preserves cents without unnecessary trailing zeroes', () => {
-    expect(formatTotalUsd(0.87)).toBe('0.87$');
-    expect(formatTotalUsd(8.29)).toBe('8.29$');
-    expect(formatTotalUsd(476)).toBe('476$');
-    expect(formatTotalUsd(8.4)).toBe('8.4$');
-    expect(formatTotalUsd(0)).toBe('0$');
-  });
-});
-
 describe('formatTokens', () => {
   it('rounds thousands to whole k values', () => {
     expect(formatTokens(368_100)).toBe('368k');
@@ -56,17 +46,22 @@ describe('formatTokens', () => {
 });
 
 describe('formatUsd', () => {
-  it('shows cents for amounts below one dollar', () => {
-    expect(formatUsd(0.68)).toBe('0.68$');
-    expect(formatUsd(0.72)).toBe('0.72$');
+  it('rounds amounts below one dollar to one decimal', () => {
+    expect(formatUsd(0.68)).toBe('0.7$');
+    expect(formatUsd(0.72)).toBe('0.7$');
+    expect(formatUsd(0.17)).toBe('0.2$');
   });
 
   it('rounds dollar amounts to one decimal with the dollar sign after the value', () => {
     expect(formatUsd(1.2)).toBe('1.2$');
+    expect(formatUsd(14.46)).toBe('14.5$');
+    expect(formatUsd(200.87)).toBe('200.9$');
+    expect(formatUsd(5)).toBe('5$');
   });
 
-  it('shows cents for nonzero amounts that round to zero at one decimal', () => {
-    expect(formatUsd(0.04)).toBe('0.04$');
+  it('rounds tiny amounts to zero and clamps negative values', () => {
+    expect(formatUsd(0.05)).toBe('0.1$');
+    expect(formatUsd(0.04)).toBe('0$');
     expect(formatUsd(0.004)).toBe('0$');
     expect(formatUsd(-0.01)).toBe('0$');
   });

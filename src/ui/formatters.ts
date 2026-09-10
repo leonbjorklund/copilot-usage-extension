@@ -21,11 +21,6 @@ export function getPeriodSpentPercentage(quota: CopilotQuota | undefined, now = 
   return Math.round(spent / quota.entitlement * 100);
 }
 
-/** Totals keep cents; the compact model/session rows use formatUsd. */
-export function formatTotalUsd(usd: number): string {
-  return `${Math.max(0, Math.round(usd * 100)) / 100}$`;
-}
-
 export function formatTokens(tokens: number): string {
   if (tokens >= 1_000_000) {
     return `${Math.round(tokens / 100_000) / 10}M`;
@@ -39,11 +34,7 @@ export function formatTokens(tokens: number): string {
   return `${Math.round(tokens)}`;
 }
 
+/** All dollar displays round to one decimal without trailing zeroes. */
 export function formatUsd(usd: number): string {
-  const cents = Math.round(usd * 100);
-  if (cents <= 0) {
-    return "0$";
-  }
-
-  return cents < 100 ? `${(cents / 100).toFixed(2)}$` : `${Math.round(usd * 10) / 10}$`;
+  return `${Math.max(0, Math.round(usd * 10)) / 10}$`;
 }

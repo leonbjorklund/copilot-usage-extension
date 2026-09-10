@@ -208,6 +208,50 @@ describe('local POC ledger', () => {
     expect((await restarted.refresh(aggregateUsage([]), now)).summary.chats[0].title).toBe('Generated chat title');
   });
 
+  it('retains timestamp-free custom rename deltas and later snapshots across restart', async () => {
+    const f = await fixture();
+    const a = record(f.usage);
+    await appendFile(f.log, done(a));
+    const now = new Date(base + 90_000);
+    const first = await f.poc.refresh(aggregateUsage([a]), now);
+    const folder = join(f.root, 'chatSessions');
+    await mkdir(folder);
+    const file = join(folder, 'chat.jsonl');
+    const snapshot = (title: string) => JSON.stringify({ kind: 0, v: {
+      sessionId: 'chat', customTitle: title, creationDate: base,
+    } }) + '\n';
+    await writeFile(file, snapshot('Original title'));
+    await utimes(file, new Date(base + 10_000), new Date(base + 10_000));
+    const index = new UsageIndex();
+    const options = { config: { dataPath: f.root, maxFileSizeMb: 10, maxScanDepth: 6 }, now, retainedChatIds: ['chat'] };
+    const initial = await index.rebuild({ roots: [f.root], ...options });
+    expect((await f.poc.refresh(initial.summary, now, initial.titleMetadata)).summary.chats[0].title).toBe('Original title');
+
+    await appendFile(file, JSON.stringify({ kind: 1, k: ['customTitle'], v: 'Renamed title' }) + '\n');
+    await utimes(file, new Date(base + 20_000), new Date(base + 20_000));
+    const renamed = await index.poll(options);
+    const saved = await f.poc.refresh(renamed.summary, now, renamed.titleMetadata);
+    expect(saved.summary.chats[0].title).toBe('Renamed title');
+    expect(saved.summary.allTime).toEqual(first.summary.allTime);
+    const rebuilt = await index.rebuild({ roots: [f.root], ...options });
+    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    expect((await restarted.refresh(rebuilt.summary, now, rebuilt.titleMetadata)).summary.chats[0].title).toBe('Renamed title');
+
+    await appendFile(file, JSON.stringify({ kind: 1, k: ['customTitle'], v: 'Second rename' }) + '\n');
+    await utimes(file, new Date(base + 25_000), new Date(base + 25_000));
+    const second = await index.poll(options);
+    expect((await restarted.refresh(second.summary, now, second.titleMetadata)).summary.chats[0].title).toBe('Second rename');
+
+    // Snapshot compaction retains the chat creation date, not its rename time.
+    await writeFile(file, snapshot('Snapshot rename'));
+    await utimes(file, new Date(base + 30_000), new Date(base + 30_000));
+    const compacted = await index.poll(options);
+    expect((await restarted.refresh(compacted.summary, now, compacted.titleMetadata)).summary.chats[0].title).toBe('Snapshot rename');
+    const final = await new AccountUsagePoc(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([]), now);
+    expect(final.summary.chats[0].title).toBe('Snapshot rename');
+    expect(final.summary.allTime).toEqual(first.summary.allTime);
+  });
+
   it('preserves title priority and saved billing when title sources change', async () => {
     const f = await fixture();
     const a = { ...record(f.usage), title: 'panel/editAgent', titlePriority: TITLE_PRIORITY.generic };
@@ -459,6 +503,35 @@ describe('local POC ledger', () => {
     if ('view' in other) expect(other.view.startedAt).toEqual(view.startedAt);
   });
 
+  it('preserves complete interrupted-write entries already visible to another observer', async () => {
+    const f = await fixture();
+    const a = record(f.usage);
+    const b = record(f.usage, base + 20_000, 'request-2');
+    await appendFile(f.log, done(a) + done(b));
+    const now = new Date(base + 40_000);
+    const start = await readFile(join(f.storage, 'start.json'), 'utf8');
+    const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    vi.mocked(appendFile).mockImplementationOnce(async (file, data) => {
+      const lines = String(data).split('\n');
+      const firstBill = lines.findIndex((line) => JSON.parse(line).kind === 'bill');
+      await fs.appendFile(file, lines.slice(0, firstBill + 1).join('\n') + '\n{"kind"');
+      throw new Error('Interrupted after a complete bill');
+    });
+    await expect(f.poc.refresh(aggregateUsage([a, b]), now)).rejects.toThrow('Interrupted after a complete bill');
+    const other = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const observed = await other.refresh(aggregateUsage([]), now);
+    expect(observed.summary.allTime.githubCopilot.aiCredits).toBe(2);
+
+    // The original writer retries after the request logs have disappeared.
+    await rm(f.usage);
+    const recovered = await f.poc.refresh(aggregateUsage([]), now);
+    expect(recovered.summary.allTime).toEqual(observed.summary.allTime);
+    expect((await other.refresh(aggregateUsage([]), now)).summary.allTime).toEqual(observed.summary.allTime);
+    const restarted = await new AccountUsagePoc(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([]), now);
+    expect(restarted.summary.allTime).toEqual(observed.summary.allTime);
+    expect(await readFile(join(f.storage, 'start.json'), 'utf8')).toBe(start);
+  });
+
   it('recovers after a failed partial journal append without losing or duplicating usage', async () => {
     const f = await fixture();
     const a = record(f.usage);
@@ -612,6 +685,25 @@ describe('local POC ledger', () => {
     const revised = await f.poc.refresh(summary, new Date(base + 35_000));
     expect(revised.excluded).toBe(1);
     expect(revised.summary.allTime.tokens).toBe(0);
+  });
+
+  it.each(['"2"', '1e999', 'true', '[2]'])('rejects malformed saved credit amount %s without changing tracking data', async (amount) => {
+    const f = await fixture();
+    const a = record(f.usage);
+    const b = record(f.usage, base + 20_000, 'second-request');
+    await appendFile(f.log, done(a) + done(b));
+    const now = new Date(base + 30_000);
+    expect((await f.poc.refresh(aggregateUsage([a, b]), now)).summary.allTime.githubCopilot.aiCredits).toBe(4);
+    const journalFile = join(f.storage, (await readdir(f.storage)).find((file) => file.endsWith('.jsonl'))!);
+    const malformed = (await readFile(journalFile, 'utf8')).replace(/"aiCredits":2/g, `"aiCredits":${amount}`);
+    await writeFile(journalFile, malformed);
+    const start = await readFile(join(f.storage, 'start.json'), 'utf8');
+    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+
+    await expect(restarted.refresh(aggregateUsage([]), now)).rejects.toThrow('Invalid account POC request journal');
+    await expect(restarted.refresh(aggregateUsage([]), now)).rejects.toThrow('Invalid account POC request journal');
+    expect(await readFile(journalFile, 'utf8')).toBe(malformed);
+    expect(await readFile(join(f.storage, 'start.json'), 'utf8')).toBe(start);
   });
 
   it('keeps failing on corrupt persisted evidence and never resets the start date', async () => {

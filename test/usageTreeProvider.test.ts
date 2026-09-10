@@ -277,12 +277,12 @@ describe('UsageTreeProvider', () => {
     const rootChildren = (await provider.getChildren()) ?? [];
     const bucketItem = provider.getTreeItem(rootChildren[0]);
     expect(bucketItem.tooltip).toContain('Tokens: 23300');
-    expect(bucketItem.tooltip).toContain('Cost: 0.04$');
+    expect(bucketItem.tooltip).toContain('Cost: 0$');
 
     const chatChildren = (await provider.getChildren(rootChildren[0])) ?? [];
     const chatItem = provider.getTreeItem(chatChildren[0]);
     expect(chatItem.tooltip).toContain('Tokens: 23300');
-    expect(chatItem.tooltip).toContain('Cost: 0.04$');
+    expect(chatItem.tooltip).toContain('Cost: 0$');
   });
 
   it('omits zero-credit costs from bucket and chat rows', async () => {
