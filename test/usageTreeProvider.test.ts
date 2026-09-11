@@ -51,14 +51,13 @@ describe('UsageTreeProvider', () => {
     expect(item.tooltip).toBe('Cannot read Copilot account log.');
   });
 
-  it('distinguishes pending account evidence from a failed scan and clears it on success', async () => {
+  it('clears a scan error after a successful summary', async () => {
     const provider = new UsageTreeProvider();
-    provider.setProblem('Waiting for one request.', true);
+    provider.setProblem('Cannot read logs.');
     const rows = (await provider.getChildren())!;
     const item = provider.getTreeItem(rows[0]);
-    expect(item.label).toBe('Waiting for account evidence');
-    expect(item.iconPath).toMatchObject({ id: 'clock' });
-    expect(item.command).toMatchObject({ command: 'copilotUsage.showDiagnostics' });
+    expect(item.label).toBe('Scan failed');
+    expect(item.iconPath).toMatchObject({ id: 'error' });
     provider.setSummary(createSummary([]));
     expect(provider.getTreeItem((await provider.getChildren())![0]).label).toBe('No Copilot usage found');
     provider.setProblem('Cannot read logs.');
@@ -276,12 +275,12 @@ describe('UsageTreeProvider', () => {
     const rootChildren = (await provider.getChildren()) ?? [];
     const bucketItem = provider.getTreeItem(rootChildren[0]);
     expect(bucketItem.tooltip).toContain('Tokens: 23300');
-    expect(bucketItem.tooltip).toContain('Cost: 0$');
+    expect(bucketItem.tooltip).toContain('Cost: 0.04$');
 
     const chatChildren = (await provider.getChildren(rootChildren[0])) ?? [];
     const chatItem = provider.getTreeItem(chatChildren[0]);
     expect(chatItem.tooltip).toContain('Tokens: 23300');
-    expect(chatItem.tooltip).toContain('Cost: 0$');
+    expect(chatItem.tooltip).toContain('Cost: 0.04$');
   });
 
   it('omits zero-credit costs from bucket and chat rows', async () => {

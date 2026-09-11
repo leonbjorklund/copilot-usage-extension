@@ -340,6 +340,13 @@ describe("formatStatusBarTooltip", () => {
     expect(formatStatusBarTooltip(summary).value).not.toContain("1.2$");
   });
 
+  it('shows sub-cent costs as plain status text and escaped tooltip HTML', () => {
+    const summary = createEmptySummary();
+    summary.today = createTotal(1_000, 0.004);
+    expect(formatStatusBarSummary(summary)).toBe('1k | <0.01$');
+    expect(formatStatusBarTooltip(summary).value).toContain('<strong>Today:</strong> 1k (&lt;0.01$)');
+  });
+
   it("omits zero-credit cost from status text and tooltip", () => {
     const summary: UsageSummary = {
       today: {
@@ -1001,6 +1008,74 @@ describe("activate", () => {
     });
   });
 
+  it.each(['unknown account', 'known account', 'damaged tracking storage'])(
+    'keeps local token and dollar displays without GitHub permission: %s', async (scenario) => {
+      vi.useFakeTimers();
+      const start = new Date(2026, 8, 21, 12);
+      vi.setSystemTime(start.getTime() + 30_000);
+      const root = await mkdtemp(join(tmpdir(), 'copilot-local-fallback-'));
+      roots.push(root);
+      vi.stubEnv('APPDATA', join(root, 'roaming'));
+      const host = join(root, 'logs', '20260921T120000', 'window1', 'exthost');
+      const logFolder = join(host, 'GitHub.copilot-chat');
+      await mkdir(logFolder, { recursive: true });
+      await writeFile(join(logFolder, 'GitHub Copilot Chat.log'), scenario === 'known account'
+        ? '2026-09-21 12:00:00.000 [info] Logged in as alice\n' +
+          '2026-09-21 12:00:00.100 [info] Got Copilot token for alice\n' +
+          '2026-09-21 12:00:11.000 [info] request done: requestId: [local-request]\n' : '');
+      const dataRoot = join(root, 'usage');
+      const chatFolder = join(dataRoot, 'debug-logs', 'local-chat');
+      await mkdir(chatFolder, { recursive: true });
+      await writeFile(join(chatFolder, 'main.jsonl'), [
+        { type: 'session_start', ts: start.getTime() + 5_000 },
+        { type: 'llm_request', ts: start.getTime() + 10_000, dur: 1000, spanId: 'local-span',
+          attrs: { model: 'model', debugName: 'local-chat', responseId: 'local-request',
+            inputTokens: 800, outputTokens: 200, copilotUsageNanoAiu: 20_000_000_000 } },
+      ].map(row => JSON.stringify(row)).join('\n') + '\n');
+      const storage = join(root, 'storage');
+      const ledger = join(storage, 'account-poc');
+      await mkdir(ledger, { recursive: true });
+      const savedStart = JSON.stringify({ version: 1, startedAt: start.getTime() });
+      await writeFile(join(ledger, 'start.json'), savedStart);
+      if (scenario === 'damaged tracking storage') await writeFile(join(ledger, 'observer-abcdef.jsonl'), 'broken\n');
+      const realIndex = await vi.importActual<typeof import('../src/core/usageIndex')>('../src/core/usageIndex');
+      const { UsageIndex } = await import('../src/core/usageIndex');
+      vi.mocked(UsageIndex).mockImplementationOnce(function () { return new realIndex.UsageIndex(); });
+      const realAccount = await vi.importActual<typeof import('../src/core/copilotAccount')>('../src/core/copilotAccount');
+      vi.mocked(CopilotAccountWatcher).mockImplementationOnce(function (path) { return new realAccount.CopilotAccountWatcher(path); });
+      locateCopilotDataPaths.mockResolvedValue([dataRoot]);
+      vi.mocked(vscode.authentication.getSession).mockResolvedValue(undefined);
+      vi.mocked(vscode.authentication.getAccounts).mockResolvedValue([{ id: 'alice', label: 'alice' }]);
+      const context = { ...createContext(), extensionMode: vscode.ExtensionMode.Production,
+        logUri: vscode.Uri.file(join(host, 'leonbjorklund.copilot-usage-extension')),
+        globalStorageUri: vscode.Uri.file(storage) };
+      try {
+        activate(context);
+        const status = vi.mocked(vscode.window.createStatusBarItem).mock.results[0].value;
+        await vi.waitFor(() => expect(status.text).toBe('1k | 0.2$'));
+        expect(status.tooltip.value).toContain('local-chat');
+        expect(status.tooltip.value).not.toMatch(/Waiting for account|excluded around account/);
+        const rows = await registeredTreeProvider().getChildren();
+        expect(rows?.find(row => row.kind === 'bucket')).toMatchObject({ bucket: { tokens: 1000, githubCopilot: { usd: 0.2 } } });
+        expect(rows?.some(row => row.kind === 'error')).toBe(scenario === 'damaged tracking storage');
+        if (scenario === 'known account') {
+          expect(rows?.find(row => row.kind === 'quota')).toMatchObject({ state: { kind: 'needs-consent', account: 'alice' } });
+          await commandCallback('copilotUsage.connectQuota')();
+          expect(status.text).toBe('1k | 0.2$');
+        }
+        if (scenario === 'damaged tracking storage') {
+          await commandCallback('copilotUsage.showDiagnostics')();
+          expect(vi.mocked(vscode.window.showInformationMessage).mock.calls.at(-1)?.[0]).toContain('Account tracking:');
+          expect(await readFile(join(ledger, 'observer-abcdef.jsonl'), 'utf8')).toBe('broken\n');
+        }
+        expect(await readFile(join(ledger, 'start.json'), 'utf8')).toBe(savedStart);
+      } finally {
+        for (const disposable of context.subscriptions) disposable.dispose?.();
+        vi.useRealTimers();
+        vi.mocked(vscode.authentication.getAccounts).mockResolvedValue([]);
+      }
+    });
+
   it.each([
     { mode: vscode.ExtensionMode.Development, switchedAccount: 'bob' },
     { mode: vscode.ExtensionMode.Development, switchedAccount: 'bob_company' },
@@ -1034,7 +1109,7 @@ describe("activate", () => {
             copilotUsageNanoAiu: credits * 1_000_000_000 } },
       ].map((row) => JSON.stringify(row)).join('\n') + '\n');
     }
-    await writeRequest("historical", -60_000, 99, "old");
+    await writeRequest("historical", -86_400_000, 99, "old");
     const realIndex = await vi.importActual<typeof import("../src/core/usageIndex")>("../src/core/usageIndex");
     const { UsageIndex } = await import("../src/core/usageIndex");
     vi.mocked(UsageIndex).mockImplementationOnce(function () { return new realIndex.UsageIndex(); });
@@ -1061,7 +1136,7 @@ describe("activate", () => {
       await writeRequest('alice-chat', 5_000, 2, 'alice-request');
       await appendFile(log, stamp(6_000, 'request done: requestId: [alice-request] model deployment ID: []'));
       await vi.advanceTimersByTimeAsync(10_000);
-      await vi.waitFor(() => expect(status.text).toBe('100 | 0$ • 50/100%'));
+      await vi.waitFor(() => expect(status.text).toBe('100 | 0.02$ • 50/100%'));
       expect(status.tooltip.value).toContain('alice-chat');
       expect(status.tooltip.value).not.toContain('historical');
       expect(status.tooltip.value).not.toContain('Last 30 days');
@@ -1075,6 +1150,8 @@ describe("activate", () => {
       const children = await registeredTreeProvider().getChildren();
       expect(children?.[0]).toMatchObject({ kind: 'quota', state: { account: switchedAccount, quota: { remaining: 50 } } });
       expect(children?.[1]).toMatchObject({ kind: 'bucket', bucket: { tokens: 100, githubCopilot: { aiCredits: 5 } } });
+      expect(children?.[2]).toMatchObject({ kind: 'bucket', bucket: { label: 'Yesterday', tokens: 100,
+        chats: [expect.objectContaining({ title: 'historical' })] } });
       expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(3);
       expect(vscode.authentication.getSession).toHaveBeenLastCalledWith('github', [], { silent: true, account: accounts[1] });
 

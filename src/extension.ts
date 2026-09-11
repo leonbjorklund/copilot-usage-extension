@@ -97,7 +97,7 @@ function formatTooltipSummaryItem(label: string, total: UsageSummary["today"]): 
     return "<strong>Today:</strong> No session";
   }
   const cost = total.githubCopilot.available && total.githubCopilot.aiCredits > 0
-    ? ` (${formatUsd(total.githubCopilot.usd)})` : "";
+    ? ` (${escapeHtml(formatUsd(total.githubCopilot.usd))})` : "";
   return `<strong>${label}:</strong> ${formatTokens(total.tokens)}${cost}`;
 }
 
@@ -192,6 +192,7 @@ export function activate(context: vscode.ExtensionContext): void {
       ...['Code', 'Code - Insiders'].map((editor) => join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), editor, 'logs'))],
   ) : undefined;
   let pocView: AccountPocView | undefined;
+  let accountTrackingError: string | undefined;
   let rawSummary: UsageSummary | undefined;
   let pocTimer: ReturnType<typeof setTimeout> | undefined;
   let disposed = false;
@@ -295,33 +296,32 @@ export function activate(context: vscode.ExtensionContext): void {
   function applyResult(result: { summary: UsageSummary; diagnostics: UsageDiagnostics }): void {
     latestDiagnostics = result.diagnostics;
     readySummary = result.summary;
-    treeProvider.setSummary(result.summary, pocView?.problem);
+    treeProvider.setSummary(result.summary, accountTrackingError ?? pocView?.problem);
     const quotaState = quotaService.getState();
-    const matchingQuota = quotaState.kind === "quota" && (!accountPoc || quotaState.account.toLowerCase() === pocView?.account)
+    const matchingQuota = quotaState.kind === "quota" && (!pocView?.account || quotaState.account.toLowerCase() === pocView.account)
       ? quotaState.quota : undefined;
     if (accountPoc) treeProvider.setQuotaState(matchingQuota || (quotaState.kind === 'needs-consent' &&
-      quotaState.account?.toLowerCase() === pocView?.account) ? quotaState : { kind: 'idle' });
+      (!pocView?.account || quotaState.account?.toLowerCase() === pocView.account)) ? quotaState : { kind: 'idle' });
     statusBar.text = formatStatusBarSummary(result.summary, matchingQuota, now());
     statusBar.command = "copilotUsage.openView";
-    const tooltip = formatStatusBarTooltip(result.summary);
-    if (accountTrackingEnabled) {
-      if (pocView?.excluded) tooltip.value += `\n\n${pocView.excluded} request(s) excluded around account switches. See Show Scan Diagnostics.`;
-      if (pocView?.problem) tooltip.value += `\n\n${escapeHtml(pocView.problem)}`;
-    }
-    statusBar.tooltip = tooltip;
-    if (pocView?.problem && !pocView.account) {
-      setStatusBarFailed(statusBar, pocView.problem);
-      statusBar.text = "Waiting for account evidence";
-      treeProvider.setProblem(pocView.problem, true);
-    }
+    statusBar.tooltip = formatStatusBarTooltip(result.summary);
   }
 
   async function acceptResult(result: { summary: UsageSummary; diagnostics: UsageDiagnostics; titleMetadata?: UsageRecord[] }, acceptedGeneration: number): Promise<void> {
     if (disposed || acceptedGeneration !== generation) return;
-    const nextPocView = await accountPoc?.refresh(result.summary, now(), result.titleMetadata);
+    let nextPocView: AccountPocView | undefined;
+    let trackingError: string | undefined;
+    try {
+      nextPocView = await accountPoc?.refresh(result.summary, now(), result.titleMetadata);
+    } catch (error) {
+      // Account storage must not block a successful local usage scan. Preserve
+      // the storage error for recovery without resetting or rewriting data.
+      trackingError = error instanceof Error ? error.message : String(error);
+    }
     if (disposed || acceptedGeneration !== generation) return;
     rawSummary = result.summary;
     pocView = nextPocView;
+    accountTrackingError = trackingError;
     applyResult({ ...result, summary: pocView?.summary ?? result.summary });
   }
 
@@ -553,7 +553,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("copilotUsage.showDiagnostics", () =>
       vscode.window.showInformationMessage(
         latestDiagnostics
-          ? formatDiagnostics(latestDiagnostics) + (pocView ? `\n\n${pocView.diagnostics}` : '')
+          ? formatDiagnostics(latestDiagnostics) + (pocView ? `\n\n${pocView.diagnostics}` : '') +
+            (accountTrackingError ? `\n\nAccount tracking: ${accountTrackingError}` : '')
           : "No Copilot usage scan has completed yet.",
         { modal: true },
       ),

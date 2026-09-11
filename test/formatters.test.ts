@@ -59,10 +59,16 @@ describe('formatUsd', () => {
     expect(formatUsd(5)).toBe('5$');
   });
 
-  it('rounds tiny amounts to zero and clamps negative values', () => {
+  it('keeps small positive amounts visible at the rounding boundaries', () => {
+    expect(formatUsd(0.261479376)).toBe('0.3$');
     expect(formatUsd(0.05)).toBe('0.1$');
-    expect(formatUsd(0.04)).toBe('0$');
-    expect(formatUsd(0.004)).toBe('0$');
+    expect(formatUsd(0.049999)).toBe('0.05$');
+    expect(formatUsd(0.04)).toBe('0.04$');
+    expect(formatUsd(0.034911756)).toBe('0.03$');
+    expect(formatUsd(0.01)).toBe('0.01$');
+    expect(formatUsd(0.009999)).toBe('<0.01$');
+    expect(formatUsd(0.004)).toBe('<0.01$');
+    expect(formatUsd(0)).toBe('0$');
     expect(formatUsd(-0.01)).toBe('0$');
   });
 });

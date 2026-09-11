@@ -110,7 +110,7 @@ export function attributeRequest(
     if (event.account) previous = event.account;
   }
   if (lastSwitch !== -Infinity && (sessionStart === undefined || sessionStart <= lastSwitch + MATCH_TOLERANCE_MS)) {
-    return { excluded: 'Chat predates an account switch. Start a new chat to resume attribution.' };
+    return { excluded: 'Account ownership is uncertain for a chat continued after a switch.' };
   }
   return { account };
 }
@@ -255,15 +255,24 @@ export class AccountUsagePoc {
     const currentAuth = evidence.filter((entry): entry is AuthEvent => isAuth(entry) && pathIdentity(entry.stream) === pathIdentity(this.currentStream))
       .sort((a, b) => a.at - b.at || authOrder(a) - authOrder(b));
     const account = authAt(currentAuth, now.getTime());
-    const records: UsageRecord[] = [];
+    // Historical usage stays in the ordinary display without entering the
+    // account ledger. Only newer requests are filtered by account.
+    const records: UsageRecord[] = summary.chats.flatMap((chat) => chat.records
+      .filter((record) => record.timestamp.getTime() < this.startedAt)
+      .map((record) => ({ ...record, title: chat.title, titlePriority: chat.titlePriority ?? record.titlePriority,
+        titleTimestamp: chat.titleTimestamp, titleModifiedAt: chat.titleModifiedAt })));
+    let attributed = 0;
     let excluded = 0;
     let pending = 0;
     const reasons = new Map<string, number>();
     for (const entry of bills) {
       const decision = attributeRequest(entry.record, entry.sessionStart, evidence, now.getTime(), peers);
-      if ('account' in decision) {
-        if (decision.account === account) records.push(entry.titleTimestamp === undefined ? entry.record :
+      if (!account || ('account' in decision && decision.account === account)) {
+        records.push(entry.titleTimestamp === undefined ? entry.record :
           { ...entry.record, titleTimestamp: new Date(entry.titleTimestamp), titleModifiedAt: entry.titleModifiedAt });
+      }
+      if ('account' in decision) {
+        if (decision.account === account) attributed++;
       } else {
         const reason = 'excluded' in decision ? decision.excluded : decision.pending;
         if ('excluded' in decision) excluded++; else pending++;
@@ -273,13 +282,12 @@ export class AccountUsagePoc {
     // Retained usage can outlive the window logs needed to identify its owner.
     // Such requests are diagnostic gaps, not active work the user can wait for.
     // Keep retrying their evidence without replacing or decorating known usage.
-    const problem = readProblems[0] ?? (!account
-      ? 'Waiting for a successful Copilot sign-in in this window. Check that GitHub Copilot Chat logging is Info or Trace.'
-      : undefined);
+    const problem = readProblems[0];
     const diagnostics = [
       `Account POC: ${account ?? 'unknown'}`,
       `Tracking began: ${new Date(this.startedAt).toLocaleString()}`,
-      `Attributed requests for this account: ${records.length}`,
+      `Attributed requests for this account: ${attributed}`,
+      ...(!account ? ['Current account unavailable; showing combined local usage.'] : []),
       `Excluded switch requests: ${excluded}; unresolved requests: ${pending}`,
       ...[...reasons].map(([reason, count]) => `${count}: ${reason}`),
       ...readProblems,

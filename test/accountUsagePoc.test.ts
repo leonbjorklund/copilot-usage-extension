@@ -139,6 +139,50 @@ async function fixture() {
 }
 
 describe('local POC ledger', () => {
+  it('keeps historical usage visible across accounts without saving it as account usage', async () => {
+    const f = await fixture();
+    const old = { ...record(f.usage, base - 1, 'old'), chatId: 'historical', title: 'Old chat' };
+    const current = record(f.usage);
+    const now = new Date(base + 30_000);
+    await appendFile(f.log, done(current));
+    const summary = aggregateUsage([old, current], now);
+    const start = await readFile(join(f.storage, 'start.json'), 'utf8');
+    const alice = await f.poc.refresh(summary, now);
+    expect(alice.summary.allTime.tokens).toBe(200);
+    expect(alice.summary.allTime.githubCopilot.usd).toBe(0.04);
+    expect(alice.summary.chats.find(chat => chat.chatId === 'historical')).toMatchObject(summary.chats.find(chat => chat.chatId === 'historical')!);
+    expect(f.poc.getRetainedChatIds()).not.toContain('historical');
+    await appendFile(f.log, auth('Bob', base + 40_000));
+    const bob = await f.poc.refresh(summary, new Date(base + 45_000));
+    expect(bob.summary.allTime.tokens).toBe(100);
+    expect(bob.summary.chats[0].title).toBe('Old chat');
+    expect(bob.diagnostics).toContain('Attributed requests for this account: 0');
+    expect(await readFile(join(f.storage, 'start.json'), 'utf8')).toBe(start);
+  });
+
+  it('shows combined saved and unresolved usage until this window identifies its account', async () => {
+    const f = await fixture();
+    const a = record(f.usage);
+    const pending = record(f.usage, base + 20_000, 'pending');
+    await appendFile(f.log, done(a));
+    const now = new Date(base + 30_000);
+    await f.poc.refresh(aggregateUsage([a, pending], now), now);
+    const other = join(f.logRoot, '20260907T110000', 'window2', 'exthost', 'GitHub.copilot-chat');
+    await mkdir(other, { recursive: true });
+    const observer = new AccountUsagePoc(f.storage, other, [f.logRoot]);
+    const unknown = await observer.refresh(aggregateUsage([a, pending], now), now);
+    expect(unknown.account).toBeUndefined();
+    expect(unknown.problem).toBeUndefined();
+    expect(unknown.summary.allTime.tokens).toBe(200);
+    expect(unknown.summary.allTime.githubCopilot.usd).toBe(0.04);
+    expect((await observer.refresh(aggregateUsage([]), now)).summary.allTime.tokens).toBe(200);
+    await writeFile(join(other, 'GitHub Copilot Chat.log'), auth('Alice'));
+    const identified = await observer.refresh(aggregateUsage([]), now);
+    expect(identified.account).toBe('alice');
+    expect(identified.summary.allTime.tokens).toBe(100);
+    expect(identified.pending).toBe(1);
+  });
+
   it('retains delayed indexed titles and same-timestamp custom title rewrites', async () => {
     const f = await fixture();
     const a = record(f.usage);
@@ -578,7 +622,7 @@ describe('local POC ledger', () => {
     expect((await restarted.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(100);
   });
 
-  it('starts fresh and retries delayed evidence without dropping or double counting usage', async () => {
+  it('preserves history and retries delayed evidence without dropping or double counting usage', async () => {
     const f = await fixture();
     const old = record(f.usage, base - 1);
     const current = record(f.usage);
@@ -586,17 +630,17 @@ describe('local POC ledger', () => {
     const pending = await f.poc.refresh(summary, new Date(base + 30_000));
     expect(pending.pending).toBe(1);
     expect(pending.problem).toBeUndefined();
-    expect(pending.summary.allTime.tokens).toBe(0);
+    expect(pending.summary.allTime.tokens).toBe(100);
     const completion = done(current);
     await appendFile(f.log, completion.slice(0, -1));
     expect((await f.poc.refresh(summary, new Date(base + 30_000))).pending).toBe(1);
     await appendFile(f.log, '\n');
     const resolved = await f.poc.refresh(summary, new Date(base + 30_000));
     expect(resolved.problem).toBeUndefined();
-    expect(resolved.summary.allTime.tokens).toBe(100);
-    expect(resolved.summary.month.githubCopilot.usd).toBe(0.02);
+    expect(resolved.summary.allTime.tokens).toBe(200);
+    expect(resolved.summary.month.githubCopilot.usd).toBe(0.04);
     expect(resolved.summary.topModels[0].sessions).toBe(1);
-    expect((await f.poc.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(100);
+    expect((await f.poc.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(200);
   });
 
   it('survives restart and log cleanup using saved evidence and usage', async () => {

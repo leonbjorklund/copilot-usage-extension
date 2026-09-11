@@ -29,7 +29,6 @@ export type UsageNode =
   | {
       kind: "error";
       message: string;
-      pending?: boolean;
     }
   | {
       kind: "quota";
@@ -87,10 +86,10 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode>, vs
     this.changeEmitter.fire();
   }
 
-  setProblem(message: string, pending = false): void {
+  setProblem(message: string): void {
     this.summary = undefined;
     this.setupNeeded = false;
-    this.problem = { kind: "error", message, ...(pending ? { pending: true } : {}) };
+    this.problem = { kind: "error", message };
     this.changeEmitter.fire();
   }
 
@@ -140,10 +139,9 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode>, vs
     }
 
     if (element.kind === "error") {
-      const item = new vscode.TreeItem(element.pending ? "Waiting for account evidence" : "Scan failed", vscode.TreeItemCollapsibleState.None);
-      item.iconPath = new vscode.ThemeIcon(element.pending ? "clock" : "error");
+      const item = new vscode.TreeItem("Scan failed", vscode.TreeItemCollapsibleState.None);
+      item.iconPath = new vscode.ThemeIcon("error");
       item.tooltip = element.message;
-      if (element.pending) item.command = { command: "copilotUsage.showDiagnostics", title: "Show Scan Diagnostics" };
       return item;
     }
 

@@ -34,7 +34,9 @@ export function formatTokens(tokens: number): string {
   return `${Math.round(tokens)}`;
 }
 
-/** All dollar displays round to one decimal without trailing zeroes. */
+/** Keep small positive costs visible; otherwise round to one decimal. */
 export function formatUsd(usd: number): string {
+  if (usd > 0 && usd < 0.01) return '<0.01$';
+  if (usd >= 0.01 && usd < 0.05) return `${usd.toFixed(2)}$`;
   return `${Math.max(0, Math.round(usd * 10)) / 10}$`;
 }

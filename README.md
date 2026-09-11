@@ -6,9 +6,9 @@ Dollar amounts use GitHub's [Copilot usage-based billing docs](https://docs.gith
 
 > Only sessions with AI Credits are counted. Older logs that predate usage-based billing are ignored.
 
-Totals follow the Copilot account in each window. Tracking starts on first use and reuses that saved start on later launches; it does not assign earlier usage to your current account. Confirmed usage is saved locally and remains visible when other requests lack account evidence. The quota row and status percentage use GitHub's live balance.
+Historical sessions remain in the usual display. New usage follows the Copilot account in each window; when the account is unavailable, the extension shows combined local usage. Token and estimated USD totals work without granting GitHub access. Only the quota row and status percentage need that permission.
 
-After switching accounts, start a new chat. Requests around a switch and chats that predate it are excluded when ownership is uncertain. Show Scan Diagnostics explains excluded or unresolved requests. Account attribution requires Copilot Chat logs at Info or Trace level.
+Requests whose account is uncertain remain saved locally and are retried without account warnings in the usage display. Show Scan Diagnostics contains the attribution details. Account attribution uses Copilot Chat logs at Info or Trace level.
 
 #### Status Bar
 
