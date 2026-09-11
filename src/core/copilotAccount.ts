@@ -7,7 +7,9 @@ import * as vscode from 'vscode';
  * Copilot Chat logs `Logged in as <login>` every time it resolves its GitHub
  * account, including after a switch. VS Code tells no extension which account
  * another one uses, so this line in Copilot Chat's own log for the window is
- * the only way the quota row can follow. Only the login is read from it.
+ * the only way the quota row can follow. Chat completion markers also support
+ * the first-message quota permission prompt. Only login and completion markers
+ * are used for this; message contents are not retained.
  */
 /** Copilot writes several lines per request, so a burst becomes one read. */
 const READ_DELAY_MS = 500;
@@ -40,6 +42,8 @@ export interface CopilotAccountSource extends vscode.Disposable {
 
 export class CopilotAccountWatcher implements CopilotAccountSource {
   private readonly changeEmitter = new vscode.EventEmitter<void>();
+  private readonly chatEmitter = new vscode.EventEmitter<string>();
+  private lastChatAt = Date.now();
   private readonly disposables: vscode.Disposable[] = [];
   private readonly logPath: string;
   private snapshot: LogSnapshot | undefined;
@@ -50,6 +54,7 @@ export class CopilotAccountWatcher implements CopilotAccountSource {
   private disposed = false;
 
   readonly onDidChange = this.changeEmitter.event;
+  readonly onDidCompleteChatRequest = this.chatEmitter.event;
 
   constructor(extensionLogPath: string) {
     this.logPath = copilotChatLogPath(extensionLogPath);
@@ -60,6 +65,7 @@ export class CopilotAccountWatcher implements CopilotAccountSource {
     );
     this.disposables.push(
       this.changeEmitter,
+      this.chatEmitter,
       watcher,
       watcher.onDidCreate(() => this.scheduleRead()),
       watcher.onDidChange(() => this.scheduleRead()),
@@ -132,6 +138,19 @@ export class CopilotAccountWatcher implements CopilotAccountSource {
       if (login !== undefined && login !== this.login) {
         this.login = login;
         this.changeEmitter.fire();
+      }
+      let requestAccount: string | undefined;
+      for (const line of changed.text.split('\n')) {
+        requestAccount = lastLoginInLog(line) ?? requestAccount;
+        if (!requestAccount || !/ccreq:[^\s|]+ \| success \| [^|]+ \| \d+ms \| \[panel\//.test(line)) continue;
+        const at = new Date(line.slice(0, 23)).getTime();
+        // Replayed history, title generation, and other windows must not prompt.
+        if (at > this.lastChatAt && at <= Date.now()) {
+          this.lastChatAt = at;
+          if (requestAccount.toLowerCase() === this.login?.toLowerCase()) {
+            this.chatEmitter.fire(requestAccount);
+          }
+        }
       }
     } catch {
       // No log yet, or Copilot Chat is not running in this window. Nothing may

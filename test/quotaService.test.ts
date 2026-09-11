@@ -1,3 +1,6 @@
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { CopilotQuota, QuotaFetchResult } from '../src/core/quota';
@@ -106,6 +109,13 @@ function fireSessionChange(providerId: string) {
 }
 
 describe('CopilotQuotaService', () => {
+  const consentDirectories: string[] = [];
+  async function consentDirectory(): Promise<string> {
+    const directory = await mkdtemp(join(tmpdir(), 'copilot-quota-consent-'));
+    consentDirectories.push(directory);
+    return directory;
+  }
+
   beforeEach(() => {
     vi.useFakeTimers();
     fetchCopilotQuota.mockReset();
@@ -120,8 +130,114 @@ describe('CopilotQuotaService', () => {
     resolvesTo({ kind: 'quota', quota: quota() });
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.useRealTimers();
+    await Promise.all(consentDirectories.map((directory) => rm(directory, { recursive: true, force: true })));
+    consentDirectories.length = 0;
+  });
+
+  it('offers access for the chat account and immediately displays quota after approval', async () => {
+    copilot.login = 'octocat';
+    auth.getSession.mockImplementation(async (_provider, _scopes, options) =>
+      options.createIfNone ? session() : undefined);
+    const service = createService();
+    await service.refreshNow();
+    expect(service.getState().kind).toBe('needs-consent');
+    expect(auth.getSession.mock.calls.some((call) => call[2].createIfNone)).toBe(false);
+
+    await service.offerConsentAfterChat('octocat', await consentDirectory());
+    expect(lastGetSessionCall()).toEqual(['github', [], { createIfNone: true, account: account() }]);
+    expect(service.getState()).toEqual({ kind: 'quota', quota: quota(), account: 'octocat' });
+    expect(fetchCopilotQuota).toHaveBeenCalledTimes(1);
+    service.dispose();
+  });
+
+  it('remembers cancellation across chats and restarts while allowing a manual retry', async () => {
+    copilot.login = 'octocat';
+    auth.getSession.mockImplementation(async (_provider, _scopes, options) => {
+      if (options.createIfNone) throw new Error('User cancelled');
+      return undefined;
+    });
+    const storage = await consentDirectory();
+    const first = createService();
+    await first.refreshNow();
+    await first.offerConsentAfterChat('octocat', storage);
+    await first.offerConsentAfterChat('octocat', storage);
+    first.dispose();
+    const restarted = createService();
+    await restarted.refreshNow();
+    await restarted.offerConsentAfterChat('OCTOCAT', storage);
+    expect(auth.getSession.mock.calls.filter((call) => call[2].createIfNone)).toHaveLength(1);
+    expect(fetchCopilotQuota).not.toHaveBeenCalled();
+    await restarted.refreshNow({ interactive: true });
+    expect(auth.getSession.mock.calls.filter((call) => call[2].createIfNone)).toHaveLength(2);
+    restarted.dispose();
+  });
+
+  it('lets only one concurrent window offer access for an account', async () => {
+    copilot.login = 'octocat';
+    auth.getSession.mockResolvedValue(undefined);
+    const storage = await consentDirectory();
+    const first = createService();
+    const second = createService();
+    await Promise.all([first.refreshNow(), second.refreshNow()]);
+    await Promise.all([
+      first.offerConsentAfterChat('octocat', storage),
+      second.offerConsentAfterChat('octocat', storage),
+    ]);
+    expect(auth.getSession.mock.calls.filter((call) => call[2].createIfNone)).toHaveLength(1);
+    expect(await readdir(storage)).toHaveLength(1);
+    first.dispose();
+    second.dispose();
+  });
+
+  it('does not offer or save a marker when access already works', async () => {
+    copilot.login = 'octocat';
+    const storage = await consentDirectory();
+    const service = createService();
+    await service.refreshNow();
+    await service.offerConsentAfterChat('octocat', storage);
+    expect(auth.getSession).toHaveBeenCalledTimes(1);
+    expect(await readdir(storage)).toEqual([]);
+    service.dispose();
+  });
+
+  it('ignores stale chat accounts and accounts missing from the GitHub provider', async () => {
+    copilot.login = 'octocat';
+    auth.getSession.mockResolvedValue(undefined);
+    const storage = await consentDirectory();
+    const service = createService();
+    await service.refreshNow();
+    await service.offerConsentAfterChat('hubot', storage);
+    auth.getAccounts.mockResolvedValue([]);
+    await service.offerConsentAfterChat('octocat', storage);
+    expect(auth.getSession).toHaveBeenCalledTimes(1);
+    expect(await readdir(storage)).toEqual([]);
+    service.dispose();
+  });
+
+  it('offers when the first chat arrives with initial account discovery', async () => {
+    copilot.login = 'octocat';
+    auth.getSession.mockResolvedValue(undefined);
+    const service = createService();
+    copilotSwitchedTo('octocat');
+    await service.offerConsentAfterChat('octocat', await consentDirectory());
+    expect(auth.getSession.mock.calls.filter((call) => call[2].createIfNone)).toHaveLength(1);
+    service.dispose();
+  });
+
+  it('does not open an automatic dialog after the account changes or the service is disposed', async () => {
+    copilot.login = 'hubot';
+    auth.getSession.mockResolvedValue(undefined);
+    const service = createService();
+    await service.refreshNow({ interactive: true, expectedAccount: 'octocat' });
+    expect(auth.getSession).not.toHaveBeenCalled();
+    service.dispose();
+    copilot.login = 'octocat';
+    const storage = await consentDirectory();
+    await service.offerConsentAfterChat('octocat', storage);
+    expect(auth.getSession).not.toHaveBeenCalled();
+    expect(await readdir(storage)).toEqual([]);
   });
 
   it('reads the quota with a silent session and publishes it', async () => {

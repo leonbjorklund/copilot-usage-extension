@@ -530,6 +530,10 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }),
     copilotAccount,
+    copilotAccount.onDidCompleteChatRequest((login) => {
+      void quotaService.offerConsentAfterChat(login, join(context.globalStorageUri.fsPath, 'quota-consent'))
+        .catch(() => undefined); // Keep manual access available if the local offer cannot be saved.
+    }),
     vscode.commands.registerCommand("copilotUsage.refresh", () => runRefresh()),
     vscode.commands.registerCommand("copilotUsage.connectQuota", () =>
       quotaService.refreshNow({ interactive: true }),

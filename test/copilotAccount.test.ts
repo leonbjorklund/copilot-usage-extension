@@ -13,16 +13,16 @@ const watchers = vi.hoisted(
 
 vi.mock('vscode', () => ({
   EventEmitter: class {
-    private readonly listeners: Array<() => void> = [];
+    private readonly listeners: Array<(value?: unknown) => void> = [];
 
-    readonly event = (listener: () => void) => {
+    readonly event = (listener: (value?: unknown) => void) => {
       this.listeners.push(listener);
       return { dispose: () => undefined };
     };
 
-    fire(): void {
+    fire(value?: unknown): void {
       for (const listener of [...this.listeners]) {
-        listener();
+        listener(value);
       }
     }
 
@@ -106,6 +106,51 @@ describe('CopilotAccountWatcher', () => {
     }
     await vi.advanceTimersByTimeAsync(READ_DELAY_MS);
   }
+
+  it('emits only new completed panel requests, without replaying history or partial lines', async () => {
+    vi.setSystemTime(new Date(2026, 8, 4, 11, 36, 13));
+    const request = (time: string, context = 'panel/editAgent', status = 'success') =>
+      `2026-09-04 11:36:${time} [info] ccreq:abc | ${status} | model | 10ms | [${context}]\n`;
+    await writeFile(copilotLog, line('octocat') + request('12.900'));
+    const watcher = new CopilotAccountWatcher(extensionLog);
+    const completed = vi.fn();
+    watcher.onDidCompleteChatRequest(completed);
+    await watcher.currentLogin();
+    expect(completed).not.toHaveBeenCalled();
+
+    await appendFile(copilotLog, request('13.100', 'title') + request('13.200', 'progressMessages')
+      + request('13.300', 'panel/editAgent', 'error') + request('13.400').trimEnd());
+    await logWritten();
+    await watcher.currentLogin();
+    expect(completed).not.toHaveBeenCalled();
+
+    await appendFile(copilotLog, '\n');
+    await logWritten();
+    await watcher.currentLogin();
+    expect(completed.mock.calls).toEqual([['octocat']]);
+    await appendFile(copilotLog, 'unrelated log update\n');
+    await logWritten();
+    await watcher.currentLogin();
+    expect(completed).toHaveBeenCalledTimes(1);
+    watcher.dispose();
+  });
+
+  it('does not offer the previous account after a switch in the same log read', async () => {
+    vi.setSystemTime(new Date(2026, 8, 4, 11, 36, 13));
+    await writeFile(copilotLog, line('octocat'));
+    const watcher = new CopilotAccountWatcher(extensionLog);
+    const completed = vi.fn();
+    watcher.onDidCompleteChatRequest(completed);
+    await watcher.currentLogin();
+    await appendFile(copilotLog,
+      '2026-09-04 11:36:13.100 [info] ccreq:old | success | model | 10ms | [panel/editAgent]\n'
+      + line('hubot')
+      + '2026-09-04 11:36:13.200 [info] ccreq:new | success | model | 10ms | [panel/editAgent]\n');
+    await logWritten();
+    await watcher.currentLogin();
+    expect(completed.mock.calls).toEqual([['hubot']]);
+    watcher.dispose();
+  });
 
   it('reads the login at start and watches the Copilot Chat log folder', async () => {
     await writeFile(copilotLog, `${line('octocat')}${line('hubot')}`);

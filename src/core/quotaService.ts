@@ -1,3 +1,7 @@
+import { createHash } from 'node:crypto';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+
 import * as vscode from 'vscode';
 
 import type { CopilotAccountSource } from './copilotAccount';
@@ -104,6 +108,29 @@ export class CopilotQuotaService implements vscode.Disposable {
     return this.state;
   }
 
+  /** Offer access once per account after a new chat, including across windows/reloads. */
+  async offerConsentAfterChat(login: string, storage: string): Promise<void> {
+    await this.inFlight;
+    if (!(await this.isCurrentLogin(login))) return;
+    // Login discovery can arrive in the same read as the first chat completion.
+    if (this.state.kind === 'idle') await this.followCopilotAccount();
+    await this.inFlight;
+    if (this.state.kind !== 'needs-consent' || !(await this.isCurrentLogin(login))) return;
+    // A missing provider/account is not a permission request we can show yet.
+    if (!(await copilotAccountSignedInHere(login)) || !(await this.isCurrentLogin(login))) return;
+    await mkdir(storage, { recursive: true });
+    const marker = join(storage, createHash('sha256').update(login.toLowerCase()).digest('hex'));
+    try {
+      // Claim before opening the dialog so concurrent windows and cancellation
+      // cannot repeat it. Manual quota access remains available afterward.
+      await writeFile(marker, '', { flag: 'wx' });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') return;
+      throw error;
+    }
+    await this.refreshNow({ interactive: true, expectedAccount: login });
+  }
+
   /** Refresh once Copilot has stopped writing logs, at most once a minute. */
   scheduleRefresh(): void {
     if (this.disposed) {
@@ -127,10 +154,10 @@ export class CopilotQuotaService implements vscode.Disposable {
   }
 
   /**
-   * @param interactive The user clicked. Allows the consent dialog and the
-   * account picker and skips the floor; a background refresh must stay silent.
+   * @param interactive Explicit access or the first-chat offer. Allows the consent
+   * dialog and skips the floor; ordinary background refreshes stay silent.
    */
-  async refreshNow(options: { interactive?: boolean } = {}): Promise<void> {
+  async refreshNow(options: { interactive?: boolean; expectedAccount?: string } = {}): Promise<void> {
     if (this.disposed) {
       return;
     }
@@ -160,7 +187,7 @@ export class CopilotQuotaService implements vscode.Disposable {
     }
 
     this.inFlightInteractive = interactive;
-    this.inFlight = this.run(interactive)
+    this.inFlight = this.run(interactive, options.expectedAccount)
       // getSession throws while the GitHub provider is still registering at
       // startup, and when the user cancels the dialog. Nothing awaits a
       // background refresh, so this must not become an unhandled rejection.
@@ -172,20 +199,21 @@ export class CopilotQuotaService implements vscode.Disposable {
     return this.inFlight;
   }
 
-  private async run(interactive: boolean): Promise<void> {
+  private async run(interactive: boolean, expectedAccount?: string): Promise<void> {
     this.lastFetchAt = Date.now();
 
     // Follow the account Copilot Chat reports. Only an unknown login may use
     // this extension's allowed account. The provider matches scopes exactly, so an
     // empty list is the only request that matches Copilot's own session.
     const login = await this.copilotAccount.currentLogin();
+    if (expectedAccount !== undefined && login?.toLowerCase() !== expectedAccount.toLowerCase()) return;
     const account = await copilotAccountSignedInHere(login);
     if (!(await this.isCurrentLogin(login))) {
       return;
     }
     if (login !== undefined && !account) {
       this.setState({ kind: 'needs-consent', account: login });
-      if (interactive) {
+      if (interactive && expectedAccount === undefined) {
         void vscode.window.showInformationMessage(
           `Copilot reports the GitHub account ${login}, but VS Code has no matching signed-in account. Open the VS Code Accounts menu, sign in to GitHub as ${login}, then run Show AI Credit Quota again.`,
         );

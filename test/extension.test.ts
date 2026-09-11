@@ -150,6 +150,7 @@ vi.mock("../src/core/copilotAccount", () => ({
   CopilotAccountWatcher: vi.fn().mockImplementation(function () {
     return {
       onDidChange: vi.fn(() => ({ dispose: vi.fn() })),
+      onDidCompleteChatRequest: vi.fn(() => ({ dispose: vi.fn() })),
       currentLogin: vi.fn(async () => undefined),
       dispose: vi.fn(),
     };
@@ -1166,6 +1167,53 @@ describe("activate", () => {
     } finally {
       for (const disposable of context.subscriptions) disposable.dispose?.();
       vi.useRealTimers();
+      vi.mocked(vscode.authentication.getSession).mockReset().mockResolvedValue(undefined);
+      vi.mocked(vscode.authentication.getAccounts).mockReset().mockResolvedValue([]);
+    }
+  });
+
+  it("offers quota access after the first new chat without clicking the credits row", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 8, 21, 12));
+    const root = await mkdtemp(join(tmpdir(), "copilot-first-chat-consent-"));
+    roots.push(root);
+    const logFolder = join(root, "GitHub.copilot-chat");
+    const logPath = join(logFolder, "GitHub Copilot Chat.log");
+    await mkdir(logFolder);
+    await writeFile(logPath, "");
+    const realAccount = await vi.importActual<typeof import("../src/core/copilotAccount")>("../src/core/copilotAccount");
+    vi.mocked(CopilotAccountWatcher).mockImplementationOnce(function (path) {
+      return new realAccount.CopilotAccountWatcher(path);
+    });
+    const account = { id: "octocat", label: "octocat" };
+    vi.mocked(vscode.authentication.getAccounts).mockResolvedValue([account]);
+    vi.mocked(vscode.authentication.getSession).mockImplementation(async (_provider, _scopes, options) =>
+      options?.createIfNone ? { id: "test", accessToken: "test", scopes: [], account } : undefined);
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ quota_snapshots: { premium_models: {
+      entitlement: 1500, percent_remaining: 90,
+    } } })));
+    vi.stubGlobal("fetch", fetchMock);
+    const context = createContext();
+    Object.assign(context, {
+      logUri: vscode.Uri.file(join(root, "copilot-usage-extension")),
+      globalStorageUri: vscode.Uri.file(join(root, "storage")),
+    });
+    try {
+      await activateExtension(context);
+      await vi.waitFor(async () => expect((await registeredTreeProvider().getChildren())?.[0])
+        .toMatchObject({ kind: "quota", state: { kind: "needs-consent" } }));
+      expect(vscode.authentication.getSession).not.toHaveBeenCalledWith("github", [], expect.objectContaining({ createIfNone: true }));
+      expect(fetchMock).not.toHaveBeenCalled();
+
+      await appendFile(logPath, "2026-09-21 12:00:00.100 [info] Logged in as octocat\n"
+        + "2026-09-21 12:00:00.200 [info] ccreq:first | success | model | 10ms | [panel/editAgent]\n");
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.waitFor(async () => expect((await registeredTreeProvider().getChildren())?.[0])
+        .toMatchObject({ kind: "quota", state: { kind: "quota", account: "octocat" } }));
+      expect(vscode.authentication.getSession).toHaveBeenCalledWith("github", [], { createIfNone: true, account });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      for (const disposable of context.subscriptions) disposable.dispose?.();
       vi.mocked(vscode.authentication.getSession).mockReset().mockResolvedValue(undefined);
       vi.mocked(vscode.authentication.getAccounts).mockReset().mockResolvedValue([]);
     }
