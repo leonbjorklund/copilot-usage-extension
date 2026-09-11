@@ -317,7 +317,6 @@ describe('UsageTreeProvider', () => {
       quota: {
         entitlement: 1500,
         remaining: 537.4,
-        percentRemaining: 35.8,
         unlimited: false,
         overageCount: 0,
       },
@@ -346,7 +345,6 @@ describe('UsageTreeProvider', () => {
       quota: {
         entitlement: Number.POSITIVE_INFINITY,
         remaining: Number.POSITIVE_INFINITY,
-        percentRemaining: 100,
         unlimited: true,
         overageCount: 12,
         resetDate,

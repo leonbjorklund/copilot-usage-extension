@@ -1,5 +1,5 @@
 import { appendFile, mkdir, mkdtemp, open, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -143,6 +143,11 @@ import { CopilotAccountWatcher } from "../src/core/copilotAccount";
 vi.mock("node:fs/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs/promises")>();
   return { ...actual, stat: vi.fn(actual.stat) };
+});
+
+vi.mock("node:os", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:os")>();
+  return { ...actual, homedir: vi.fn(actual.homedir) };
 });
 
 vi.mock("../src/core/locator", () => ({ locateCopilotDataPaths }));
@@ -370,7 +375,14 @@ describe("formatStatusBarTooltip", () => {
     expect(formatStatusBarTooltip(summary).value).not.toContain("0$");
   });
 
-  it("formats status bar as no sessions today when today has no tokens", () => {
+  it('shows billed usage when a request has no uncached tokens', () => {
+    const summary = createEmptySummary();
+    summary.today = createTotal(0, 0.1);
+    expect(formatStatusBarSummary(summary)).toBe('0 | 0.1$');
+    expect(formatStatusBarTooltip(summary).value).toContain('<strong>Today:</strong> 0 (0.1$)');
+  });
+
+  it("formats status bar as no sessions today when today has no tokens or credits", () => {
     const summary: UsageSummary = {
       today: createTotal(0),
       week: createTotal(0),
@@ -456,7 +468,7 @@ describe("formatStatusBarTooltip", () => {
     const summary = createEmptySummary();
     summary.today = createTotal(2_100_000, 8.29);
     const quota = {
-      entitlement: 1500, remaining: 841, percentRemaining: 841 / 15,
+      entitlement: 1500, remaining: 841,
       unlimited: false, overageCount: 0, resetDate: new Date("2026-10-01"),
     };
     expect(formatStatusBarSummary(summary, quota, new Date("2026-09-21"))).toBe("2.1M | 8.3$ • 43/100%");
@@ -472,6 +484,7 @@ describe("activate", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(homedir).mockReturnValue(join(tmpdir(), "copilot-usage-extension-test-home-missing"));
     vi.useRealTimers();
     usageIndexInstances.length = 0;
     watcherRegistrations.length = 0;
@@ -1081,11 +1094,14 @@ describe("activate", () => {
     { mode: vscode.ExtensionMode.Development, switchedAccount: 'bob_company' },
     { mode: vscode.ExtensionMode.Production, switchedAccount: 'bob' },
     { mode: vscode.ExtensionMode.Production, switchedAccount: 'bob_company' },
-  ])("runs the real account pipeline in mode $mode and switches quota and usage to $switchedAccount", async ({ mode, switchedAccount }) => {
+    { mode: vscode.ExtensionMode.Production, switchedAccount: 'bob', otherEditorBase: '.config' },
+    { mode: vscode.ExtensionMode.Production, switchedAccount: 'bob', otherEditorBase: 'Library/Application Support' },
+  ])("runs the real account pipeline in mode $mode and switches quota and usage to $switchedAccount with $otherEditorBase", async ({ mode, switchedAccount, otherEditorBase }) => {
     vi.useFakeTimers();
     const start = new Date(2026, 8, 21, 12);
     vi.setSystemTime(start);
     const root = await mkdtemp(join(tmpdir(), "copilot-poc-integration-"));
+    vi.mocked(homedir).mockReturnValue(root);
     roots.push(root);
     vi.stubEnv("APPDATA", join(root, "roaming"));
     const host = join(root, "logs", "20260921T120000", "window1", "exthost");
@@ -1097,6 +1113,13 @@ describe("activate", () => {
       return `2026-09-21 12:00:${String(d.getSeconds()).padStart(2, '0')}.${String(d.getMilliseconds()).padStart(3, '0')} [info] ${text}\n`;
     };
     await writeFile(log, stamp(0, "Logged in as alice") + stamp(100, "Got Copilot token for alice"));
+    let aliceLog = log;
+    if (otherEditorBase) {
+      const otherFolder = join(root, otherEditorBase, 'Code - Insiders', 'logs', '20260921T120000', 'window1', 'exthost', 'GitHub.copilot-chat');
+      await mkdir(otherFolder, { recursive: true });
+      aliceLog = join(otherFolder, 'GitHub Copilot Chat.log');
+      await writeFile(aliceLog, stamp(0, "Logged in as alice") + stamp(100, "Got Copilot token for alice"));
+    }
     const dataRoot = join(root, "usage");
     await mkdir(dataRoot);
     async function writeRequest(chat: string, offset: number, credits: number, id: string) {
@@ -1134,7 +1157,7 @@ describe("activate", () => {
       const status = vi.mocked(vscode.window.createStatusBarItem).mock.results[0].value;
       await vi.waitFor(() => expect(status.text).toBe('No sessions today • 50/100%'));
       await writeRequest('alice-chat', 5_000, 2, 'alice-request');
-      await appendFile(log, stamp(6_000, 'request done: requestId: [alice-request] model deployment ID: []'));
+      await appendFile(aliceLog, stamp(6_000, 'request done: requestId: [alice-request] model deployment ID: []'));
       await vi.advanceTimersByTimeAsync(10_000);
       await vi.waitFor(() => expect(status.text).toBe('100 | 0.02$ • 50/100%'));
       expect(status.tooltip.value).toContain('alice-chat');

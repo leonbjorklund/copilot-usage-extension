@@ -1,6 +1,6 @@
 # Forward-only account attribution
 
-Research date: 2026-09-07. This note preserves the initial investigation and early POC follow-up. Claims about what was not implemented or agreed describe those snapshots. See [the current handoff](HANDOFF.md#account-tracking) for accepted behavior, installed wiring, verification, and limits. Usage before the saved tracking start is out of scope at the user's request.
+Research date: 2026-09-07. This note preserves the initial investigation and early POC follow-up. Claims about what was not implemented or agreed describe those snapshots. See [Account tracking](ACCOUNT-TRACKING.md) for accepted behavior, storage safeguards, and remaining native checks. This research concerns attribution after the saved tracking start; historical usage is displayed without account attribution.
 
 ## Finding
 
@@ -32,23 +32,17 @@ No application code, specifications, credentials, or user logs were changed. The
 
 In a newly observed window with a known account, no evidence gaps, no switches since the relevant transport was created, and an unambiguous request-to-window match, the source supports a defensible stable-account inference. It still is not an explicit account field attached by Copilot to the billed request. The distinction should remain clear in any later agreement about what the POC must prove.
 
-## Extension behavior at the initial research snapshot
-
-The current [account watcher](../../src/core/copilotAccount.ts#L22) reads the last `Logged in as` match and [stores only the current login](../../src/core/copilotAccount.ts#L117). It does not retain a timestamped authentication history or require the successful token marker. That supports the existing quota row's purpose, but it cannot establish historical request ownership by itself.
-
-The [normalizer](../../src/core/normalizer.ts#L324) emits the fields defined in [UsageRecord](../../src/core/types.ts#L32). It does not retain `spanId`, `responseId` as a separate correlation field, or `dur`; `responseId` is used only as a fallback chat identifier. The [aggregator](../../src/core/aggregator.ts#L49) adds eligible positive-credit records without an account filter. Account-specific totals would therefore need ownership determined per billed request before aggregation. No such change has been agreed or implemented.
-
 ## Local evidence supplied by the coordinating inspection
 
 The inspected corpus covered Stable Code storage roots and `.jsonl` files no larger than 50 MiB. It was not an exhaustive inspection of every editor, profile, or JSON container. Within that scope it contained 657 JSONL files and 12,724 positive-credit rows. No account field appeared in the inspected row or attribute keys. A nested JSON-string inspection found one historical June 5 row with `requestOptions.metadata.user_id` containing `device_id`, `account_uuid`, and `session_id`; its `account_uuid` was empty, so it supplied no ownership evidence. Other inspected billed options lacked login or account identity. Of 1,867 distinct `responseId` values, 1,311 appeared more than once, consistent with the source's non-unique ID construction.
 
 In the latest live snapshot, all 67 billed rows for today matched a request completion in exactly one retained window log when matching both `responseId` and completion time within two seconds. Each matched window had a successful account marker before the billed span and no different-account marker during it. All these billed spans belonged to the same anonymized account timeline. This demonstrates feasible correlation in the observed stable-account case, not switch safety, billing proof, or validation of the two-second tolerance. Logs were still growing during inspection.
 
-No controlled tests covered billed requests across account switches, active-request switches, resumed WebSockets after switching, multiple windows using different accounts concurrently, or missing authentication-log segments. Those remain unverified, and no automatic exclusion policy has been agreed.
+At this research snapshot, no controlled tests covered billed requests across account switches, active-request switches, resumed WebSockets after switching, multiple windows using different accounts concurrently, or missing authentication-log segments. The accepted exclusion policy and remaining native checks now live in [Account tracking](ACCOUNT-TRACKING.md).
 
 ## POC follow-up, September 7
 
-The findings above describe the initial research snapshot, before the user authorized implementation. The development preview now records new usage in a separate local ledger. It excludes requests around switches and chats that predate a switch. Historical usage files remain untouched.
+The findings above describe the initial research snapshot, before the user authorized implementation. The September 7 development preview introduced the local ledger and exclusions for requests around switches and chats that predate a switch. The ledger now runs in both development and installed windows; [Account tracking](ACCOUNT-TRACKING.md) describes current behavior. Historical usage files remain untouched.
 
 The first manual test exposed two implementation bugs. Windows paths with `C:` and `c:` produced duplicate window evidence and billed entries. The MAI transport emitted a successful `ccreq` summary without the `request done` marker used by the initial sample. Neither was a missing authentication log.
 

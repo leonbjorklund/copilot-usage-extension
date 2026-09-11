@@ -16,8 +16,6 @@ export interface CopilotQuota {
   entitlement: number;
   /** Reported credits still available, with a percentage fallback. Infinity when unlimited. */
   remaining: number;
-  /** 0-100. */
-  percentRemaining: number;
   unlimited: boolean;
   overageCount: number;
   resetDate?: Date;
@@ -96,7 +94,6 @@ export function parseCopilotQuota(payload: unknown): CopilotQuota | undefined {
     return {
       entitlement: Number.POSITIVE_INFINITY,
       remaining: Number.POSITIVE_INFINITY,
-      percentRemaining: 100,
       unlimited: true,
       overageCount,
       resetDate,
@@ -115,7 +112,6 @@ export function parseCopilotQuota(payload: unknown): CopilotQuota | undefined {
     remaining: reportedRemaining !== undefined && reportedRemaining >= 0
       ? reportedRemaining
       : (entitlement * percentRemaining) / 100,
-    percentRemaining,
     unlimited: false,
     overageCount,
     resetDate,
@@ -130,13 +126,13 @@ function isRateLimited(response: Response): boolean {
 }
 
 function readRetryAfterMs(response: Response): number | undefined {
-  const header = response.headers.get('retry-after');
-  if (header === null) {
-    return undefined;
-  }
-
-  const seconds = Number(header);
-  return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : undefined;
+  const seconds = readFiniteNumber(response.headers.get('retry-after'));
+  const retryAfter = seconds !== undefined && seconds >= 0 ? seconds * 1000 : undefined;
+  const reset = response.headers.get('x-ratelimit-remaining') === '0'
+    ? readFiniteNumber(response.headers.get('x-ratelimit-reset')) : undefined;
+  return reset !== undefined
+    ? Math.max(retryAfter ?? 0, reset * 1000 - Date.now(), 0)
+    : retryAfter;
 }
 
 export async function fetchCopilotQuota(options: FetchQuotaOptions): Promise<QuotaFetchResult> {

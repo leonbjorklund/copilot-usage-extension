@@ -1,12 +1,13 @@
 import { createHash } from 'node:crypto';
-import { appendFile, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, open, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('node:fs/promises', async (importOriginal) => {
   const fs = await importOriginal<typeof import('node:fs/promises')>();
-  return { ...fs, appendFile: vi.fn(fs.appendFile), writeFile: vi.fn(fs.writeFile), readFile: vi.fn(fs.readFile) };
+  return { ...fs, appendFile: vi.fn(fs.appendFile), writeFile: vi.fn(fs.writeFile), readFile: vi.fn(fs.readFile),
+    open: vi.fn(fs.open), readdir: vi.fn(fs.readdir) };
 });
 
 import { aggregateUsage } from '../src/core/aggregator';
@@ -45,6 +46,8 @@ afterEach(async () => {
   vi.mocked(appendFile).mockImplementation(fs.appendFile);
   vi.mocked(writeFile).mockImplementation(fs.writeFile);
   vi.mocked(readFile).mockImplementation(fs.readFile);
+  vi.mocked(open).mockImplementation(fs.open);
+  vi.mocked(readdir).mockImplementation(fs.readdir);
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -470,9 +473,19 @@ describe('local POC ledger', () => {
     const summary = aggregateUsage([a]);
     await f.poc.refresh(summary, new Date(base + 30_000));
     await f.poc.refresh(summary, new Date(base + 30_000));
-    vi.mocked(readFile).mockClear();
+    const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    const reads = vi.fn();
+    vi.mocked(open).mockImplementation(async (...args) => {
+      const handle = await fs.open(...args);
+      const read = handle.read.bind(handle);
+      vi.spyOn(handle, 'read').mockImplementation((...readArgs: Parameters<typeof handle.read>) => {
+        reads(args[0]);
+        return read(...readArgs);
+      });
+      return handle;
+    });
     expect((await f.poc.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(100);
-    expect(vi.mocked(readFile).mock.calls.filter(([file]) => String(file).endsWith('.jsonl'))).toHaveLength(0);
+    expect(reads).not.toHaveBeenCalled();
   });
 
   it.each([false, true])('recovers a delayed session start across restart, failed append: %s', async (failAppend) => {
@@ -507,13 +520,19 @@ describe('local POC ledger', () => {
     const summary = aggregateUsage([a]);
     const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
     let interrupted = false;
-    vi.mocked(readFile).mockImplementation(async (file, options) => {
+    vi.mocked(open).mockImplementation(async (file, flags, mode) => {
+      const handle = await fs.open(file, flags, mode);
       if (!interrupted && String(file).toLowerCase() === f.log.toLowerCase()) {
         interrupted = true;
         // A writer can replace/truncate a file between its stat and read.
-        return Buffer.from(auth('Alice'));
+        let firstRead = true;
+        vi.spyOn(handle, 'read').mockImplementation(async (buffer) => {
+          const bytesRead = firstRead ? Buffer.from(auth('Alice')).copy(buffer as Buffer) : 0;
+          firstRead = false;
+          return { bytesRead, buffer };
+        });
       }
-      return fs.readFile(file, options);
+      return handle;
     });
     expect((await f.poc.refresh(summary, new Date(base + 30_000))).pending).toBe(1);
     const caughtUp = await f.poc.refresh(summary, new Date(base + 30_000));
@@ -545,6 +564,63 @@ describe('local POC ledger', () => {
     const view = await firstRefresh;
     expect(other).toHaveProperty('view');
     if ('view' in other) expect(other.view.startedAt).toEqual(view.startedAt);
+  });
+
+  it('bounds a log read when the file grows beyond its limit after stat', async () => {
+    const f = await fixture();
+    const a = record(f.usage);
+    await appendFile(f.log, done(a));
+    const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    let checkedSize = 0;
+    let allocatedSize = 0;
+    vi.mocked(open).mockImplementation(async (...args) => {
+      const handle = await fs.open(...args);
+      if (String(args[0]).toLowerCase() === f.log.toLowerCase()) {
+        const stat = handle.stat.bind(handle);
+        vi.spyOn(handle, 'stat').mockImplementation(async () => {
+          const info = await stat();
+          checkedSize = info.size;
+          await fs.truncate(f.log, 32 * 1024 * 1024 + 1);
+          return info;
+        });
+        const read = handle.read.bind(handle);
+        vi.spyOn(handle, 'read').mockImplementation((...readArgs: Parameters<typeof handle.read>) => {
+          allocatedSize = (readArgs[0] as Buffer).length;
+          return read(...readArgs);
+        });
+      }
+      return handle;
+    });
+    const summary = aggregateUsage([a]);
+    expect((await f.poc.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(100);
+    expect(checkedSize).toBeGreaterThan(0);
+    expect(allocatedSize).toBe(checkedSize);
+    expect(allocatedSize).toBeLessThan(1024);
+    vi.mocked(open).mockImplementation(fs.open);
+    expect((await f.poc.refresh(summary, new Date(base + 30_000))).problem).toContain('Cannot read Copilot log');
+  });
+
+  it('stops discovering windows as soon as the folder limit is reached', async () => {
+    const f = await fixture();
+    const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    const session = join(f.logRoot, '20260907T110000');
+    const [window] = await fs.readdir(session, { withFileTypes: true });
+    const hosts = await fs.readdir(join(session, window.name), { withFileTypes: true });
+    const visited: string[] = [];
+    vi.mocked(readdir).mockImplementation(async (path, options) => {
+      const name = String(path);
+      if (name.toLowerCase() === session.toLowerCase()) {
+        return Array.from({ length: 514 }, (_, index) =>
+          Object.create(window, { name: { value: `window${index + 1}` } }));
+      }
+      if (name.toLowerCase().startsWith(join(session, 'window').toLowerCase())) {
+        visited.push(name);
+        return hosts;
+      }
+      return fs.readdir(path, options);
+    });
+    await expect(f.poc.refresh(aggregateUsage([]))).rejects.toThrow('too many window log folders');
+    expect(visited).toHaveLength(513);
   });
 
   it('preserves complete interrupted-write entries already visible to another observer', async () => {

@@ -5,7 +5,7 @@
 - VS Code extension in TypeScript. Entry point: `src/extension.ts`; esbuild bundles to `dist/extension.js` (the manifest `main`). Nothing builds from `tsconfig.json`: `check-types` passes `--noEmit`, and esbuild produces every shipped file.
 - Purpose: attribute positive-AI-Credit requests from local VS Code/Copilot logs to accounts, persist tracked usage locally, and show the current account's totals in the status bar, hover tooltip, and "Copilot Sessions" tree (view `copilotUsage.views.usage`). The tree leads with an AI Credit quota row read from GitHub, the one row not derived from local usage.
 - Privacy constraint: keep work local. Do not add telemetry, and add no network access beyond the AI Credit quota request to `copilot_internal/user` under the rules below. The quota watcher reads the login from this window's Copilot Chat log; account attribution also reads authentication and request markers across retained window logs. Nothing about the user's logs or usage leaves the machine.
-- Before changing account attribution, persistence, or preview behavior, read [the current handoff](docs/account-tracking/HANDOFF.md). It records accepted behavior, storage limits, and remaining live verification.
+- Before changing account attribution, persistence, or preview behavior, read [Account tracking](docs/account-tracking/ACCOUNT-TRACKING.md) for accepted behavior, storage safeguards, and remaining native checks.
 
 ## Commands
 

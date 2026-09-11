@@ -2,12 +2,6 @@ import { getSpentCredits, type CopilotQuota } from '../core/quota';
 
 /** Only show a percentage when the snapshot belongs to this calendar billing month. */
 export function formatPeriodPercentage(quota: CopilotQuota | undefined, now = new Date()): string | undefined {
-  const percentage = getPeriodSpentPercentage(quota, now);
-  return percentage === undefined ? undefined : `${percentage}/100%`;
-}
-
-/** Account spending rounded down for a valid current UTC billing month. */
-export function getPeriodSpentPercentage(quota: CopilotQuota | undefined, now = new Date()): number | undefined {
   if (!quota || quota.unlimited || !Number.isFinite(quota.entitlement) || quota.entitlement <= 0) {
     return undefined;
   }
@@ -18,7 +12,7 @@ export function getPeriodSpentPercentage(quota: CopilotQuota | undefined, now = 
   }
 
   const spent = getSpentCredits(quota);
-  return Math.floor(spent / quota.entitlement * 100);
+  return `${Math.floor(spent / quota.entitlement * 100)}/100%`;
 }
 
 export function formatTokens(tokens: number): string {

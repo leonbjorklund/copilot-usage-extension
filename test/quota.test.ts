@@ -45,7 +45,7 @@ describe('parseCopilotQuota', () => {
   it('reads premium_interactions from the Pro payload', () => {
     const quota = parseCopilotQuota(proPayload());
 
-    expect(quota).toMatchObject({ entitlement: 1500, percentRemaining: 87.8, unlimited: false });
+    expect(quota).toMatchObject({ entitlement: 1500, unlimited: false });
     expect(quota?.remaining).toBeCloseTo(1317, 6);
     expect(quota?.resetDate?.toISOString().slice(0, 10)).toBe('2026-10-01');
   });
@@ -75,11 +75,9 @@ describe('parseCopilotQuota', () => {
 
   it('keeps the percentage between 0 and 100', () => {
     expect(parseCopilotQuota(proPayload({ percent_remaining: 999 }))).toMatchObject({
-      percentRemaining: 100,
       remaining: 1500,
     });
     expect(parseCopilotQuota(proPayload({ percent_remaining: -5 }))).toMatchObject({
-      percentRemaining: 0,
       remaining: 0,
     });
   });
@@ -191,6 +189,23 @@ describe('fetchCopilotQuota', () => {
 
     // A 403 with no rate-limit headers is still a rejected token.
     expect(await fetchWith(403)).toEqual({ kind: 'unauthorized' });
+  });
+
+  it('waits for the primary rate-limit reset, including when retry-after is shorter', async () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      for (const retryAfter of [{}, { 'retry-after': '60' }]) {
+        const reset = Math.ceil(now / 1000) + 1800;
+        expect(await fetchWith(403, {}, {
+          'x-ratelimit-remaining': '0',
+          'x-ratelimit-reset': String(reset),
+          ...retryAfter,
+        })).toEqual({ kind: 'rate-limited', retryAfterMs: reset * 1000 - now });
+      }
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it('treats a signed-in account with no snapshots as having no quota', async () => {

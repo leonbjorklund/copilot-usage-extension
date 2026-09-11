@@ -5,7 +5,7 @@ import { formatPeriodPercentage, formatTokens, formatUsd } from '../src/ui/forma
 describe('formatPeriodPercentage', () => {
   const now = new Date('2026-09-21T12:00:00Z');
   const quota = {
-    entitlement: 1500, remaining: 841, percentRemaining: 841 / 15,
+    entitlement: 1500, remaining: 841,
     unlimited: false, overageCount: 0, resetDate: new Date('2026-10-01'),
   };
 

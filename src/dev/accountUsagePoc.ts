@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFile, link, mkdir, open, readdir, readFile, stat, truncate, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, link, mkdir, open, readdir, readFile, truncate, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 
 import { aggregateUsage } from '../core/aggregator';
@@ -386,22 +386,33 @@ export class AccountUsagePoc {
   }
 
   private async readChanged(file: string): Promise<string | undefined> {
-    const info = await stat(file);
-    const previous = this.offsets.get(file);
-    if (previous?.size === info.size && previous.modified === info.mtimeMs) return undefined;
-    if (info.size > MAX_FILE_BYTES) throw new Error(`Account POC file exceeds its read limit: ${file}`);
-    const buffer = await readFile(file);
-    // Re-read changed files completely, including rotated/replaced files. Files
-    // are bounded; event keys deduplicate replay and tolerate delayed writes.
-    const complete = buffer.lastIndexOf(10) + 1;
-    if (complete === buffer.length && buffer.length === info.size) {
-      this.offsets.set(file, { size: info.size, modified: info.mtimeMs });
-    } else {
-      // A complete last line does not prove the read reached the stat's size.
-      // Retry snapshots taken while the writer was replacing or growing logs.
-      this.offsets.delete(file);
+    const handle = await open(file, 'r');
+    try {
+      const info = await handle.stat();
+      const previous = this.offsets.get(file);
+      if (previous?.size === info.size && previous.modified === info.mtimeMs) return undefined;
+      if (info.size > MAX_FILE_BYTES) throw new Error(`Account POC file exceeds its read limit: ${file}`);
+      const buffer = Buffer.alloc(info.size);
+      let read = 0;
+      while (read < buffer.length) {
+        const { bytesRead } = await handle.read(buffer, read, buffer.length - read, read);
+        if (bytesRead === 0) break;
+        read += bytesRead;
+      }
+      // Read only the checked descriptor size, even if its contents grow.
+      // Event keys deduplicate replay and tolerate delayed writes.
+      const complete = buffer.subarray(0, read).lastIndexOf(10) + 1;
+      if (complete === info.size) {
+        this.offsets.set(file, { size: info.size, modified: info.mtimeMs });
+      } else {
+        // A complete last line does not prove the read reached the stat's size.
+        // Retry snapshots taken while the writer was replacing or growing logs.
+        this.offsets.delete(file);
+      }
+      return buffer.toString('utf8', 0, complete);
+    } finally {
+      await handle.close();
     }
-    return buffer.toString('utf8', 0, complete);
   }
 
   private async discoverLogs(problems: string[]): Promise<string[]> {
@@ -422,12 +433,15 @@ export class AccountUsagePoc {
             const hosts = await readdir(windowRoot, { withFileTypes: true });
             for (const host of hosts.filter((entry) => entry.isDirectory() && /^exthost\d*$/.test(entry.name))) {
               folders.add(pathIdentity(join(windowRoot, host.name, 'GitHub.copilot-chat')));
+              if (folders.size > 512) throw new Error('Account POC found too many window log folders.');
             }
           }
-        } catch { problems.push(`Cannot list window logs: ${sessionRoot}`); }
+        } catch (error) {
+          if (folders.size > 512) throw error;
+          problems.push(`Cannot list window logs: ${sessionRoot}`);
+        }
       }
     }
-    if (folders.size > 512) throw new Error('Account POC found too many window log folders.');
     const files: string[] = [];
     for (const folder of folders) {
       try {

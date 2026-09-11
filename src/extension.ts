@@ -150,7 +150,7 @@ function escapeHtml(value: string): string {
 export function formatStatusBarSummary(summary: UsageSummary, quota?: CopilotQuota, now = new Date()): string {
   const cost = summary.today.githubCopilot.available && summary.today.githubCopilot.aiCredits > 0
     ? formatUsd(summary.today.githubCopilot.usd) : undefined;
-  const today = summary.today.tokens === 0 ? "No sessions today" : cost
+  const today = summary.today.tokens === 0 && summary.today.githubCopilot.aiCredits === 0 ? "No sessions today" : cost
     ? [formatTokens(summary.today.tokens), cost].join(STATUS_BAR_DISPLAY.separator)
     : formatTokens(summary.today.tokens);
   const period = formatPeriodPercentage(quota, now);
@@ -189,7 +189,11 @@ export function activate(context: vscode.ExtensionContext): void {
     join(context.globalStorageUri.fsPath, 'account-poc'),
     join(dirname(context.logUri.fsPath), 'GitHub.copilot-chat'),
     [dirname(dirname(dirname(dirname(context.logUri.fsPath)))),
-      ...['Code', 'Code - Insiders'].map((editor) => join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), editor, 'logs'))],
+      ...['Code', 'Code - Insiders'].flatMap((editor) => [
+        join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), editor, 'logs'),
+        join(homedir(), '.config', editor, 'logs'),
+        join(homedir(), 'Library', 'Application Support', editor, 'logs'),
+      ])],
   ) : undefined;
   let pocView: AccountPocView | undefined;
   let accountTrackingError: string | undefined;

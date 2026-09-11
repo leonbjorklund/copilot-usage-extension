@@ -78,7 +78,6 @@ function quota(overrides: Partial<CopilotQuota> = {}): CopilotQuota {
   return {
     entitlement: 1500,
     remaining: 1317,
-    percentRemaining: 87.8,
     unlimited: false,
     overageCount: 0,
     ...overrides,
@@ -668,13 +667,13 @@ describe('CopilotQuotaService', () => {
     const changes = vi.fn();
     service.onDidChange(changes);
 
-    resolvesTo({ kind: 'quota', quota: quota({ remaining: 0, percentRemaining: 0 }) });
+    resolvesTo({ kind: 'quota', quota: quota({ remaining: 0 }) });
     await service.refreshNow();
     expect(changes).toHaveBeenCalledTimes(1);
 
     resolvesTo({
       kind: 'quota',
-      quota: quota({ remaining: 0, percentRemaining: 0, overageCount: 12 }),
+      quota: quota({ remaining: 0, overageCount: 12 }),
     });
     await service.refreshNow({ interactive: true });
     expect(changes).toHaveBeenCalledTimes(2);

@@ -265,6 +265,7 @@ function isBetterTitleCandidate(candidate: TitleCandidate, existing: TitleCandid
 }
 
 function resolveTitle(record: UsageRecord, candidate: TitleCandidate | undefined): string {
+  if (candidate?.priority === TITLE_PRIORITY.childRun) return record.chatId;
   const title = candidate?.title ?? record.title;
   return isGenericTitle(title) ? record.chatId || title : title;
 }
