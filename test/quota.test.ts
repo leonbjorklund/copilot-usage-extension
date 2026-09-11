@@ -27,6 +27,21 @@ function proPayload(overrides: Record<string, unknown> = {}) {
 }
 
 describe('parseCopilotQuota', () => {
+  it('prefers the reported remaining credits over the percentage estimate', () => {
+    for (const quota_remaining of [1205.2, '1205.2']) {
+      const quota = parseCopilotQuota(proPayload({ quota_remaining, percent_remaining: 80.3 }));
+      expect(quota?.remaining).toBe(1205.2);
+      expect(formatQuotaLabel(quota!)).toBe('294.8 / 1,500 | 19%');
+    }
+    expect(parseCopilotQuota(proPayload({ quota_remaining: 0 }))?.remaining).toBe(0);
+  });
+
+  it('falls back to the percentage when remaining credits are missing or invalid', () => {
+    for (const quota_remaining of [undefined, null, '', 'invalid', -1, Infinity]) {
+      expect(parseCopilotQuota(proPayload({ quota_remaining }))?.remaining).toBeCloseTo(1317, 6);
+    }
+  });
+
   it('reads premium_interactions from the Pro payload', () => {
     const quota = parseCopilotQuota(proPayload());
 

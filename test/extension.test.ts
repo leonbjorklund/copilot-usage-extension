@@ -264,7 +264,7 @@ describe("formatStatusBarTooltip", () => {
       "<strong>Today:</strong> 1.2M (8.4$) &nbsp;|&nbsp; <strong>Month:</strong> 8.9M (21.6$) &nbsp;|&nbsp; <strong>All time:</strong> 22M (42.2$)",
     );
     expect(tooltip.value).toContain("---");
-    expect(tooltip.value).toContain('<tr><td colspan="2"><strong>Model use:</strong></td></tr>');
+    expect(tooltip.value).toContain('<tr><td colspan="2"><strong>Model use</strong></td></tr>');
     expect(tooltip.value).not.toContain('<strong>Model usage:</strong>');
     expect(tooltip.value).not.toContain('<strong>Top models:</strong>');
     expect(tooltip.value).toContain(
@@ -272,7 +272,7 @@ describe("formatStatusBarTooltip", () => {
     );
     expect(tooltip.value).not.toContain("<em>Claude opus 4.6</em>");
     expect(tooltip.value).toContain(
-      '<tr><td colspan="2"><strong>Top sessions today:</strong></td></tr>',
+      '<tr><td colspan="2"><strong>Top sessions today</strong></td></tr>',
     );
     expect(tooltip.value).toContain(
       '<td>Feature work <span style="color:var(--vscode-descriptionForeground);">Claude opus 4.6</span></td><td align="right">420k (2.1$)</td>',
@@ -310,7 +310,7 @@ describe("formatStatusBarTooltip", () => {
     expect(formatStatusBarTooltip(summary).value).toContain(
       [
         '<table width="430">',
-        '<tr><td colspan="2"><strong>Model use:</strong></td></tr>',
+        '<tr><td colspan="2"><strong>Model use</strong></td></tr>',
         '<tr><td colspan="2">No sessions yet.</td></tr>',
         "</table>",
       ].join("\n"),
@@ -406,7 +406,7 @@ describe("formatStatusBarTooltip", () => {
     };
 
     expect(formatStatusBarTooltip(summary).value).toContain(
-      '<strong>Top sessions today:</strong></td></tr>\n<tr><td colspan="2">No sessions today.</td></tr>',
+      '<strong>Top sessions today</strong></td></tr>\n<tr><td colspan="2">No sessions today.</td></tr>',
     );
   });
 
@@ -459,10 +459,10 @@ describe("formatStatusBarTooltip", () => {
       entitlement: 1500, remaining: 841, percentRemaining: 841 / 15,
       unlimited: false, overageCount: 0, resetDate: new Date("2026-10-01"),
     };
-    expect(formatStatusBarSummary(summary, quota, new Date("2026-09-21"))).toBe("2.1M | 8.3$ • 44/100%");
+    expect(formatStatusBarSummary(summary, quota, new Date("2026-09-21"))).toBe("2.1M | 8.3$ • 43/100%");
     expect(formatStatusBarSummary(summary)).toBe("2.1M | 8.3$");
     summary.today = createTotal(0);
-    expect(formatStatusBarSummary(summary, quota, new Date("2026-09-21"))).toBe("No sessions today • 44/100%");
+    expect(formatStatusBarSummary(summary, quota, new Date("2026-09-21"))).toBe("No sessions today • 43/100%");
   });
 
 });
@@ -986,7 +986,7 @@ describe("activate", () => {
       respond(new Response(JSON.stringify({ quota_snapshots: { premium_models: {
         entitlement: 1500, percent_remaining: 841 / 15, reset_date: "2026-10-01",
       } } })));
-      await vi.waitFor(() => expect(statusBar.text).toBe("2.1M | 0.9$ • 44/100%"));
+      await vi.waitFor(() => expect(statusBar.text).toBe("2.1M | 0.9$ • 43/100%"));
       expect(statusBar.command).toBe("copilotUsage.openView");
       await commandCallback("copilotUsage.connectQuota")();
       expect(statusBar.text).toBe("2.1M | 0.9$");

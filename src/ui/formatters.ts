@@ -6,7 +6,7 @@ export function formatPeriodPercentage(quota: CopilotQuota | undefined, now = ne
   return percentage === undefined ? undefined : `${percentage}/100%`;
 }
 
-/** Rounded account spending for a valid current UTC billing month. */
+/** Account spending rounded down for a valid current UTC billing month. */
 export function getPeriodSpentPercentage(quota: CopilotQuota | undefined, now = new Date()): number | undefined {
   if (!quota || quota.unlimited || !Number.isFinite(quota.entitlement) || quota.entitlement <= 0) {
     return undefined;
@@ -18,7 +18,7 @@ export function getPeriodSpentPercentage(quota: CopilotQuota | undefined, now = 
   }
 
   const spent = getSpentCredits(quota);
-  return Math.round(spent / quota.entitlement * 100);
+  return Math.floor(spent / quota.entitlement * 100);
 }
 
 export function formatTokens(tokens: number): string {

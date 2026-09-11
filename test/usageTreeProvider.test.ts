@@ -327,7 +327,7 @@ describe('UsageTreeProvider', () => {
 
     expect(rootChildren).toHaveLength(3);
     const item = provider.getTreeItem(rootChildren[0]);
-    expect(item.label).toBe('963 / 1,500 | 64%');
+    expect(item.label).toBe('962.6 / 1,500 | 64%');
     expect(item.description).toBe('AI Credits · octocat');
     expect(item.collapsibleState).toBe(vscode.TreeItemCollapsibleState.None);
     expect(item.tooltip).toBeUndefined();

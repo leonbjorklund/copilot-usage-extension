@@ -117,7 +117,7 @@ function formatTopModelTableRow(
 
 function formatTopModelsTooltipRows(rows: string[]): string[] {
   return formatTooltipTable([
-    '<tr><td colspan="2"><strong>Model use:</strong></td></tr>',
+    '<tr><td colspan="2"><strong>Model use</strong></td></tr>',
     ...(rows.length > 0 ? rows : ['<tr><td colspan="2">No sessions yet.</td></tr>']),
   ]);
 }
@@ -131,7 +131,7 @@ function formatHighestTodayTooltipRows(summary: UsageSummary): string[] {
     .filter((chat): chat is NonNullable<typeof chat> => chat !== undefined)
     .filter((chat, index, chats) => chats.findIndex((other) => other.chatId === chat.chatId) === index);
   return formatTooltipTable([
-    '<tr><td colspan="2"><strong>Top sessions today:</strong></td></tr>',
+    '<tr><td colspan="2"><strong>Top sessions today</strong></td></tr>',
     ...(highlights.length > 0 ? highlights.map(formatTodayHighlightTableRow)
       : ['<tr><td colspan="2">No sessions today.</td></tr>']),
   ]);

@@ -14,7 +14,7 @@ const REQUEST_TIMEOUT_MS = 10_000;
 export interface CopilotQuota {
   /** Credits included in the plan for the current period. Infinity when unlimited. */
   entitlement: number;
-  /** Credits still available, derived from the reported percentage. Infinity when unlimited. */
+  /** Reported credits still available, with a percentage fallback. Infinity when unlimited. */
   remaining: number;
   /** 0-100. */
   percentRemaining: number;
@@ -109,9 +109,12 @@ export function parseCopilotQuota(payload: unknown): CopilotQuota | undefined {
   }
 
   const percentRemaining = Math.min(100, Math.max(0, reportedPercent));
+  const reportedRemaining = readFiniteNumber(snapshot.quota_remaining);
   return {
     entitlement,
-    remaining: (entitlement * percentRemaining) / 100,
+    remaining: reportedRemaining !== undefined && reportedRemaining >= 0
+      ? reportedRemaining
+      : (entitlement * percentRemaining) / 100,
     percentRemaining,
     unlimited: false,
     overageCount,
@@ -191,7 +194,7 @@ export function formatQuotaLabel(quota: CopilotQuota): string {
 
   const spent = getSpentCredits(quota);
   const entitlement = formatCredits(quota.entitlement);
-  const percentage = quota.entitlement > 0 ? ` | ${Math.round(spent / quota.entitlement * 100)}%` : '';
+  const percentage = quota.entitlement > 0 ? ` | ${Math.floor(spent / quota.entitlement * 100)}%` : '';
   return `${formatCredits(spent)} / ${entitlement}${percentage}`;
 }
 
@@ -200,6 +203,5 @@ export function getSpentCredits(quota: CopilotQuota): number {
 }
 
 export function formatCredits(value: number): string {
-  // Credits are fractional per request but only whole numbers are meaningful here.
-  return Math.round(value).toLocaleString('en-US');
+  return value.toLocaleString('en-US', { maximumFractionDigits: 1 });
 }
