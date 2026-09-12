@@ -14,10 +14,8 @@ const REQUEST_TIMEOUT_MS = 10_000;
 export interface CopilotQuota {
   /** Credits included in the plan for the current period. Infinity when unlimited. */
   entitlement: number;
-  /** Credits still available, derived from the reported percentage. Infinity when unlimited. */
+  /** Reported credits still available, with a percentage fallback. Infinity when unlimited. */
   remaining: number;
-  /** 0-100. */
-  percentRemaining: number;
   unlimited: boolean;
   overageCount: number;
   resetDate?: Date;
@@ -96,7 +94,6 @@ export function parseCopilotQuota(payload: unknown): CopilotQuota | undefined {
     return {
       entitlement: Number.POSITIVE_INFINITY,
       remaining: Number.POSITIVE_INFINITY,
-      percentRemaining: 100,
       unlimited: true,
       overageCount,
       resetDate,
@@ -109,10 +106,12 @@ export function parseCopilotQuota(payload: unknown): CopilotQuota | undefined {
   }
 
   const percentRemaining = Math.min(100, Math.max(0, reportedPercent));
+  const reportedRemaining = readFiniteNumber(snapshot.quota_remaining);
   return {
     entitlement,
-    remaining: (entitlement * percentRemaining) / 100,
-    percentRemaining,
+    remaining: reportedRemaining !== undefined && reportedRemaining >= 0
+      ? reportedRemaining
+      : (entitlement * percentRemaining) / 100,
     unlimited: false,
     overageCount,
     resetDate,
@@ -127,13 +126,13 @@ function isRateLimited(response: Response): boolean {
 }
 
 function readRetryAfterMs(response: Response): number | undefined {
-  const header = response.headers.get('retry-after');
-  if (header === null) {
-    return undefined;
-  }
-
-  const seconds = Number(header);
-  return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : undefined;
+  const seconds = readFiniteNumber(response.headers.get('retry-after'));
+  const retryAfter = seconds !== undefined && seconds >= 0 ? seconds * 1000 : undefined;
+  const reset = response.headers.get('x-ratelimit-remaining') === '0'
+    ? readFiniteNumber(response.headers.get('x-ratelimit-reset')) : undefined;
+  return reset !== undefined
+    ? Math.max(retryAfter ?? 0, reset * 1000 - Date.now(), 0)
+    : retryAfter;
 }
 
 export async function fetchCopilotQuota(options: FetchQuotaOptions): Promise<QuotaFetchResult> {
@@ -189,12 +188,16 @@ export function formatQuotaLabel(quota: CopilotQuota): string {
     return 'Unlimited AI Credits';
   }
 
-  const remaining = formatCredits(quota.remaining);
+  const spent = getSpentCredits(quota);
   const entitlement = formatCredits(quota.entitlement);
-  return `${remaining} / ${entitlement} | ${Math.round(quota.percentRemaining)}%`;
+  const percentage = quota.entitlement > 0 ? ` | ${Math.floor(spent / quota.entitlement * 100)}%` : '';
+  return `${formatCredits(spent)} / ${entitlement}${percentage}`;
+}
+
+export function getSpentCredits(quota: CopilotQuota): number {
+  return Math.max(0, quota.entitlement - quota.remaining) + Math.max(0, quota.overageCount);
 }
 
 export function formatCredits(value: number): string {
-  // Credits are fractional per request but only whole numbers are meaningful here.
-  return Math.round(value).toLocaleString('en-US');
+  return value.toLocaleString('en-US', { maximumFractionDigits: 1 });
 }

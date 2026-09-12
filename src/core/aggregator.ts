@@ -12,6 +12,8 @@ interface TitleCandidate {
   title: string;
   priority: number;
   timestamp: Date;
+  modifiedAt?: number;
+  filePath: string;
 }
 
 /**
@@ -108,6 +110,9 @@ function buildChatSummaries(
       const chat: ChatUsageSummary = {
         chatId: record.chatId,
         title,
+        titlePriority: titleCandidates.get(record.chatId)?.priority,
+        titleTimestamp: titleCandidates.get(record.chatId)?.timestamp,
+        titleModifiedAt: titleCandidates.get(record.chatId)?.modifiedAt,
         model: record.model,
         timestamp: record.timestamp,
         tokens: record.tokens.total,
@@ -221,7 +226,9 @@ function collectTitleCandidate(candidates: Map<string, TitleCandidate>, record: 
   const candidate = {
     title: record.title,
     priority: record.titlePriority ?? TITLE_PRIORITY.record,
-    timestamp: record.timestamp,
+    timestamp: record.titleTimestamp ?? record.timestamp,
+    modifiedAt: record.titleModifiedAt,
+    filePath: record.filePath,
   };
   const existing = candidates.get(record.chatId);
 
@@ -239,10 +246,26 @@ function isBetterTitleCandidate(candidate: TitleCandidate, existing: TitleCandid
     return candidate.timestamp < existing.timestamp;
   }
 
+  if (candidate.priority === TITLE_PRIORITY.custom &&
+    candidate.modifiedAt !== undefined && existing.modifiedAt !== undefined) {
+    // Chat snapshots retain creationDate; rename deltas may have no timestamp.
+    // Their file revision and row order describe which custom title is current.
+    if (candidate.modifiedAt !== existing.modifiedAt) return candidate.modifiedAt > existing.modifiedAt;
+    if (candidate.filePath === existing.filePath) return true;
+  }
+
+  if (candidate.timestamp.getTime() === existing.timestamp.getTime()) {
+    // A rebuilt JSONL file gives every row the same revision. Preserve its
+    // later title row, as incremental appends do, without ordering other files.
+    if (candidate.modifiedAt !== undefined && candidate.modifiedAt === existing.modifiedAt &&
+      candidate.filePath === existing.filePath) return true;
+    return (candidate.modifiedAt ?? 0) > (existing.modifiedAt ?? 0);
+  }
   return candidate.timestamp > existing.timestamp;
 }
 
 function resolveTitle(record: UsageRecord, candidate: TitleCandidate | undefined): string {
+  if (candidate?.priority === TITLE_PRIORITY.childRun) return record.chatId;
   const title = candidate?.title ?? record.title;
   return isGenericTitle(title) ? record.chatId || title : title;
 }

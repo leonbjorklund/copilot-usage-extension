@@ -40,6 +40,12 @@ export interface UsageRecord {
   hiddenFromExplorer?: boolean;
   metadataOnly?: boolean;
   titlePriority?: number;
+  /** Source time of a retained chat title, separate from the billed request time. */
+  titleTimestamp?: Date;
+  /** Metadata file revision, orders custom titles and breaks other non-prompt timestamp ties. */
+  titleModifiedAt?: number;
+  /** Correlation evidence for account attribution. */
+  debugRequest?: { responseId: string; spanId: string; durationMs: number };
 }
 
 export interface ExtensionConfig {
@@ -56,6 +62,9 @@ export interface UsageTotal {
 export interface ChatUsageSummary {
   chatId: string;
   title: string;
+  titlePriority?: number;
+  titleTimestamp?: Date;
+  titleModifiedAt?: number;
   model: string;
   timestamp: Date;
   tokens: number;
@@ -98,6 +107,8 @@ export interface UsageDiagnostics {
 export interface UsageServiceResult {
   summary: UsageSummary;
   diagnostics: UsageDiagnostics;
+  /** Title sources for scanned or saved billed chats, without contributing usage. */
+  titleMetadata?: UsageRecord[];
 }
 
 export interface CopilotCostEstimate {

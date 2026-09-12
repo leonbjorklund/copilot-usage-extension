@@ -6,7 +6,7 @@ import type {
   UsageDiagnostics,
   UsageSummary,
 } from "../core/types";
-import { formatCredits, formatQuotaLabel } from "../core/quota";
+import { formatQuotaLabel } from "../core/quota";
 import type { QuotaState } from "../core/quotaService";
 import { formatTokens, formatUsd } from "./formatters";
 
@@ -51,7 +51,7 @@ export type UsageNode =
 export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode>, vscode.Disposable {
   private summary: UsageSummary | undefined;
   private setupNeeded = false;
-  private scanError: string | undefined;
+  private problem: Extract<UsageNode, { kind: "error" }> | undefined;
   private quotaState: QuotaState = { kind: "idle" };
   private readonly changeEmitter = new vscode.EventEmitter<UsageNode | undefined | null | void>();
 
@@ -72,24 +72,24 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode>, vs
     this.changeEmitter.fire();
   }
 
-  setSummary(summary: UsageSummary): void {
+  setSummary(summary: UsageSummary, problemMessage?: string): void {
     this.summary = summary;
     this.setupNeeded = false;
-    this.scanError = undefined;
+    this.problem = problemMessage ? { kind: "error", message: problemMessage } : undefined;
     this.changeEmitter.fire();
   }
 
   setSetupNeeded(): void {
     this.summary = undefined;
     this.setupNeeded = true;
-    this.scanError = undefined;
+    this.problem = undefined;
     this.changeEmitter.fire();
   }
 
-  setScanFailed(message: string): void {
+  setProblem(message: string): void {
     this.summary = undefined;
     this.setupNeeded = false;
-    this.scanError = message;
+    this.problem = { kind: "error", message };
     this.changeEmitter.fire();
   }
 
@@ -119,8 +119,8 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode>, vs
       return quota.length > 0 ? [...quota, { kind: "setup" }] : [];
     }
 
-    if (this.scanError !== undefined) {
-      return [...quota, { kind: "error", message: this.scanError }];
+    if (this.problem && !this.summary) {
+      return [...quota, this.problem];
     }
 
     if (!this.summary) {
@@ -130,7 +130,7 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode>, vs
     const buckets = buildBuckets(this.summary, this.now(), this.sortMode).map(
       (bucket): UsageNode => ({ kind: "bucket", bucket }),
     );
-    return [...quota, ...(buckets.length > 0 ? buckets : [{ kind: "empty" } as UsageNode])];
+    return [...quota, ...buckets, ...(this.problem ? [this.problem] : buckets.length > 0 ? [] : [{ kind: "empty" } as UsageNode])];
   }
 
   getTreeItem(element: UsageNode): vscode.TreeItem {
@@ -216,34 +216,9 @@ function buildQuotaTreeItem(state: QuotaRowState): vscode.TreeItem {
     vscode.TreeItemCollapsibleState.None,
   );
   item.iconPath = new vscode.ThemeIcon("credit-card");
-  item.description = `AI Credits left · ${state.account}`;
-  item.tooltip = formatQuotaTooltip(state);
+  item.description = `AI Credits · ${state.account}`;
   item.command = QUOTA_CONNECT_COMMAND;
   return item;
-}
-
-function formatQuotaTooltip(state: Extract<QuotaState, { kind: "quota" }>): string {
-  const lines = [`Account: ${state.account}`];
-
-  if (state.quota.unlimited) {
-    lines.push("AI Credits: unlimited");
-  } else {
-    lines.push(
-      `Remaining: ${formatCredits(state.quota.remaining)} of ${formatCredits(state.quota.entitlement)}`,
-      `Used: ${formatCredits(state.quota.entitlement - state.quota.remaining)}`,
-    );
-  }
-
-  if (state.quota.resetDate) {
-    lines.push(`Resets: ${state.quota.resetDate.toLocaleDateString()}`);
-  }
-
-  if (state.quota.overageCount > 0) {
-    lines.push(`Overage used: ${formatCredits(state.quota.overageCount)}`);
-  }
-
-  lines.push("", "Follows the account Copilot Chat uses. Click to re-read.");
-  return lines.join("\n");
 }
 
 function buildBuckets(

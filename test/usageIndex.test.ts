@@ -1,8 +1,14 @@
-import { appendFile, mkdir, mkdtemp, rm, truncate, utimes, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, open, rm, truncate, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const fs = await importOriginal<typeof import('node:fs/promises')>();
+  return { ...fs, open: vi.fn(fs.open) };
+});
+
+import * as parser from '../src/core/parser';
 import { UsageIndex } from '../src/core/usageIndex';
 import type { ExtensionConfig } from '../src/core/types';
 
@@ -20,6 +26,8 @@ describe('UsageIndex', () => {
   const roots: string[] = [];
 
   afterEach(async () => {
+    vi.restoreAllMocks();
+    vi.mocked(open).mockImplementation((await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')).open);
     await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })));
     roots.length = 0;
   });
@@ -68,6 +76,200 @@ describe('UsageIndex', () => {
       skippedRecords: 2,
       skippedMalformedFiles: 0,
     });
+  });
+
+  it('does not reread unchanged JSON usage, metadata, or marker-free files when polling', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    const folder = join(root, 'debug-logs', 'billed');
+    await mkdir(folder, { recursive: true });
+    await writeFile(join(folder, 'main.json'), JSON.stringify(usageRecord('billed', 7)));
+    await writeFile(join(folder, 'title-response.json'), JSON.stringify({
+      type: 'agent_response', ts: Date.parse('2026-05-28T08:00:01.000Z'),
+      attrs: { response: JSON.stringify([{ role: 'assistant', parts: [{ type: 'text', content: 'Billed title' }] }]) },
+    }));
+    await writeFile(join(root, 'old-session.json'), '{not valid json');
+    const parse = vi.spyOn(parser, 'parseUsageFile');
+    const index = new UsageIndex();
+    const options = { config: configForRoot(root), now: new Date('2026-05-28T12:00:00Z') };
+    const initial = await index.rebuild({ roots: [root], ...options });
+    expect(initial.summary.chats[0].title).toBe('Billed title');
+    expect(initial.diagnostics.files).toBe(2);
+    parse.mockClear();
+
+    await index.poll(options);
+    const result = await index.poll(options);
+
+    expect(parse).not.toHaveBeenCalled();
+    expect(result).toEqual(initial);
+  });
+
+  it('collects billed chat IDs only once while polling unchanged usage and title files', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    for (let chat = 0; chat < 20; chat++) {
+      const folder = join(root, 'debug-logs', `chat-${chat}`);
+      await mkdir(folder, { recursive: true });
+      await writeFile(join(folder, 'main.json'), JSON.stringify(usageRecord(`chat-${chat}`, 7)));
+      await writeFile(join(folder, 'title-response.json'), JSON.stringify({
+        type: 'agent_response', ts: Date.parse('2026-05-28T08:00:01Z'),
+        attrs: { response: JSON.stringify([{ role: 'assistant', parts: [{ type: 'text', content: `Title ${chat}` }] }]) },
+      }));
+    }
+    const index = new UsageIndex();
+    const options = { config: configForRoot(root), now: new Date('2026-05-28T12:00:00Z') };
+    const initial = await index.rebuild({ roots: [root], ...options });
+    // Each collection walks every cached record, so its count must not grow
+    // with the number of unchanged files visited by the automatic poll.
+    const collectIds = vi.spyOn(index as unknown as { getBilledChatIds(): Set<string> }, 'getBilledChatIds');
+    expect(await index.poll(options)).toEqual(initial);
+    expect(collectIds).toHaveBeenCalledTimes(1);
+  });
+
+  it('polls same-size JSON usage and delayed title rewrites', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    const folder = join(root, 'debug-logs', 'billed');
+    await mkdir(folder, { recursive: true });
+    const usageFile = join(folder, 'main.json');
+    const titleFile = join(folder, 'title-response.json');
+    const titleRecord = (title: string) => JSON.stringify({
+      type: 'agent_response', ts: Date.parse('2026-05-28T08:00:01.000Z'),
+      attrs: { response: JSON.stringify([{ role: 'assistant', parts: [{ type: 'text', content: title }] }]) },
+    });
+    await writeFile(usageFile, JSON.stringify(usageRecord('billed', 7)));
+    await writeFile(titleFile, titleRecord('First title'));
+    const before = new Date('2026-05-28T12:00:00Z');
+    await utimes(usageFile, before, before);
+    await utimes(titleFile, before, before);
+    const index = new UsageIndex();
+    const options = { config: configForRoot(root), now: before };
+    await index.rebuild({ roots: [root], ...options });
+
+    await writeFile(usageFile, JSON.stringify(usageRecord('billed', 9)));
+    await writeFile(titleFile, titleRecord('Later title'));
+    const after = new Date('2026-05-28T12:00:01Z');
+    await utimes(usageFile, after, after);
+    await utimes(titleFile, after, after);
+    const result = await index.poll(options);
+
+    expect(result.summary.allTime.tokens).toBe(9);
+    expect(result.summary.chats[0].title).toBe('Later title');
+    expect(result.summary.chats[0].titleTimestamp).toEqual(new Date('2026-05-28T08:00:01Z'));
+    expect(result.summary.chats[0].titleModifiedAt).toBe(after.getTime());
+    expect(result.diagnostics.files).toBe(2);
+  });
+
+  it('retries unchanged JSON after a transient read failure, then caches the successful read', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    await writeFile(join(root, 'usage.json'), JSON.stringify(usageRecord('billed', 7)));
+    const parse = vi.spyOn(parser, 'parseUsageFile').mockRejectedValueOnce(new Error('File temporarily unavailable'));
+    const index = new UsageIndex();
+    const options = { config: configForRoot(root), now: new Date('2026-05-28T12:00:00Z') };
+    const initial = await index.rebuild({ roots: [root], ...options });
+    expect(initial.summary.allTime.tokens).toBe(0);
+    expect(initial.diagnostics.skippedMalformedFiles).toBe(1);
+    parse.mockClear();
+
+    const recovered = await index.poll(options);
+
+    expect(parse).toHaveBeenCalledTimes(1);
+    expect(recovered.summary.allTime.tokens).toBe(7);
+    expect(recovered.diagnostics.skippedMalformedFiles).toBe(0);
+    parse.mockClear();
+    expect(await index.poll(options)).toEqual(recovered);
+    expect(parse).not.toHaveBeenCalled();
+  });
+
+  it('records the file revision for appended JSONL title metadata', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    const folder = join(root, 'debug-logs', 'billed');
+    await mkdir(folder, { recursive: true });
+    await writeFile(join(folder, 'main.jsonl'), JSON.stringify(usageRecord('billed', 7)) + '\n');
+    const titleFile = join(folder, 'title-response.jsonl');
+    const titleRecord = (title: string) => JSON.stringify({
+      type: 'agent_response', ts: Date.parse('2026-05-28T08:00:01.000Z'),
+      attrs: { response: JSON.stringify([{ role: 'assistant', parts: [{ type: 'text', content: title }] }]) },
+    }) + '\n';
+    const before = new Date('2026-05-28T12:00:00Z');
+    await writeFile(titleFile, titleRecord('First title'));
+    await utimes(titleFile, before, before);
+    const index = new UsageIndex();
+    const options = { config: configForRoot(root), now: before };
+    await index.rebuild({ roots: [root], ...options });
+
+    await appendFile(titleFile, titleRecord('Later title'));
+    const after = new Date('2026-05-28T12:00:01Z');
+    await utimes(titleFile, after, after);
+    const result = await index.poll(options);
+
+    expect(result.summary.chats[0].title).toBe('Later title');
+    expect(result.summary.chats[0].titleTimestamp).toEqual(new Date('2026-05-28T08:00:01Z'));
+    expect(result.summary.chats[0].titleModifiedAt).toBe(after.getTime());
+    expect(result.summary.allTime.tokens).toBe(7);
+    const rebuilt = await index.rebuild({ roots: [root], ...options });
+    expect(rebuilt.summary.chats[0].title).toBe('Later title');
+    expect(rebuilt.summary.allTime).toEqual(result.summary.allTime);
+  });
+
+  it('polls a cached marker-free JSON file when its size changes with the same timestamp', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    const file = join(root, 'usage.json');
+    const now = new Date('2026-05-28T12:00:00Z');
+    await writeFile(file, '{}');
+    await utimes(file, now, now);
+    const index = new UsageIndex();
+    const options = { config: configForRoot(root), now };
+    const initial = await index.rebuild({ roots: [root], ...options });
+    expect(initial.diagnostics.files).toBe(0);
+
+    await writeFile(file, JSON.stringify(usageRecord('billed', 7)));
+    await utimes(file, now, now);
+    const result = await index.poll(options);
+
+    expect(result.summary.allTime.tokens).toBe(7);
+    expect(result.diagnostics.files).toBe(1);
+  });
+
+  it('polls missed deletions and drops metadata for deleted billed chats', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    const folder = join(root, 'debug-logs', 'billed');
+    await mkdir(folder, { recursive: true });
+    const file = join(folder, 'main.jsonl');
+    await writeFile(file, JSON.stringify(usageRecord('billed', 7)) + '\n');
+    await writeFile(join(folder, 'title-response.jsonl'), JSON.stringify({
+      type: 'agent_response', ts: Date.parse('2026-05-28T08:00:01.000Z'),
+      attrs: { response: JSON.stringify([{ role: 'assistant', parts: [{ type: 'text', content: 'Billed title' }] }]) },
+    }));
+    const index = new UsageIndex();
+    const options = { config: configForRoot(root), now: new Date('2026-05-28T12:00:00Z') };
+    expect((await index.rebuild({ roots: [root], ...options })).summary.allTime.tokens).toBe(7);
+
+    await rm(file);
+    const result = await index.poll(options);
+    expect(result.summary.chats).toEqual([]);
+    expect(result.diagnostics.files).toBe(0);
+    expect(result.diagnostics.normalizedRecords).toBe(0);
+  });
+
+  it('polls files that exceeded the size limit without a notification', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    const file = join(root, 'usage.jsonl');
+    await writeFile(file, JSON.stringify(usageRecord('billed', 7)) + '\n');
+    const index = new UsageIndex();
+    const options = { config: { ...configForRoot(root), maxFileSizeMb: 0.001 } };
+    expect((await index.rebuild({ roots: [root], ...options })).summary.allTime.tokens).toBe(7);
+
+    await appendFile(file, ' '.repeat(2048));
+    const result = await index.poll(options);
+    expect(result.summary.allTime.tokens).toBe(0);
+    expect(result.diagnostics.files).toBe(0);
+    expect(result.diagnostics.oversizedFiles).toBe(1);
   });
 
   it('skips files without AI Credit markers before parsing usage content', async () => {
@@ -342,6 +544,111 @@ describe('UsageIndex', () => {
 
     expect(result.summary.allTime.tokens).toBe(3);
     expect(result.summary.chats.map((chat) => chat.chatId)).toEqual(['third']);
+  });
+
+  it('reparses longer JSONL rewrites even when the old offset remains a line boundary', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    const filePath = join(root, 'usage.jsonl');
+    const original = JSON.stringify(usageRecord('first', 1)) + '\n';
+    const replacement = JSON.stringify(usageRecord('third', 3)) + '\n';
+    expect(Buffer.byteLength(replacement)).toBe(Buffer.byteLength(original));
+    await writeFile(filePath, original);
+    const index = new UsageIndex();
+    const options = { config: configForRoot(root), now: new Date('2026-05-28T12:00:00Z') };
+    await index.rebuild({ roots: [root], ...options });
+
+    await writeFile(filePath, replacement + JSON.stringify(usageRecord('second', 2)) + '\n');
+    const result = await index.poll(options);
+
+    expect(result.summary.allTime.tokens).toBe(5);
+    expect(result.summary.chats.map((chat) => chat.chatId).sort()).toEqual(['second', 'third']);
+    expect(result).toEqual(await new UsageIndex().rebuild({ roots: [root], ...options }));
+  });
+
+  it('discovers a retained title after a longer JSONL rewrite at the same old line boundary', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    await mkdir(join(root, 'chatSessions'));
+    const filePath = join(root, 'chatSessions', 'saved-chat.jsonl');
+    const original = JSON.stringify({ kind: 0, v: {
+      sessionId: 'saved-chat', customTitle: 'Title A', creationDate: Date.parse('2026-05-28T08:00:00Z'),
+    } }) + '\n';
+    await writeFile(filePath, original);
+    const index = new UsageIndex();
+    const options = { config: configForRoot(root), now: new Date('2026-05-28T12:00:00Z'), retainedChatIds: ['saved-chat'] };
+    expect((await index.rebuild({ roots: [root], ...options })).titleMetadata?.[0].title).toBe('Title A');
+
+    await writeFile(filePath, original.replace('Title A', 'Title B') + '\n');
+    const result = await index.poll(options);
+
+    expect(result.titleMetadata?.[0].title).toBe('Title B');
+    expect(result.summary.chats).toEqual([]);
+    expect(result).toEqual(await new UsageIndex().rebuild({ roots: [root], ...options }));
+  });
+
+  it('skips unchanged JSONL content reads and parses only appended lines on growth', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    const filePath = join(root, 'usage.jsonl');
+    await writeFile(filePath, JSON.stringify(usageRecord('first', 1)) + '\n');
+    const index = new UsageIndex();
+    const options = { config: configForRoot(root), now: new Date('2026-05-28T12:00:00Z') };
+    await index.rebuild({ roots: [root], ...options });
+    vi.mocked(open).mockClear();
+    const parse = vi.spyOn(parser, 'parseUsageFile');
+
+    await index.poll(options);
+    await index.poll(options);
+    expect(open).not.toHaveBeenCalled();
+    expect(parse).not.toHaveBeenCalled();
+
+    await appendFile(filePath, JSON.stringify(usageRecord('second', 2)) + '\n');
+    expect((await index.poll(options)).summary.allTime.tokens).toBe(3);
+    expect(parse).not.toHaveBeenCalled();
+  });
+
+  it('does not resume from a digest of contents rewritten after the initial parse', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    const filePath = join(root, 'usage.jsonl');
+    await writeFile(filePath, JSON.stringify(usageRecord('first', 1)) + '\n');
+    const parse = parser.parseUsageFile;
+    vi.spyOn(parser, 'parseUsageFile').mockImplementationOnce(async (...args) => {
+      const parsed = await parse(...args);
+      await writeFile(filePath, JSON.stringify(usageRecord('third', 3)) + '\n' + JSON.stringify(usageRecord('second', 2)) + '\n');
+      return parsed;
+    });
+    const index = new UsageIndex();
+    const options = { config: configForRoot(root), now: new Date('2026-05-28T12:00:00Z') };
+    await index.rebuild({ roots: [root], ...options });
+
+    const result = await index.poll(options);
+
+    expect(result.summary.allTime.tokens).toBe(5);
+    expect(result.summary.chats.map((chat) => chat.chatId).sort()).toEqual(['second', 'third']);
+  });
+
+  it('reads all appended bytes when filesystem reads return short chunks', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    const filePath = join(root, 'usage.jsonl');
+    await writeFile(filePath, JSON.stringify(usageRecord('first', 1)) + '\n');
+    const index = new UsageIndex();
+    const options = { config: configForRoot(root), now: new Date('2026-05-28T12:00:00Z') };
+    await index.rebuild({ roots: [root], ...options });
+    await appendFile(filePath, JSON.stringify(usageRecord('second', 2)) + '\n' + JSON.stringify(usageRecord('third', 3)) + '\n');
+    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    vi.mocked(open).mockImplementation(async (...args) => {
+      const handle = await actual.open(...args);
+      const read = handle.read.bind(handle);
+      Object.defineProperty(handle, 'read', { value: (buffer: Buffer, offset: number, length: number, position: number | null) =>
+        read(buffer, offset, Math.min(length, 7), position) });
+      return handle;
+    });
+
+    expect((await index.poll(options)).summary.allTime.tokens).toBe(6);
+    expect((await index.poll(options)).summary.allTime.tokens).toBe(6);
   });
 
   it.skipIf(process.platform !== 'win32')('does not duplicate cached records when a Windows file event changes drive letter casing', async () => {

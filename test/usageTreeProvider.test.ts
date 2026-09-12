@@ -37,9 +37,32 @@ import * as vscode from 'vscode';
 import { differenceInLocalCalendarDays, UsageTreeProvider } from '../src/ui/usageTreeProvider';
 import type { ChatUsageSummary, CopilotCostEstimate, UsageRecord, UsageSummary, UsageTotal } from '../src/core/types';
 
-const QUOTA_CLICK_HINT = 'Follows the account Copilot Chat uses. Click to re-read.';
 
 describe('UsageTreeProvider', () => {
+  it('keeps confirmed sessions visible while reporting a log read failure', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setSummary(createSummary(), 'Cannot read Copilot account log.');
+    const rows = (await provider.getChildren())!;
+    expect(rows.some((row) => row.kind === 'bucket')).toBe(true);
+    const problem = rows.find((row) => row.kind === 'error')!;
+    const item = provider.getTreeItem(problem);
+    expect(item.label).toBe('Scan failed');
+    expect(item.iconPath).toMatchObject({ id: 'error' });
+    expect(item.tooltip).toBe('Cannot read Copilot account log.');
+  });
+
+  it('clears a scan error after a successful summary', async () => {
+    const provider = new UsageTreeProvider();
+    provider.setProblem('Cannot read logs.');
+    const rows = (await provider.getChildren())!;
+    const item = provider.getTreeItem(rows[0]);
+    expect(item.label).toBe('Scan failed');
+    expect(item.iconPath).toMatchObject({ id: 'error' });
+    provider.setSummary(createSummary([]));
+    expect(provider.getTreeItem((await provider.getChildren())![0]).label).toBe('No Copilot usage found');
+    provider.setProblem('Cannot read logs.');
+    expect(provider.getTreeItem((await provider.getChildren())![0]).label).toBe('Scan failed');
+  });
   it('returns no tree rows when Copilot file logging is disabled so the welcome view renders', async () => {
     const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
     provider.setSetupNeeded();
@@ -294,7 +317,6 @@ describe('UsageTreeProvider', () => {
       quota: {
         entitlement: 1500,
         remaining: 537.4,
-        percentRemaining: 35.8,
         unlimited: false,
         overageCount: 0,
       },
@@ -304,24 +326,16 @@ describe('UsageTreeProvider', () => {
 
     expect(rootChildren).toHaveLength(3);
     const item = provider.getTreeItem(rootChildren[0]);
-    expect(item.label).toBe('537 / 1,500 | 36%');
-    expect(item.description).toBe('AI Credits left · octocat');
+    expect(item.label).toBe('962.6 / 1,500 | 64%');
+    expect(item.description).toBe('AI Credits · octocat');
     expect(item.collapsibleState).toBe(vscode.TreeItemCollapsibleState.None);
-    expect(item.tooltip).toBe(
-      [
-        'Account: octocat',
-        'Remaining: 537 of 1,500',
-        'Used: 963',
-        '',
-        QUOTA_CLICK_HINT,
-      ].join('\n'),
-    );
-    // The filled row stays clickable: that click is the account picker.
+    expect(item.tooltip).toBeUndefined();
+    // Clicking the filled row requests a fresh quota snapshot.
     expect(item.command).toMatchObject({ command: 'copilotUsage.connectQuota' });
     expect(provider.getTreeItem(rootChildren[1]).label).toBe('Today');
   });
 
-  it('describes an unlimited plan, the reset date and any overage in the tooltip', async () => {
+  it('shows an unlimited plan without a quota tooltip', async () => {
     const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
     provider.setSummary(createSummary());
     const resetDate = new Date(2026, 9, 1);
@@ -331,7 +345,6 @@ describe('UsageTreeProvider', () => {
       quota: {
         entitlement: Number.POSITIVE_INFINITY,
         remaining: Number.POSITIVE_INFINITY,
-        percentRemaining: 100,
         unlimited: true,
         overageCount: 12,
         resetDate,
@@ -341,16 +354,8 @@ describe('UsageTreeProvider', () => {
     const item = provider.getTreeItem(((await provider.getChildren()) ?? [])[0]);
 
     expect(item.label).toBe('Unlimited AI Credits');
-    expect(item.tooltip).toBe(
-      [
-        'Account: octocat',
-        'AI Credits: unlimited',
-        `Resets: ${resetDate.toLocaleDateString()}`,
-        'Overage used: 12',
-        '',
-        QUOTA_CLICK_HINT,
-      ].join('\n'),
-    );
+    expect(item.description).toBe('AI Credits · octocat');
+    expect(item.tooltip).toBeUndefined();
   });
 
   it('offers a one-click consent row instead of the quota when access is not granted', async () => {
@@ -391,7 +396,7 @@ describe('UsageTreeProvider', () => {
 
   it('explains a failed scan instead of drawing an empty tree', async () => {
     const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
-    provider.setScanFailed('profile folder is locked');
+    provider.setProblem('profile folder is locked');
 
     const rootChildren = (await provider.getChildren()) ?? [];
 

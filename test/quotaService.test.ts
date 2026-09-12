@@ -1,3 +1,6 @@
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { CopilotQuota, QuotaFetchResult } from '../src/core/quota';
@@ -7,6 +10,7 @@ const { fetchCopilotQuota, auth } = vi.hoisted(() => ({
   auth: {
     getSession: vi.fn(),
     getAccounts: vi.fn(),
+    showInformationMessage: vi.fn(),
     sessionChangeHandlers: [] as Array<(event: { provider: { id: string } }) => void>,
   },
 }));
@@ -40,6 +44,7 @@ vi.mock('vscode', () => ({
       return { dispose: () => undefined };
     },
   },
+  window: { showInformationMessage: auth.showInformationMessage },
 }));
 
 const { CopilotQuotaService } = await import('../src/core/quotaService');
@@ -73,7 +78,6 @@ function quota(overrides: Partial<CopilotQuota> = {}): CopilotQuota {
   return {
     entitlement: 1500,
     remaining: 1317,
-    percentRemaining: 87.8,
     unlimited: false,
     overageCount: 0,
     ...overrides,
@@ -104,11 +108,19 @@ function fireSessionChange(providerId: string) {
 }
 
 describe('CopilotQuotaService', () => {
+  const consentDirectories: string[] = [];
+  async function consentDirectory(): Promise<string> {
+    const directory = await mkdtemp(join(tmpdir(), 'copilot-quota-consent-'));
+    consentDirectories.push(directory);
+    return directory;
+  }
+
   beforeEach(() => {
     vi.useFakeTimers();
     fetchCopilotQuota.mockReset();
     auth.getSession.mockReset();
     auth.getAccounts.mockReset();
+    auth.showInformationMessage.mockReset();
     auth.sessionChangeHandlers.length = 0;
     copilot.login = undefined;
     copilot.changeHandlers.length = 0;
@@ -117,8 +129,114 @@ describe('CopilotQuotaService', () => {
     resolvesTo({ kind: 'quota', quota: quota() });
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     vi.useRealTimers();
+    await Promise.all(consentDirectories.map((directory) => rm(directory, { recursive: true, force: true })));
+    consentDirectories.length = 0;
+  });
+
+  it('offers access for the chat account and immediately displays quota after approval', async () => {
+    copilot.login = 'octocat';
+    auth.getSession.mockImplementation(async (_provider, _scopes, options) =>
+      options.createIfNone ? session() : undefined);
+    const service = createService();
+    await service.refreshNow();
+    expect(service.getState().kind).toBe('needs-consent');
+    expect(auth.getSession.mock.calls.some((call) => call[2].createIfNone)).toBe(false);
+
+    await service.offerConsentAfterChat('octocat', await consentDirectory());
+    expect(lastGetSessionCall()).toEqual(['github', [], { createIfNone: true, account: account() }]);
+    expect(service.getState()).toEqual({ kind: 'quota', quota: quota(), account: 'octocat' });
+    expect(fetchCopilotQuota).toHaveBeenCalledTimes(1);
+    service.dispose();
+  });
+
+  it('remembers cancellation across chats and restarts while allowing a manual retry', async () => {
+    copilot.login = 'octocat';
+    auth.getSession.mockImplementation(async (_provider, _scopes, options) => {
+      if (options.createIfNone) throw new Error('User cancelled');
+      return undefined;
+    });
+    const storage = await consentDirectory();
+    const first = createService();
+    await first.refreshNow();
+    await first.offerConsentAfterChat('octocat', storage);
+    await first.offerConsentAfterChat('octocat', storage);
+    first.dispose();
+    const restarted = createService();
+    await restarted.refreshNow();
+    await restarted.offerConsentAfterChat('OCTOCAT', storage);
+    expect(auth.getSession.mock.calls.filter((call) => call[2].createIfNone)).toHaveLength(1);
+    expect(fetchCopilotQuota).not.toHaveBeenCalled();
+    await restarted.refreshNow({ interactive: true });
+    expect(auth.getSession.mock.calls.filter((call) => call[2].createIfNone)).toHaveLength(2);
+    restarted.dispose();
+  });
+
+  it('lets only one concurrent window offer access for an account', async () => {
+    copilot.login = 'octocat';
+    auth.getSession.mockResolvedValue(undefined);
+    const storage = await consentDirectory();
+    const first = createService();
+    const second = createService();
+    await Promise.all([first.refreshNow(), second.refreshNow()]);
+    await Promise.all([
+      first.offerConsentAfterChat('octocat', storage),
+      second.offerConsentAfterChat('octocat', storage),
+    ]);
+    expect(auth.getSession.mock.calls.filter((call) => call[2].createIfNone)).toHaveLength(1);
+    expect(await readdir(storage)).toHaveLength(1);
+    first.dispose();
+    second.dispose();
+  });
+
+  it('does not offer or save a marker when access already works', async () => {
+    copilot.login = 'octocat';
+    const storage = await consentDirectory();
+    const service = createService();
+    await service.refreshNow();
+    await service.offerConsentAfterChat('octocat', storage);
+    expect(auth.getSession).toHaveBeenCalledTimes(1);
+    expect(await readdir(storage)).toEqual([]);
+    service.dispose();
+  });
+
+  it('ignores stale chat accounts and accounts missing from the GitHub provider', async () => {
+    copilot.login = 'octocat';
+    auth.getSession.mockResolvedValue(undefined);
+    const storage = await consentDirectory();
+    const service = createService();
+    await service.refreshNow();
+    await service.offerConsentAfterChat('hubot', storage);
+    auth.getAccounts.mockResolvedValue([]);
+    await service.offerConsentAfterChat('octocat', storage);
+    expect(auth.getSession).toHaveBeenCalledTimes(1);
+    expect(await readdir(storage)).toEqual([]);
+    service.dispose();
+  });
+
+  it('offers when the first chat arrives with initial account discovery', async () => {
+    copilot.login = 'octocat';
+    auth.getSession.mockResolvedValue(undefined);
+    const service = createService();
+    copilotSwitchedTo('octocat');
+    await service.offerConsentAfterChat('octocat', await consentDirectory());
+    expect(auth.getSession.mock.calls.filter((call) => call[2].createIfNone)).toHaveLength(1);
+    service.dispose();
+  });
+
+  it('does not open an automatic dialog after the account changes or the service is disposed', async () => {
+    copilot.login = 'hubot';
+    auth.getSession.mockResolvedValue(undefined);
+    const service = createService();
+    await service.refreshNow({ interactive: true, expectedAccount: 'octocat' });
+    expect(auth.getSession).not.toHaveBeenCalled();
+    service.dispose();
+    copilot.login = 'octocat';
+    const storage = await consentDirectory();
+    await service.offerConsentAfterChat('octocat', storage);
+    expect(auth.getSession).not.toHaveBeenCalled();
+    expect(await readdir(storage)).toEqual([]);
   });
 
   it('reads the quota with a silent session and publishes it', async () => {
@@ -225,6 +343,19 @@ describe('CopilotQuotaService', () => {
     service.dispose();
   });
 
+  it('matches Copilot and signed-in account names without case sensitivity', async () => {
+    copilot.login = 'OCTOCAT';
+    const service = createService();
+    await service.refreshNow();
+
+    expect(lastGetSessionCall()[2]).toEqual({ silent: true, account: account('octocat') });
+    expect(service.getState()).toMatchObject({ kind: 'quota', account: 'octocat' });
+    copilotSwitchedTo('Octocat');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchCopilotQuota).toHaveBeenCalledTimes(1);
+    service.dispose();
+  });
+
   it('applies a switch that lands while a read is running', async () => {
     let releaseFirst: (value: unknown) => void = () => undefined;
     auth.getSession.mockReturnValueOnce(
@@ -237,26 +368,109 @@ describe('CopilotQuotaService', () => {
     const service = createService();
     const first = service.refreshNow();
 
+    await vi.advanceTimersByTimeAsync(0);
+    expect(auth.getSession).toHaveBeenCalledTimes(1);
     auth.getSession.mockResolvedValue(session('hubot'));
     copilotSwitchedTo('hubot');
     releaseFirst(session('octocat'));
     await first;
     await vi.advanceTimersByTimeAsync(0);
 
-    expect(fetchCopilotQuota).toHaveBeenCalledTimes(2);
+    expect(fetchCopilotQuota).toHaveBeenCalledTimes(1);
     expect(lastGetSessionCall()[2]).toEqual({ silent: true, account: account('hubot') });
     expect(service.getState()).toMatchObject({ account: 'hubot' });
     service.dispose();
   });
 
-  it('falls back to the allowed account when Copilot reports one not signed in here', async () => {
+  it('never publishes the previous account response after a switch during fetch', async () => {
+    copilot.login = 'octocat';
+    auth.getAccounts.mockResolvedValue([account('octocat'), account('hubot')]);
+    let release: (result: QuotaFetchResult) => void = () => undefined;
+    fetchCopilotQuota.mockReturnValueOnce(new Promise<QuotaFetchResult>((resolve) => { release = resolve; }));
+    const service = createService();
+    const published: string[] = [];
+    service.onDidChange(() => {
+      const state = service.getState();
+      if (state.kind === 'quota') published.push(state.account);
+    });
+    const first = service.refreshNow();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchCopilotQuota).toHaveBeenCalledTimes(1);
+    auth.getSession.mockResolvedValue(session('hubot'));
+    copilotSwitchedTo('hubot');
+    release({ kind: 'quota', quota: quota() });
+    await first;
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(published).toEqual(['hubot']);
+    expect(service.getState()).toMatchObject({ account: 'hubot' });
+    service.dispose();
+  });
+
+  it('clears the previous quota while the new account fetch is pending', async () => {
+    copilot.login = 'octocat';
+    auth.getAccounts.mockResolvedValue([account('octocat'), account('hubot')]);
+    const service = createService();
+    await service.refreshNow();
+    let release: (result: QuotaFetchResult) => void = () => undefined;
+    fetchCopilotQuota.mockReturnValueOnce(new Promise<QuotaFetchResult>((resolve) => { release = resolve; }));
+    auth.getSession.mockResolvedValue(session('hubot'));
+    copilotSwitchedTo('hubot');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(service.getState()).toEqual({ kind: 'idle' });
+    release({ kind: 'quota', quota: quota() });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(service.getState()).toMatchObject({ account: 'hubot' });
+    service.dispose();
+  });
+
+  it('honours a rate limit received from the old account after switching', async () => {
+    copilot.login = 'octocat';
+    auth.getAccounts.mockResolvedValue([account('octocat'), account('hubot')]);
+    let release: (result: QuotaFetchResult) => void = () => undefined;
+    fetchCopilotQuota.mockReturnValueOnce(new Promise<QuotaFetchResult>((resolve) => { release = resolve; }));
+    const service = createService();
+    const first = service.refreshNow();
+    await vi.advanceTimersByTimeAsync(0);
+    auth.getSession.mockResolvedValue(session('hubot'));
+    copilotSwitchedTo('hubot');
+    release({ kind: 'rate-limited', retryAfterMs: 5 * MIN_REFRESH_INTERVAL_MS });
+    await first;
+    await vi.advanceTimersByTimeAsync(5 * MIN_REFRESH_INTERVAL_MS - 1);
+
+    expect(fetchCopilotQuota).toHaveBeenCalledTimes(1);
+    expect(service.getState()).toEqual({ kind: 'idle' });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(fetchCopilotQuota).toHaveBeenCalledTimes(2);
+    expect(service.getState()).toMatchObject({ kind: 'quota', account: 'hubot' });
+    service.dispose();
+  });
+
+  it('does not fetch another account when Copilot reports one not signed in here', async () => {
     copilot.login = 'ghost';
     const service = createService();
 
     await service.refreshNow();
 
-    expect(lastGetSessionCall()[2]).toEqual({ silent: true });
-    expect(service.getState()).toMatchObject({ account: 'octocat' });
+    expect(auth.getSession).not.toHaveBeenCalled();
+    expect(fetchCopilotQuota).not.toHaveBeenCalled();
+    expect(service.getState()).toEqual({ kind: 'needs-consent', account: 'ghost' });
+    expect(auth.showInformationMessage).not.toHaveBeenCalled();
+    service.dispose();
+  });
+
+  it('explains how to sign into the missing Copilot account when clicked', async () => {
+    copilot.login = 'ghost';
+    const service = createService();
+
+    await service.refreshNow({ interactive: true });
+
+    expect(auth.showInformationMessage).toHaveBeenCalledWith(
+      'Copilot reports the GitHub account ghost, but VS Code has no matching signed-in account. Open the VS Code Accounts menu, sign in to GitHub as ghost, then run Show AI Credit Quota again.',
+    );
+    expect(auth.getSession).not.toHaveBeenCalled();
+    expect(fetchCopilotQuota).not.toHaveBeenCalled();
+    expect(service.getState()).toEqual({ kind: 'needs-consent', account: 'ghost' });
     service.dispose();
   });
 
@@ -272,6 +486,17 @@ describe('CopilotQuotaService', () => {
     service.dispose();
   });
 
+  it('rejects a session returned for a different account than Copilot requested', async () => {
+    copilot.login = 'hubot';
+    auth.getAccounts.mockResolvedValue([account('octocat'), account('hubot')]);
+    const service = createService();
+    await service.refreshNow();
+
+    expect(fetchCopilotQuota).not.toHaveBeenCalled();
+    expect(service.getState()).toEqual({ kind: 'needs-consent', account: 'hubot' });
+    service.dispose();
+  });
+
   it('asks for access to the account Copilot uses on a click, without the picker', async () => {
     copilot.login = 'hubot';
     auth.getAccounts.mockResolvedValue([account('octocat'), account('hubot')]);
@@ -282,6 +507,35 @@ describe('CopilotQuotaService', () => {
 
     expect(lastGetSessionCall()[2]).toEqual({ createIfNone: true, account: account('hubot') });
     expect(service.getState()).toMatchObject({ account: 'hubot' });
+    service.dispose();
+  });
+
+  it.each(['account switch', 'disposal'])('does not open stale consent after %s during silent authentication', async (change) => {
+    copilot.login = 'octocat';
+    auth.getAccounts.mockResolvedValue([account('octocat'), account('hubot')]);
+    let releaseSession!: (value: undefined) => void;
+    auth.getSession.mockReturnValueOnce(new Promise<undefined>((resolve) => { releaseSession = resolve; }));
+    const service = createService();
+    const pending = service.refreshNow({ interactive: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(auth.getSession).toHaveBeenCalledTimes(1);
+
+    if (change === 'account switch') {
+      auth.getSession.mockResolvedValue(session('hubot'));
+      copilotSwitchedTo('hubot');
+    } else {
+      service.dispose();
+    }
+    releaseSession(undefined);
+    await pending;
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(auth.getSession.mock.calls.every((call) => call[2].silent === true)).toBe(true);
+    if (change === 'account switch') {
+      expect(service.getState()).toMatchObject({ kind: 'quota', account: 'hubot' });
+    } else {
+      expect(fetchCopilotQuota).not.toHaveBeenCalled();
+    }
     service.dispose();
   });
 
@@ -413,13 +667,13 @@ describe('CopilotQuotaService', () => {
     const changes = vi.fn();
     service.onDidChange(changes);
 
-    resolvesTo({ kind: 'quota', quota: quota({ remaining: 0, percentRemaining: 0 }) });
+    resolvesTo({ kind: 'quota', quota: quota({ remaining: 0 }) });
     await service.refreshNow();
     expect(changes).toHaveBeenCalledTimes(1);
 
     resolvesTo({
       kind: 'quota',
-      quota: quota({ remaining: 0, percentRemaining: 0, overageCount: 12 }),
+      quota: quota({ remaining: 0, overageCount: 12 }),
     });
     await service.refreshNow({ interactive: true });
     expect(changes).toHaveBeenCalledTimes(2);
@@ -486,6 +740,23 @@ describe('CopilotQuotaService', () => {
     // GitHub asked for five minutes of silence, so four events inside that
     // window must not put a single extra request on the wire.
     expect(fetchCopilotQuota).toHaveBeenCalledTimes(1);
+    service.dispose();
+  });
+
+  it('does not apply one account failure backoff to a different Copilot account', async () => {
+    copilot.login = 'octocat';
+    auth.getAccounts.mockResolvedValue([account('octocat'), account('hubot')]);
+    resolvesTo({ kind: 'unauthorized' });
+    const service = createService();
+    await service.refreshNow();
+    auth.getSession.mockResolvedValue(session('hubot'));
+    resolvesTo({ kind: 'quota', quota: quota() });
+
+    copilotSwitchedTo('hubot');
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(fetchCopilotQuota).toHaveBeenCalledTimes(2);
+    expect(service.getState()).toMatchObject({ kind: 'quota', account: 'hubot' });
     service.dispose();
   });
 

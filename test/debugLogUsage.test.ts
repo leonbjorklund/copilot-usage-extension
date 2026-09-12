@@ -530,6 +530,12 @@ describe('Copilot debug log usage', () => {
     expect(result.summary.chats).toHaveLength(1);
     expect(result.summary.chats[0].title).toBe('session-1');
     expect(result.summary.chats[0].tokens).toBe(20);
+
+    // Retention can remove the parent log before its child's billed log.
+    await rm(join(folder, 'main.jsonl'));
+    const childOnly = await rebuildUsage(root);
+    expect(childOnly.summary.chats[0].title).toBe('session-1');
+    expect(childOnly.summary.chats[0].tokens).toBe(10);
   });
 
   it('reads the chat id from the debug-logs folder and marks child runs', () => {

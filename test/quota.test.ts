@@ -27,10 +27,25 @@ function proPayload(overrides: Record<string, unknown> = {}) {
 }
 
 describe('parseCopilotQuota', () => {
+  it('prefers the reported remaining credits over the percentage estimate', () => {
+    for (const quota_remaining of [1205.2, '1205.2']) {
+      const quota = parseCopilotQuota(proPayload({ quota_remaining, percent_remaining: 80.3 }));
+      expect(quota?.remaining).toBe(1205.2);
+      expect(formatQuotaLabel(quota!)).toBe('294.8 / 1,500 | 19%');
+    }
+    expect(parseCopilotQuota(proPayload({ quota_remaining: 0 }))?.remaining).toBe(0);
+  });
+
+  it('falls back to the percentage when remaining credits are missing or invalid', () => {
+    for (const quota_remaining of [undefined, null, '', 'invalid', -1, Infinity]) {
+      expect(parseCopilotQuota(proPayload({ quota_remaining }))?.remaining).toBeCloseTo(1317, 6);
+    }
+  });
+
   it('reads premium_interactions from the Pro payload', () => {
     const quota = parseCopilotQuota(proPayload());
 
-    expect(quota).toMatchObject({ entitlement: 1500, percentRemaining: 87.8, unlimited: false });
+    expect(quota).toMatchObject({ entitlement: 1500, unlimited: false });
     expect(quota?.remaining).toBeCloseTo(1317, 6);
     expect(quota?.resetDate?.toISOString().slice(0, 10)).toBe('2026-10-01');
   });
@@ -60,11 +75,9 @@ describe('parseCopilotQuota', () => {
 
   it('keeps the percentage between 0 and 100', () => {
     expect(parseCopilotQuota(proPayload({ percent_remaining: 999 }))).toMatchObject({
-      percentRemaining: 100,
       remaining: 1500,
     });
     expect(parseCopilotQuota(proPayload({ percent_remaining: -5 }))).toMatchObject({
-      percentRemaining: 0,
       remaining: 0,
     });
   });
@@ -88,10 +101,21 @@ describe('parseCopilotQuota', () => {
 });
 
 describe('formatQuotaLabel', () => {
-  it('shows remaining, entitlement and percentage', () => {
+  it('shows spent credits, entitlement and spent percentage', () => {
     const quota = parseCopilotQuota(proPayload({ entitlement: 1500, percent_remaining: 35.8 }));
 
-    expect(formatQuotaLabel(quota!)).toBe('537 / 1,500 | 36%');
+    expect(formatQuotaLabel(quota!)).toBe('963 / 1,500 | 64%');
+    expect(formatQuotaLabel(parseCopilotQuota(proPayload({ percent_remaining: 87 }))!)).toBe('195 / 1,500 | 13%');
+  });
+
+  it('includes overage in spent credits and percentage', () => {
+    const quota = parseCopilotQuota(proPayload({ percent_remaining: 0, overage_count: 150 }));
+    expect(formatQuotaLabel(quota!)).toBe('1,650 / 1,500 | 110%');
+  });
+
+  it('omits the percentage when there is no included allowance', () => {
+    const quota = parseCopilotQuota(proPayload({ entitlement: 0, percent_remaining: 0, overage_count: 12 }));
+    expect(formatQuotaLabel(quota!)).toBe('12 / 0');
   });
 });
 
@@ -165,6 +189,23 @@ describe('fetchCopilotQuota', () => {
 
     // A 403 with no rate-limit headers is still a rejected token.
     expect(await fetchWith(403)).toEqual({ kind: 'unauthorized' });
+  });
+
+  it('waits for the primary rate-limit reset, including when retry-after is shorter', async () => {
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    try {
+      for (const retryAfter of [{}, { 'retry-after': '60' }]) {
+        const reset = Math.ceil(now / 1000) + 1800;
+        expect(await fetchWith(403, {}, {
+          'x-ratelimit-remaining': '0',
+          'x-ratelimit-reset': String(reset),
+          ...retryAfter,
+        })).toEqual({ kind: 'rate-limited', retryAfterMs: reset * 1000 - now });
+      }
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it('treats a signed-in account with no snapshots as having no quota', async () => {

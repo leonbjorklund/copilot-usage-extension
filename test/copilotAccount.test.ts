@@ -1,4 +1,4 @@
-import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, open, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -13,16 +13,16 @@ const watchers = vi.hoisted(
 
 vi.mock('vscode', () => ({
   EventEmitter: class {
-    private readonly listeners: Array<() => void> = [];
+    private readonly listeners: Array<(value?: unknown) => void> = [];
 
-    readonly event = (listener: () => void) => {
+    readonly event = (listener: (value?: unknown) => void) => {
       this.listeners.push(listener);
       return { dispose: () => undefined };
     };
 
-    fire(): void {
+    fire(value?: unknown): void {
       for (const listener of [...this.listeners]) {
-        listener();
+        listener(value);
       }
     }
 
@@ -107,6 +107,51 @@ describe('CopilotAccountWatcher', () => {
     await vi.advanceTimersByTimeAsync(READ_DELAY_MS);
   }
 
+  it('emits only new completed panel requests, without replaying history or partial lines', async () => {
+    vi.setSystemTime(new Date(2026, 8, 4, 11, 36, 13));
+    const request = (time: string, context = 'panel/editAgent', status = 'success') =>
+      `2026-09-04 11:36:${time} [info] ccreq:abc | ${status} | model | 10ms | [${context}]\n`;
+    await writeFile(copilotLog, line('octocat') + request('12.900'));
+    const watcher = new CopilotAccountWatcher(extensionLog);
+    const completed = vi.fn();
+    watcher.onDidCompleteChatRequest(completed);
+    await watcher.currentLogin();
+    expect(completed).not.toHaveBeenCalled();
+
+    await appendFile(copilotLog, request('13.100', 'title') + request('13.200', 'progressMessages')
+      + request('13.300', 'panel/editAgent', 'error') + request('13.400').trimEnd());
+    await logWritten();
+    await watcher.currentLogin();
+    expect(completed).not.toHaveBeenCalled();
+
+    await appendFile(copilotLog, '\n');
+    await logWritten();
+    await watcher.currentLogin();
+    expect(completed.mock.calls).toEqual([['octocat']]);
+    await appendFile(copilotLog, 'unrelated log update\n');
+    await logWritten();
+    await watcher.currentLogin();
+    expect(completed).toHaveBeenCalledTimes(1);
+    watcher.dispose();
+  });
+
+  it('does not offer the previous account after a switch in the same log read', async () => {
+    vi.setSystemTime(new Date(2026, 8, 4, 11, 36, 13));
+    await writeFile(copilotLog, line('octocat'));
+    const watcher = new CopilotAccountWatcher(extensionLog);
+    const completed = vi.fn();
+    watcher.onDidCompleteChatRequest(completed);
+    await watcher.currentLogin();
+    await appendFile(copilotLog,
+      '2026-09-04 11:36:13.100 [info] ccreq:old | success | model | 10ms | [panel/editAgent]\n'
+      + line('hubot')
+      + '2026-09-04 11:36:13.200 [info] ccreq:new | success | model | 10ms | [panel/editAgent]\n');
+    await logWritten();
+    await watcher.currentLogin();
+    expect(completed.mock.calls).toEqual([['hubot']]);
+    watcher.dispose();
+  });
+
   it('reads the login at start and watches the Copilot Chat log folder', async () => {
     await writeFile(copilotLog, `${line('octocat')}${line('hubot')}`);
 
@@ -177,6 +222,32 @@ describe('CopilotAccountWatcher', () => {
     watcher.dispose();
   });
 
+  it('detects a switch while the writer stays open and no file event arrives', async () => {
+    await writeFile(copilotLog, line('octocat'));
+    const watcher = new CopilotAccountWatcher(extensionLog);
+    const writer = await open(copilotLog, 'a');
+    const changes = vi.fn();
+    watcher.onDidChange(changes);
+    try {
+      expect(await watcher.currentLogin()).toBe('octocat');
+      await writer.write(line('hubot'));
+
+      // Windows can defer notifications until the writer closes its handle.
+      // Copilot keeps its log open, so no mocked file event is fired here.
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(await watcher.currentLogin()).toBe('hubot');
+      expect(changes).toHaveBeenCalledTimes(2);
+
+      await vi.advanceTimersByTimeAsync(4_000);
+      expect(await watcher.currentLogin()).toBe('hubot');
+      expect(changes).toHaveBeenCalledTimes(2);
+    } finally {
+      watcher.dispose();
+      await writer.close();
+    }
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it('starts over when the log is replaced by a shorter one', async () => {
     await writeFile(copilotLog, `${line('octocat')}${line('octocat')}${line('octocat')}`);
     const watcher = new CopilotAccountWatcher(extensionLog);
@@ -188,6 +259,21 @@ describe('CopilotAccountWatcher', () => {
     expect(await watcher.currentLogin()).toBe('hubot');
     watcher.dispose();
   });
+
+  it.each(['', '2026-09-04 11:40:00.000 [info] Request completed\n'])(
+    'detects an account switch before the old offset in a replacement log with suffix %j', async (suffix) => {
+    await writeFile(copilotLog, line('alice'));
+    const watcher = new CopilotAccountWatcher(extensionLog);
+    try {
+      expect(await watcher.currentLogin()).toBe('alice');
+      await writeFile(copilotLog, line('bobby') + suffix);
+      await utimes(copilotLog, new Date(), new Date('2026-09-05T12:00:00Z'));
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(await watcher.currentLogin()).toBe('bobby');
+    } finally {
+      watcher.dispose();
+    }
+    });
 
   it('reports no login while Copilot Chat has written no log', async () => {
     const watcher = new CopilotAccountWatcher(extensionLog);
