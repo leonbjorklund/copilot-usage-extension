@@ -1,7 +1,24 @@
 import { describe, expect, it } from 'vitest';
 
 import { aggregateUsage } from '../src/core/aggregator';
+import { TITLE_PRIORITY } from '../src/core/types';
 import type { UsageRecord } from '../src/core/types';
+
+describe('title source ordering', () => {
+  it.each([
+    [TITLE_PRIORITY.prompt, 'First title'],
+    [TITLE_PRIORITY.generated, 'Later title'],
+    [TITLE_PRIORITY.custom, 'Later title'],
+  ])('preserves within-file title order at priority %s', (titlePriority, expected) => {
+    const at = new Date('2026-05-28T08:00:00Z');
+    const billed = createBilledRecord('chat', 'panel/editAgent', at, 'model', 100);
+    const first = { ...billed, filePath: 'title.jsonl', metadataOnly: true,
+      title: 'First title', titlePriority, titleModifiedAt: at.getTime() };
+    const later = { ...first, title: 'Later title' };
+    expect(aggregateUsage([billed, first, later]).chats[0].title).toBe(expected);
+    expect(aggregateUsage([billed, first, { ...later, filePath: 'other-title.jsonl' }]).chats[0].title).toBe('First title');
+  });
+});
 
 describe('aggregateUsage', () => {
   it('aggregates positive AI Credit usage totals and chat summaries', () => {
@@ -173,34 +190,37 @@ describe('aggregateUsage', () => {
     expect(summary.chats[0].records[0].title).toBe('panel/editAgent');
   });
 
-  it('falls back to session id before generic debug names', () => {
+  it('falls back to the session id for generic and internal request names', () => {
     const now = new Date('2026-05-28T12:00:00.000Z');
-    const records: UsageRecord[] = [
-      {
-        chatId: 'session-1',
-        title: 'panel/editAgent',
-        timestamp: new Date('2026-05-28T08:00:00Z'),
-        model: 'gpt-test',
-        titlePriority: 0,
-        tokens: {
-          input: 100,
-          cachedInput: 0,
-          output: 50,
-          cacheWriteInput: 0,
-          total: 150,
-          source: 'recorded',
+    // `tool/...` is what a subagent request calls itself; it is no chat title.
+    for (const title of ['panel/editAgent', 'tool/runSubagent-Explore']) {
+      const records: UsageRecord[] = [
+        {
+          chatId: 'session-1',
+          title,
+          timestamp: new Date('2026-05-28T08:00:00Z'),
+          model: 'gpt-test',
+          titlePriority: 1,
+          tokens: {
+            input: 100,
+            cachedInput: 0,
+            output: 50,
+            cacheWriteInput: 0,
+            total: 150,
+            source: 'recorded',
+          },
+          filePath: 'main.jsonl',
+          billing: {
+            aiCredits: 1.5,
+            source: 'copilot-debug-log',
+          },
         },
-        filePath: 'main.jsonl',
-        billing: {
-          aiCredits: 1.5,
-          source: 'copilot-debug-log',
-        },
-      },
-    ];
+      ];
 
-    const summary = aggregateUsage(records, now);
+      const summary = aggregateUsage(records, now);
 
-    expect(summary.chats[0].title).toBe('session-1');
+      expect(summary.chats[0].title).toBe('session-1');
+    }
   });
 
   it('ignores hidden records when selecting session titles', () => {
@@ -328,13 +348,13 @@ describe('aggregateUsage', () => {
     expect(summary.week).toEqual(createTotal(100, 1));
   });
 
-  it('ranks top models by tokens and counts sessions', () => {
+  it('ranks top models by session count across mixed-model sessions', () => {
     const now = new Date(2026, 4, 28, 12, 0);
     const summary = aggregateUsage(
       [
-        createBilledRecord('a-1', 'A1', new Date(2026, 4, 28, 8, 0), 'model-a', 100),
+        createBilledRecord('mixed', 'Mixed chat', new Date(2026, 4, 28, 10, 0), 'model-b', 300),
+        createBilledRecord('mixed', 'Mixed chat', new Date(2026, 4, 28, 8, 0), 'model-a', 100),
         createBilledRecord('a-2', 'A2', new Date(2026, 4, 28, 9, 0), 'model-a', 150),
-        createBilledRecord('b-1', 'B1', new Date(2026, 4, 28, 10, 0), 'model-b', 300),
         createBilledRecord('c-1', 'C1', new Date(2026, 4, 28, 11, 0), 'model-c', 50),
         createBilledRecord('d-1', 'D1', new Date(2026, 4, 28, 12, 0), 'model-d', 25),
       ],
@@ -342,26 +362,9 @@ describe('aggregateUsage', () => {
     );
 
     expect(summary.topModels).toEqual([
-      { model: 'model-b', sessions: 1, tokens: 300, githubCopilot: createCost(3) },
       { model: 'model-a', sessions: 2, tokens: 250, githubCopilot: createCost(2.5) },
+      { model: 'model-b', sessions: 1, tokens: 300, githubCopilot: createCost(3) },
       { model: 'model-c', sessions: 1, tokens: 50, githubCopilot: createCost(0.5) },
-    ]);
-  });
-
-  it('ranks top models from underlying records in mixed-model sessions', () => {
-    const now = new Date(2026, 4, 28, 12, 0);
-    const summary = aggregateUsage(
-      [
-        createBilledRecord('mixed', 'Mixed chat', new Date(2026, 4, 28, 8, 0), 'model-a', 100),
-        createBilledRecord('mixed', 'Mixed chat', new Date(2026, 4, 28, 9, 0), 'model-b', 200),
-        createBilledRecord('solo', 'Solo chat', new Date(2026, 4, 28, 10, 0), 'model-a', 50),
-      ],
-      now,
-    );
-
-    expect(summary.topModels).toEqual([
-      { model: 'model-b', sessions: 1, tokens: 200, githubCopilot: createCost(2) },
-      { model: 'model-a', sessions: 2, tokens: 150, githubCopilot: createCost(1.5) },
     ]);
   });
 

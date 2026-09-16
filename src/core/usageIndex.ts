@@ -1,3 +1,4 @@
+import { createHash, type Hash } from 'node:crypto';
 import { open, realpath, stat } from 'node:fs/promises';
 import { basename, dirname, extname, resolve, sep } from 'node:path';
 
@@ -11,6 +12,7 @@ import {
   type RawUsageItem,
 } from './parser';
 import {
+  createScanDiagnostics,
   isIgnoredUsageCacheFile,
   isSameOrInsidePath,
   isSupportedUsageFile,
@@ -19,16 +21,26 @@ import {
   type ScanDiagnostics,
 } from './scanner';
 import type { ExtensionConfig, UsageDiagnostics, UsageRecord, UsageServiceResult } from './types';
+import {
+  readUsageIndexCache,
+  usageIndexCacheScope,
+  writeUsageIndexCache,
+  type UsageIndexCacheScope,
+} from './usageIndexCache';
 
 export interface UsageIndexOptions {
   roots: string[];
   now?: Date;
   config: ExtensionConfig;
+  /** Saved billed chats whose title sources may outlive their debug logs. */
+  retainedChatIds?: string[];
 }
 
 export interface UsageIndexUpdateOptions {
   now?: Date;
   config: ExtensionConfig;
+  /** Omit to keep the last supplied set; pass an empty array to clear it. */
+  retainedChatIds?: string[];
 }
 
 export interface UsageIndexChangeOptions extends UsageIndexUpdateOptions {
@@ -39,6 +51,7 @@ export interface UsageIndexChangeOptions extends UsageIndexUpdateOptions {
 interface FileUsageState {
   filePath: string;
   mode: ParseUsageMode;
+  countInDiagnostics: boolean;
   records: UsageRecord[];
   parsedRecords: number;
   skippedRecords: number;
@@ -47,6 +60,8 @@ interface FileUsageState {
   mtimeMs: number;
   jsonlOffsetBytes: number;
   canAppendJsonl: boolean;
+  jsonlPrefixHash?: Hash;
+  jsonlPrefixDigest?: string;
 }
 
 const MAX_CONCURRENT_FILE_PARSES = 8;
@@ -54,18 +69,70 @@ const MAX_CONCURRENT_FILE_PARSES = 8;
 export class UsageIndex {
   private readonly files = new Map<string, FileUsageState>();
   private roots: string[] = [];
+  private retainedChatIds = new Set<string>();
   private watchFolders: string[] = [];
-  private scanDiagnostics: ScanDiagnostics = emptyScanDiagnostics();
+  private scanDiagnostics: ScanDiagnostics = createScanDiagnostics();
   private recordsCache: UsageRecord[] | undefined;
-  private recordsVersion = 0;
+  private cacheScope: UsageIndexCacheScope | undefined;
+  private revision = 0;
+  private savedRevision: number | undefined;
+  private savedDirectory: string | undefined;
   private summaryCache:
-    | { recordsVersion: number; localDateKey: string; result: UsageServiceResult }
+    | { localDateKey: string; result: UsageServiceResult }
     | undefined;
+
+  /** Restored records are provisional until poll() reconciles current files. */
+  async restore(options: UsageIndexOptions, cacheDirectory: string): Promise<UsageServiceResult | undefined> {
+    const scope = usageIndexCacheScope(options.roots, options.config);
+    const snapshot = await readUsageIndexCache(cacheDirectory, scope);
+    if (snapshot === undefined) return undefined;
+    // Ordinary paths need no I/O here. Resolve aliases before trusting a saved
+    // canonical key so a corrupt entry cannot masquerade as another file.
+    let invalidKey = false;
+    await forEachLimited(snapshot.files, MAX_CONCURRENT_FILE_PARSES, async (state) => {
+      const resolvedPath = resolve(state.filePath);
+      const lexicalKey = process.platform === 'win32' ? resolvedPath.toLowerCase() : resolvedPath;
+      if (state.key !== lexicalKey && state.key !== await fileStateKey(state.filePath)) invalidKey = true;
+    });
+    if (invalidKey) return undefined;
+    this.files.clear();
+    for (const { key, ...state } of snapshot.files) this.files.set(key, state);
+    this.roots = uniqueResolvedPaths(options.roots);
+    this.retainedChatIds = new Set(options.retainedChatIds ?? []);
+    this.watchFolders = snapshot.watchFolders;
+    this.scanDiagnostics = snapshot.diagnostics;
+    this.cacheScope = scope;
+    this.invalidateCaches();
+    this.savedRevision = this.revision;
+    this.savedDirectory = resolve(cacheDirectory);
+    this.pruneMetadataForBilledChats(this.getBilledChatIds());
+    return this.summarize(options);
+  }
+
+  /** Saves changed snapshots only. Cache errors remain separate from the usage ledger. */
+  async save(cacheDirectory: string): Promise<void> {
+    if (this.cacheScope === undefined ||
+        (this.savedRevision === this.revision && this.savedDirectory === resolve(cacheDirectory))) return;
+    const revision = this.revision;
+    await writeUsageIndexCache(cacheDirectory, this.cacheScope, {
+      files: [...this.files].map(([key, { jsonlPrefixHash, ...state }]) => ({
+        ...state,
+        key,
+        jsonlPrefixDigest: jsonlPrefixHash?.copy().digest('hex') ?? state.jsonlPrefixDigest,
+      })),
+      watchFolders: this.watchFolders,
+      diagnostics: this.scanDiagnostics,
+    });
+    this.savedRevision = revision;
+    this.savedDirectory = resolve(cacheDirectory);
+  }
 
   async rebuild(options: UsageIndexOptions): Promise<UsageServiceResult> {
     this.files.clear();
     this.invalidateCaches();
     this.roots = uniqueResolvedPaths(options.roots);
+    this.cacheScope = usageIndexCacheScope(this.roots, options.config);
+    this.retainedChatIds = new Set(options.retainedChatIds ?? []);
     const scan = await scanUsageFiles(this.roots, {
       maxFileSizeBytes: options.config.maxFileSizeMb * 1024 * 1024,
       maxDepth: options.config.maxScanDepth,
@@ -86,6 +153,7 @@ export class UsageIndex {
 
   async applyChanges(options: UsageIndexChangeOptions): Promise<UsageServiceResult> {
     const previousBilledChatIds = this.getBilledChatIds();
+    if (options.retainedChatIds !== undefined) this.retainedChatIds = new Set(options.retainedChatIds);
     for (const path of options.pathsToDelete) {
       await this.deletePathState(path);
     }
@@ -103,13 +171,44 @@ export class UsageIndex {
     return this.summarize(options);
   }
 
-  summarize(options: UsageIndexUpdateOptions): UsageServiceResult {
+  /** Reconcile disk state when writers delay filesystem notifications. */
+  async poll(options: UsageIndexUpdateOptions): Promise<UsageServiceResult> {
+    if (options.retainedChatIds !== undefined) this.retainedChatIds = new Set(options.retainedChatIds);
+    const scan = await scanUsageFiles(this.roots, {
+      maxFileSizeBytes: options.config.maxFileSizeMb * 1024 * 1024,
+      maxDepth: options.config.maxScanDepth,
+      broadRootPaths: customDataRoots(options.config),
+      includeFilesOutsideUsageFolders: false,
+    });
+    if (JSON.stringify(this.scanDiagnostics) !== JSON.stringify(scan.diagnostics) ||
+        JSON.stringify(this.watchFolders) !== JSON.stringify(scan.watchFolders)) this.revision += 1;
+    this.scanDiagnostics = scan.diagnostics;
+    this.watchFolders = scan.watchFolders;
+    const scannedFiles = new Map<string, string>();
+    await forEachLimited(scan.files, MAX_CONCURRENT_FILE_PARSES, async (file) => {
+      scannedFiles.set(await fileStateKey(file), file);
+    });
+    for (const key of this.files.keys()) {
+      if (!scannedFiles.has(key)) {
+        this.files.delete(key);
+        this.invalidateCaches();
+      }
+    }
+    const files = [...scannedFiles.values()];
+    await forEachLimited(files.filter((file) => !isMetadataPath(file)), MAX_CONCURRENT_FILE_PARSES,
+      (file) => this.updateFileState(file, options.config));
+    const billedChatIds = this.getBilledChatIds();
+    await forEachLimited(files.filter(isMetadataPath), MAX_CONCURRENT_FILE_PARSES,
+      (file) => this.updateFileState(file, options.config, billedChatIds));
+    this.pruneMetadataForBilledChats(billedChatIds);
+    this.summaryCache = undefined;
+    return this.summarize(options);
+  }
+
+  private summarize(options: UsageIndexUpdateOptions): UsageServiceResult {
     const now = options.now ?? new Date();
     const localDateKey = formatLocalDateKey(now);
-    if (
-      this.summaryCache?.recordsVersion === this.recordsVersion &&
-      this.summaryCache.localDateKey === localDateKey
-    ) {
+    if (this.summaryCache?.localDateKey === localDateKey) {
       return this.summaryCache.result;
     }
 
@@ -117,9 +216,9 @@ export class UsageIndex {
     const result = {
       summary: aggregateUsage(records, now),
       diagnostics: this.buildDiagnostics(),
+      titleMetadata: records.filter((record) => record.metadataOnly === true),
     };
     this.summaryCache = {
-      recordsVersion: this.recordsVersion,
       localDateKey,
       result,
     };
@@ -135,7 +234,7 @@ export class UsageIndex {
     return pruneNestedFolders(Array.from(folders));
   }
 
-  private async updateFileState(filePath: string, config: ExtensionConfig): Promise<void> {
+  private async updateFileState(filePath: string, config: ExtensionConfig, billedChatIds?: Set<string>): Promise<void> {
     const resolvedPath = resolve(filePath);
     const stateKey = await fileStateKey(resolvedPath);
     if (isIgnoredUsageCacheFile(resolvedPath) || !isSupportedUsageFile(resolvedPath)) {
@@ -165,8 +264,8 @@ export class UsageIndex {
 
     const extension = extname(resolvedPath).toLowerCase();
     const existing = this.files.get(stateKey);
-    const billedChatIds = this.getBilledChatIds();
-    const metadataChatId = metadataChatIdFromPath(resolvedPath, billedChatIds);
+    const metadataChatId = isMetadataPath(resolvedPath)
+      ? metadataChatIdFromPath(resolvedPath, billedChatIds ?? this.getBilledChatIds()) : undefined;
     if (isMetadataPath(resolvedPath) && metadataChatId === undefined) {
       if (this.files.delete(stateKey)) {
         this.invalidateCaches();
@@ -175,14 +274,34 @@ export class UsageIndex {
     }
 
     const mode = metadataChatId ? 'metadata' : 'billed-usage';
+    let verifiedPrefix: Hash | undefined;
+    if (
+      (extension === '.json' || existing?.canAppendJsonl === true) &&
+      existing?.mode === mode &&
+      existing.skippedMalformedFiles === 0 &&
+      fileStat.size === existing.sizeBytes &&
+      fileStat.mtimeMs === existing.mtimeMs
+    ) {
+      return;
+    }
     const sameSizeRewrite = existing !== undefined && fileStat.size === existing.sizeBytes && fileStat.mtimeMs !== existing.mtimeMs;
     if (
       extension === '.jsonl' &&
       existing?.canAppendJsonl === true &&
       existing.mode === mode &&
       fileStat.size >= existing.jsonlOffsetBytes &&
-      !sameSizeRewrite
+      !sameSizeRewrite &&
+      // A rewrite can preserve the old line boundary. Verify all previously
+      // parsed bytes before treating growth as an append.
+      (existing.jsonlPrefixHash !== undefined || existing.jsonlPrefixDigest !== undefined) &&
+      (verifiedPrefix = await hashFilePrefix(resolvedPath, existing.jsonlOffsetBytes)) !== undefined &&
+      verifiedPrefix.copy().digest('hex') ===
+        (existing.jsonlPrefixHash?.copy().digest('hex') ?? existing.jsonlPrefixDigest)
     ) {
+      // A restored cache has only the digest. The verified prefix rebuilds the
+      // incremental hash without rereading unchanged files on startup.
+      existing.jsonlPrefixHash = verifiedPrefix;
+      existing.jsonlPrefixDigest = undefined;
       await this.appendJsonlFile(resolvedPath, fileStat.size, fileStat.mtimeMs, existing);
     } else {
       await this.reparseFile(resolvedPath, { mode, keepEmpty: mode === 'metadata' });
@@ -235,6 +354,7 @@ export class UsageIndex {
     });
 
     this.watchFolders = uniqueResolvedPaths([folder, ...this.watchFolders, ...scan.watchFolders]);
+    this.revision += 1;
     const billedUsageFiles = scan.files.filter((file) => !isMetadataPath(file));
     await forEachLimited(billedUsageFiles, MAX_CONCURRENT_FILE_PARSES, (file) =>
       this.reparseFile(file, { mode: 'billed-usage', keepEmpty: false }),
@@ -249,50 +369,71 @@ export class UsageIndex {
     state: FileUsageState,
   ): Promise<void> {
     if (sizeBytes === state.jsonlOffsetBytes) {
+      if (state.sizeBytes !== sizeBytes || state.mtimeMs !== mtimeMs) this.revision += 1;
       state.sizeBytes = sizeBytes;
+      state.mtimeMs = mtimeMs;
       return;
     }
 
-    let content: string;
+    let content: Buffer;
     try {
-      content = await readUtf8Range(filePath, state.jsonlOffsetBytes, sizeBytes - state.jsonlOffsetBytes);
+      content = await readFileRange(filePath, state.jsonlOffsetBytes, sizeBytes - state.jsonlOffsetBytes);
     } catch {
       await this.reparseFile(filePath, { mode: state.mode, keepEmpty: state.mode === 'metadata' });
       return;
     }
+    // An early EOF can race with a rewrite. Keep the snapshot retryable even
+    // when the next stat reports the originally requested size and revision.
+    sizeBytes = state.jsonlOffsetBytes + content.length;
 
-    const parsed = parseCompleteJsonlLines(content, filePath);
+    const parsed = parseCompleteJsonlLines(content.toString('utf8'), filePath);
     if (parsed.consumedBytes === 0) {
+      if (state.sizeBytes !== sizeBytes || state.mtimeMs !== mtimeMs) this.revision += 1;
       state.sizeBytes = sizeBytes;
+      state.mtimeMs = mtimeMs;
       return;
     }
 
-    const normalized = normalizeItems(parsed.items, recordFilterForMode(state.mode));
+    const normalized = normalizeItems(parsed.items, state.mode, mtimeMs);
+    this.revision += 1;
     state.records.push(...normalized.records);
     state.parsedRecords += parsed.items.length;
     state.skippedRecords += parsed.malformedRecords + normalized.skippedRecords;
     state.jsonlOffsetBytes += parsed.consumedBytes;
+    state.jsonlPrefixHash?.update(content.subarray(0, parsed.consumedBytes));
     state.sizeBytes = sizeBytes;
     state.mtimeMs = mtimeMs;
-    state.canAppendJsonl = true;
-    if (parsed.items.length > 0 || parsed.malformedRecords > 0 || normalized.records.length > 0) {
+    if (parsed.items.length > 0 || parsed.malformedRecords > 0) {
       this.invalidateCaches();
     }
   }
 
   private async reparseFile(
     filePath: string,
-    options: { mode: ParseUsageMode; keepEmpty?: boolean },
+    options: { mode: ParseUsageMode; keepEmpty: boolean },
   ): Promise<void> {
     const resolvedPath = resolve(filePath);
     const stateKey = await fileStateKey(resolvedPath);
     const mode = options.mode;
-    const keepEmpty = options.keepEmpty ?? true;
+    const keepEmpty = options.keepEmpty;
+    let changed = false;
     try {
       const fileStat = await stat(resolvedPath);
       const parsed = await parseUsageFile(resolvedPath, { mode });
-      const canAppendJsonl =
-        extname(resolvedPath).toLowerCase() === '.jsonl' && (await sizeBytesEndsAtLineBoundary(resolvedPath, fileStat.size));
+      // Resume from what the read actually consumed. `fileStat.size` is sampled
+      // before the read, so Copilot appending mid-read would leave those bytes
+      // both parsed and ahead of the offset, and the next append would count
+      // them a second time.
+      let canAppendJsonl =
+        extname(resolvedPath).toLowerCase() === '.jsonl' &&
+        (await endsAtLineBoundary(resolvedPath, parsed.consumedBytes));
+      const jsonlPrefixHash = canAppendJsonl ? await hashFilePrefix(resolvedPath, parsed.consumedBytes) : undefined;
+      if (canAppendJsonl) {
+        const after = await stat(resolvedPath);
+        // Do not associate parsed records with a digest from a different
+        // revision if a writer changed the file during the initial read.
+        canAppendJsonl = jsonlPrefixHash !== undefined && after.size === fileStat.size && after.mtimeMs === fileStat.mtimeMs;
+      }
       const state = buildState(
         resolvedPath,
         mode,
@@ -301,15 +442,20 @@ export class UsageIndex {
         parsed,
         canAppendJsonl,
       );
-      if (keepEmpty || state.records.length > 0 || state.skippedRecords > 0 || state.skippedMalformedFiles > 0) {
+      state.jsonlPrefixHash = canAppendJsonl ? jsonlPrefixHash : undefined;
+      state.countInDiagnostics = keepEmpty || state.records.length > 0 || state.skippedRecords > 0 || state.skippedMalformedFiles > 0;
+      // Cache successful marker-free JSON reads too, without adding them to usage diagnostics.
+      if (state.countInDiagnostics || extname(resolvedPath).toLowerCase() === '.json') {
         this.files.set(stateKey, state);
+        changed = true;
       } else {
-        this.files.delete(stateKey);
+        changed = this.files.delete(stateKey);
       }
     } catch {
       this.files.set(stateKey, emptyMalformedState(resolvedPath, mode));
+      changed = true;
     }
-    this.invalidateCaches();
+    if (changed) this.invalidateCaches();
   }
 
   private async reparseMetadataFiles(files: string[], billedChatIds: Set<string>): Promise<void> {
@@ -336,16 +482,22 @@ export class UsageIndex {
       includeFilesOutsideUsageFolders: false,
     });
     this.watchFolders = uniqueResolvedPaths([...this.watchFolders, ...scan.watchFolders]);
+    this.revision += 1;
     await this.reparseMetadataFiles(scan.files, billedChatIds);
   }
 
   private buildDiagnostics(): UsageDiagnostics {
+    let files = 0;
     let parsedRecords = 0;
     let normalizedRecords = 0;
     let skippedMalformedFiles = 0;
     let skippedRecords = 0;
 
     for (const state of this.files.values()) {
+      if (!state.countInDiagnostics) {
+        continue;
+      }
+      files += 1;
       parsedRecords += state.parsedRecords;
       normalizedRecords += state.records.length;
       skippedMalformedFiles += state.skippedMalformedFiles;
@@ -354,7 +506,7 @@ export class UsageIndex {
 
     return {
       roots: this.roots.length,
-      files: this.files.size,
+      files,
       parsedRecords,
       normalizedRecords,
       skippedMalformedFiles,
@@ -372,13 +524,13 @@ export class UsageIndex {
   }
 
   private invalidateCaches(): void {
-    this.recordsVersion += 1;
+    this.revision += 1;
     this.recordsCache = undefined;
     this.summaryCache = undefined;
   }
 
   private getBilledChatIds(): Set<string> {
-    const chatIds = new Set<string>();
+    const chatIds = new Set(this.retainedChatIds);
     for (const state of this.files.values()) {
       for (const record of state.records) {
         if (record.metadataOnly !== true && (record.billing?.aiCredits ?? 0) > 0) {
@@ -416,32 +568,41 @@ function buildState(
   parsed: ParseUsageFileResult,
   canAppendJsonl: boolean,
 ): FileUsageState {
-  const normalized = normalizeItems(parsed.items, recordFilterForMode(mode));
-  const extension = extname(filePath).toLowerCase();
+  const normalized = normalizeItems(parsed.items, mode, mtimeMs);
 
   return {
     filePath,
     mode,
+    countInDiagnostics: true,
     records: normalized.records,
     parsedRecords: parsed.items.length,
     skippedRecords: parsed.malformedRecords + normalized.skippedRecords,
     skippedMalformedFiles: 0,
     sizeBytes,
     mtimeMs,
-    jsonlOffsetBytes: extension === '.jsonl' ? sizeBytes : 0,
+    jsonlOffsetBytes: canAppendJsonl ? parsed.consumedBytes : 0,
     canAppendJsonl,
   };
 }
 
 function normalizeItems(
   items: RawUsageItem[],
-  recordFilter: (record: UsageRecord) => boolean = () => true,
+  mode: ParseUsageMode,
+  mtimeMs: number,
 ): { records: UsageRecord[]; skippedRecords: number } {
   const records: UsageRecord[] = [];
   let skippedRecords = 0;
 
   for (const item of items) {
-    const normalizedRecords = normalizeRawUsage(item).filter(recordFilter);
+    // Keep prompts from billed logs as title candidates, but never bill title files.
+    const normalizedRecords = normalizeRawUsage(item).filter((record) =>
+      record.metadataOnly === true || (mode === 'billed-usage' && (record.billing?.aiCredits ?? 0) > 0),
+    );
+    for (const record of normalizedRecords) {
+      if (record.metadataOnly === true) {
+        record.titleModifiedAt = mtimeMs;
+      }
+    }
     skippedRecords += normalizedRecords.length === 0 ? 1 : 0;
     records.push(...normalizedRecords);
   }
@@ -453,6 +614,7 @@ function emptyMalformedState(filePath: string, mode: ParseUsageMode): FileUsageS
   return {
     filePath,
     mode,
+    countInDiagnostics: true,
     records: [],
     parsedRecords: 0,
     skippedRecords: 0,
@@ -467,18 +629,6 @@ function emptyMalformedState(filePath: string, mode: ParseUsageMode): FileUsageS
 async function fileStateKey(filePath: string): Promise<string> {
   const canonicalPath = await realpath(filePath).catch(() => resolve(filePath));
   return process.platform === 'win32' ? canonicalPath.toLowerCase() : canonicalPath;
-}
-
-function recordFilterForMode(mode: ParseUsageMode): (record: UsageRecord) => boolean {
-  if (mode === 'billed-usage') {
-    return (record) => record.metadataOnly !== true && (record.billing?.aiCredits ?? 0) > 0;
-  }
-
-  if (mode === 'metadata') {
-    return (record) => record.metadataOnly === true;
-  }
-
-  return () => false;
 }
 
 function metadataChatIdFromPath(filePath: string, billedChatIds: Set<string>): string | undefined {
@@ -518,23 +668,7 @@ function isMetadataPath(filePath: string): boolean {
 }
 
 function hasNewChatIds(previous: Set<string>, next: Set<string>): boolean {
-  for (const chatId of next) {
-    if (!previous.has(chatId)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-function emptyScanDiagnostics(): ScanDiagnostics {
-  return {
-    scannedFiles: 0,
-    skippedFolders: 0,
-    unsupportedFiles: 0,
-    oversizedFiles: 0,
-    unreadableFiles: 0,
-  };
+  return [...next].some((id) => !previous.has(id));
 }
 
 function pruneNestedFolders(paths: string[]): string[] {
@@ -573,28 +707,64 @@ async function forEachLimited<T>(items: T[], limit: number, worker: (item: T) =>
   );
 }
 
-async function sizeBytesEndsAtLineBoundary(filePath: string, sizeBytes: number): Promise<boolean> {
+/** True when byte `sizeBytes - 1` of the file as it stands now is a line ending. */
+async function endsAtLineBoundary(filePath: string, sizeBytes: number): Promise<boolean> {
   if (sizeBytes === 0) {
     return true;
   }
 
-  const file = await open(filePath, 'r');
+  let file;
+  try {
+    file = await open(filePath, 'r');
+  } catch {
+    return false;
+  }
+
   try {
     const buffer = Buffer.alloc(1);
-    await file.read(buffer, 0, 1, sizeBytes - 1);
-    return buffer[0] === 10 || buffer[0] === 13;
+    const { bytesRead } = await file.read(buffer, 0, 1, sizeBytes - 1);
+    return bytesRead === 1 && (buffer[0] === 10 || buffer[0] === 13);
+  } catch {
+    return false;
   } finally {
     await file.close();
   }
 }
 
-async function readUtf8Range(filePath: string, start: number, length: number): Promise<string> {
+async function readFileRange(filePath: string, start: number, length: number): Promise<Buffer> {
   const file = await open(filePath, 'r');
   try {
     const buffer = Buffer.alloc(length);
-    const { bytesRead } = await file.read(buffer, 0, length, start);
-    return buffer.subarray(0, bytesRead).toString('utf8');
+    let read = 0;
+    while (read < length) {
+      const { bytesRead } = await file.read(buffer, read, length - read, start + read);
+      if (bytesRead === 0) break;
+      read += bytesRead;
+    }
+    return buffer.subarray(0, read);
   } finally {
     await file.close();
+  }
+}
+
+/** Hash with bounded scratch space; unchanged polls never read the prefix. */
+async function hashFilePrefix(filePath: string, length: number): Promise<Hash | undefined> {
+  let file;
+  try {
+    file = await open(filePath, 'r');
+    const hash = createHash('sha256');
+    const buffer = Buffer.alloc(Math.min(length, 64 * 1024));
+    let offset = 0;
+    while (offset < length) {
+      const { bytesRead } = await file.read(buffer, 0, Math.min(buffer.length, length - offset), offset);
+      if (bytesRead === 0) return undefined;
+      hash.update(buffer.subarray(0, bytesRead));
+      offset += bytesRead;
+    }
+    return hash;
+  } catch {
+    return undefined;
+  } finally {
+    await file?.close();
   }
 }
