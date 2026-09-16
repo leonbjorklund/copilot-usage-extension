@@ -2,11 +2,7 @@
 
 Lightweight Copilot usage viewer for token count and AI credit cost from Copilot log files. Runs locally. Shows monthly credit use and estimated monthly pace. Requires `github.copilot.chat.agentDebugLog.fileLogging.enabled`.
 
-After updating, fully quit VS Code, including all windows, then reopen it so every window uses the updated extension and Copilot logging settings. Existing channel log-level overrides are preserved.
-
-During the repeated hour when clocks move back, Copilot's local log timestamps are ambiguous. The daily graph can undercount usage during that hour, and account matching can remain unresolved.
-
-Dollar amounts use GitHub's [Copilot usage-based billing docs](https://docs.github.com/en/copilot/concepts/billing/usage-based-billing-for-individuals): 1 AI Credit = $0.01 USD. They are not final billed cost and exclude plans, pooled credits, discounts, taxes, and adjustments.
+Dollar amounts are estimates using [GitHub's rate](https://docs.github.com/en/copilot/concepts/billing/usage-based-billing-for-individuals) of $0.01 USD per AI Credit.
 
 #### Status Bar
 
