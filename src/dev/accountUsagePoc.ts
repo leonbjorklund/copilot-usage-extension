@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFile, link, mkdir, open, readdir, readFile, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, link, mkdir, open, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 
-import { aggregateUsage } from '../core/aggregator';
+import { aggregateUsage, collectModelUsage, mergeCostEstimates, mergeUsageTotals, rankModelUsage } from '../core/aggregator';
+import type { ModelUsage } from '../core/aggregator';
 import { TITLE_PRIORITY } from '../core/types';
-import type { UsageRecord, UsageSummary } from '../core/types';
+import type { ChatUsageSummary, CopilotCostEstimate, UsageRecord, UsageSummary } from '../core/types';
 
 const MAX_FILE_BYTES = 32 * 1024 * 1024;
 const MATCH_TOLERANCE_MS = 2_000;
@@ -15,13 +16,37 @@ const MAX_JOURNALS = 256;
 const MAX_APPEND_BYTES = 256 * 1024;
 const READ_CHUNK_BYTES = 64 * 1024;
 const MAX_LINE_BYTES = 4 * 1024 * 1024;
+/**
+ * Requests older than this are frozen: their account decision is final and
+ * they are kept as per-day rollups instead of bills with request evidence.
+ * Unresolved decisions also become permanent; evidence discovered after
+ * freezing no longer changes attribution.
+ */
+const FREEZE_MS = 7 * 86_400_000;
+/** Version 1 snapshots already compacted requests after three days. */
+const LEGACY_FREEZE_MS = 3 * 86_400_000;
+/** A rolled ledger waits this long for in-flight appends before it is frozen. */
+const ROLL_SETTLE_MS = 10 * 60_000;
+/** A snapshot temp file older than this belongs to a window that died mid-write. */
+const STALE_TEMP_MS = 60 * 60_000;
+const LIVE_LEDGER = 'ledger.jsonl';
+const LEGACY_JOURNAL = /^observer-[\da-f-]+\.jsonl$/;
+const ROLLED_LEDGER = /^ledger-(\d+)-[\da-f-]+\.jsonl$/;
+const SNAPSHOT = /^snapshot-(\d+)-[\da-f-]+\.jsonl$/;
+const SNAPSHOT_TEMP = /^snapshot-(\d+)-[\da-f-]+\.tmp$/;
+const SNAPSHOT_WRITER = '00000000-0000-0000-0000-000000000000';
 
 type AuthEvent = { kind: 'login' | 'token' | 'unknown'; stream: string; at: number; account?: string };
 type Completion = { kind: 'completion'; stream: string; at: number; responseId: string };
 type RequestSummary = { kind: 'request-summary'; stream: string; at: number; id: string; model: string; durationMs: number };
 type Evidence = AuthEvent | Completion | RequestSummary;
 type Bill = { kind: 'bill'; key: string; record: UsageRecord; sessionStart?: number; titleTimestamp?: number; titleModifiedAt?: number };
-type Entry = Evidence | Bill;
+/** Frozen requests of one chat, model, local day, and decision. */
+type Rollup = { kind: 'rollup'; key: string; record: UsageRecord; day: string; requests: number; decision: Attribution;
+  frozenAt: number; titleTimestamp?: number; titleModifiedAt?: number };
+type Saved = Bill | Rollup;
+type Entry = Evidence | Saved;
+type Absorbed = { name: string; bytes: number };
 export type Attribution = { account: string } | { excluded: string } | { pending: string };
 
 export interface AccountPocView {
@@ -43,9 +68,9 @@ export function parseAccountEvidence(text: string, stream: string): Evidence[] {
     if (!Number.isFinite(at)) continue;
     const auth = /\] (Logged in as |Got Copilot token for )(\S+)/.exec(line);
     // Enterprise managed logins include an underscore before the organization suffix.
-    if (auth && /^[a-z\d](?:[a-z\d_-]*[a-z\d])?$/i.test(auth[2]) && auth[2] !== 'devDeviceId') {
+    if (auth && /^[a-z\d](?:[a-z\d_-]*[a-z\d])?$/i.test(auth[2]) && auth[2].toLowerCase() !== 'devdeviceid') {
       entries.push({ kind: auth[1].startsWith('Logged') ? 'login' : 'token', stream, at, account: auth[2].toLowerCase() });
-    } else if (/GitHub login failed|AuthenticationService: firing onDidAuthenticationChange .*Has token: false/.test(line)) {
+    } else if (auth || /GitHub login failed|AuthenticationService: firing onDidAuthenticationChange .*Has token: false|onDidCopilotTokenChange .*token lost|onDidCopilotTokenChange .*resetCopilotToken|Auth state changed \(identity change\)/.test(line)) {
       entries.push({ kind: 'unknown', stream, at });
     }
     const request = /request done: requestId: \[([^\]]+)\]/.exec(line);
@@ -71,69 +96,129 @@ export function attributeRequest(
   record: UsageRecord, sessionStart: number | undefined,
   evidence: Evidence[], now: number, peers: UsageRecord[] = [record],
 ): Attribution {
-  return attributeIndexedRequest(record, sessionStart, indexEvidence(evidence), now, peers);
+  const index = new EvidenceIndex();
+  for (const entry of evidence) index.add({ ...entry, stream: pathIdentity(entry.stream) });
+  const billed = new PeerIndex();
+  for (const peer of peers) billed.add(billKey(peer, true), peer);
+  return attributeIndexedRequest(record, sessionStart, index, now, billed);
 }
 
-interface EvidenceIndex {
-  auth: Map<string, AuthEvent[]>;
-  completions: Map<string, Completion[]>;
-  summaries: Map<string, RequestSummary[]>;
-}
+/**
+ * Evidence grouped for attribution. Entries are only ever added, so the index
+ * grows with the journal and is rebuilt only when the journal is reloaded;
+ * nothing is cached away, delayed or conflicting evidence still lands here.
+ */
+class EvidenceIndex {
+  private readonly auth = new Map<string, { events: AuthEvent[]; sorted: boolean }>();
+  private readonly completions = new Map<string, Completion[]>();
+  private readonly summaries = new Map<string, RequestSummary[]>();
 
-/** Rebuilt for each refresh so delayed or conflicting evidence is never cached away. */
-function indexEvidence(evidence: Evidence[]): EvidenceIndex {
-  const index: EvidenceIndex = { auth: new Map(), completions: new Map(), summaries: new Map() };
-  for (const original of evidence) {
-    const entry = { ...original, stream: pathIdentity(original.stream) };
+  add(entry: Evidence): void {
     if (entry.kind === 'completion') {
-      const group = index.completions.get(entry.responseId) ?? [];
-      group.push(entry);
-      index.completions.set(entry.responseId, group);
+      push(this.completions, entry.responseId, entry);
     } else if (entry.kind === 'request-summary') {
-      for (const model of new Set(entry.model.split(' -> '))) {
-        const group = index.summaries.get(model) ?? [];
-        group.push(entry);
-        index.summaries.set(model, group);
-      }
+      for (const model of new Set(entry.model.split(' -> '))) push(this.summaries, timeBucket(model, entry.at), entry);
     } else {
-      const group = index.auth.get(entry.stream) ?? [];
-      group.push(entry);
-      index.auth.set(entry.stream, group);
+      const group = this.auth.get(entry.stream);
+      if (group) {
+        group.events.push(entry);
+        group.sorted = false;
+      } else {
+        this.auth.set(entry.stream, { events: [entry], sorted: true });
+      }
     }
   }
-  for (const events of index.auth.values()) events.sort((a, b) => a.at - b.at || authOrder(a) - authOrder(b));
-  return index;
+
+  authFor(stream: string): AuthEvent[] {
+    const group = this.auth.get(stream);
+    if (!group) return [];
+    if (!group.sorted) {
+      group.events.sort((a, b) => a.at - b.at || authOrder(a) - authOrder(b));
+      group.sorted = true;
+    }
+    return group.events;
+  }
+
+  completionsFor(responseId: string): Completion[] {
+    return this.completions.get(responseId) ?? [];
+  }
+
+  /** Successful summaries for the model whose end lies within tolerance of `end`. */
+  summariesNear(model: string, end: number): RequestSummary[] {
+    return bucketsAround(end).flatMap((bucket) => this.summaries.get(`${model}\n${bucket}`) ?? []);
+  }
+}
+
+/** Billed requests by model and end time, for checking that a summary matches one request only. */
+class PeerIndex {
+  private readonly bills = new Map<string, Map<string, UsageRecord>>();
+
+  add(key: string, record: UsageRecord): void {
+    const request = record.debugRequest;
+    if (!request) return;
+    const bucket = timeBucket(record.model, record.timestamp.getTime() + request.durationMs);
+    const group = this.bills.get(bucket) ?? new Map<string, UsageRecord>();
+    group.set(key, record);
+    this.bills.set(bucket, group);
+  }
+
+  matching(summary: RequestSummary): Set<string> {
+    const keys = new Set<string>();
+    for (const model of new Set(summary.model.split(' -> '))) {
+      for (const bucket of bucketsAround(summary.at)) {
+        for (const [key, record] of this.bills.get(`${model}\n${bucket}`) ?? []) {
+          if (matchesSummary(record, summary)) keys.add(key);
+        }
+      }
+    }
+    return keys;
+  }
+}
+
+function push<T>(groups: Map<string, T[]>, key: string, value: T): void {
+  const group = groups.get(key);
+  if (group) group.push(value);
+  else groups.set(key, [value]);
+}
+
+function timeBucket(model: string, at: number): string {
+  return `${model}\n${Math.floor(at / 1000)}`;
+}
+
+function bucketsAround(at: number): number[] {
+  const first = Math.floor((at - SUMMARY_TOLERANCE_MS) / 1000);
+  const last = Math.floor((at + SUMMARY_TOLERANCE_MS) / 1000);
+  return first === last ? [first] : [first, last];
 }
 
 function attributeIndexedRequest(
   record: UsageRecord, sessionStart: number | undefined,
-  evidence: EvidenceIndex, now: number, peers: UsageRecord[],
+  evidence: EvidenceIndex, now: number, peers: PeerIndex,
 ): Attribution {
   const request = record.debugRequest;
   if (!request) return { pending: 'Request correlation fields are missing.' };
   const start = record.timestamp.getTime();
   const end = start + request.durationMs;
   if (now < end + SETTLE_MS) return { pending: 'Waiting for complete request logs.' };
-  const completions = (evidence.completions.get(request.responseId) ?? [])
+  const completions = evidence.completionsFor(request.responseId)
     .filter((entry) => Math.abs(entry.at - end) <= MATCH_TOLERANCE_MS);
   let streams = [...new Set(completions.map((entry) => entry.stream))];
   if (!streams.length) {
     // Some transports omit request-done. Their successful ccreq summary still
     // reports the measured request interval and model. Require a unique match
     // in both directions, never merely the nearest request or current account.
-    const summaries = [...new Map((evidence.summaries.get(record.model) ?? [])
+    const summaries = [...new Map(evidence.summariesNear(record.model, end)
       .filter((entry) => matchesSummary(record, entry)).map((entry) => [entryKey(entry), entry])).values()];
     if (summaries.length > 1) return { pending: 'Request matches more than one successful request summary.' };
     if (summaries.length === 1) {
-      const matchingBills = new Set(peers.filter((peer) => matchesSummary(peer, summaries[0])).map((peer) => billKey(peer, true)));
-      if (matchingBills.size !== 1) return { pending: 'Successful request summary matches more than one billed request.' };
+      if (peers.matching(summaries[0]).size !== 1) return { pending: 'Successful request summary matches more than one billed request.' };
       streams = [summaries[0].stream];
     }
   }
   if (streams.length !== 1) return { pending: streams.length === 0
     ? 'No matching window request log is available.'
     : 'Request matches more than one window.' };
-  const events = evidence.auth.get(streams[0]) ?? [];
+  const events = evidence.authFor(streams[0]);
   const account = authAt(events, start);
   if (!account) return events.some((event) => event.kind === 'token' && event.at < start)
     ? { excluded: 'Authentication changed before dispatch completed.' }
@@ -148,7 +233,8 @@ function attributeIndexedRequest(
   let lastSwitch = -Infinity;
   for (const event of events) {
     if (event.at > start) break;
-    if (previous && (event.kind === 'unknown' || event.account !== previous)) lastSwitch = event.at;
+    // A lost or reset token followed by the same account is a renewal, not a switch.
+    if (previous && event.account && event.account !== previous) lastSwitch = event.at;
     if (event.account) previous = event.account;
   }
   if (lastSwitch !== -Infinity && (sessionStart === undefined || sessionStart <= lastSwitch + MATCH_TOLERANCE_MS)) {
@@ -157,8 +243,12 @@ function attributeIndexedRequest(
   return { account };
 }
 
-function isAuth(entry: Evidence): entry is AuthEvent {
+function isAuth(entry: Entry): entry is AuthEvent {
   return entry.kind === 'login' || entry.kind === 'token' || entry.kind === 'unknown';
+}
+
+function isSaved(entry: Entry): entry is Saved {
+  return entry.kind === 'bill' || entry.kind === 'rollup';
 }
 
 function matchesSummary(record: UsageRecord, summary: RequestSummary): boolean {
@@ -181,32 +271,91 @@ function authOrder(event: AuthEvent): number {
   return event.kind === 'token' ? 0 : event.kind === 'login' ? 1 : 2;
 }
 
+function visibleTo(decision: Attribution, account: string | undefined): boolean {
+  return !account || ('account' in decision && decision.account === account);
+}
+
+/** A saved entry's record with its retained title time, as the aggregator expects it. */
+function titledRecord(entry: Saved): UsageRecord {
+  return entry.titleTimestamp === undefined ? entry.record :
+    { ...entry.record, titleTimestamp: new Date(entry.titleTimestamp), titleModifiedAt: entry.titleModifiedAt };
+}
+
+interface FileState {
+  /** Byte offset of the last complete line already loaded. */
+  loaded: number;
+  torn: number;
+  ino: number;
+  /** Earliest freezable request or evidence time loaded from this file. */
+  oldest: number;
+  lines: number;
+  expectedLines?: number;
+  /** Keys with a line in this file, while the file can still be frozen. */
+  keys?: Set<string>;
+}
+
+type FileMode = 'snapshot' | 'legacy' | 'settled' | 'growing' | 'live';
+
+interface StorageView {
+  /** Files read to their end that the next snapshot may absorb. */
+  absorbable: Absorbed[];
+  /** False when a listed file vanished mid-read; a freeze then waits for the next refresh. */
+  stable: boolean;
+  problems: string[];
+}
+
+interface FrozenAggregate {
+  revision: number;
+  account: string | undefined;
+  day: string;
+  summary: UsageSummary;
+  byChat: Map<string, UsageRecord[]>;
+  models: Map<string, ModelUsage>;
+}
+
 /**
  * Local-only ledger. Every extension process appends whole lines to one shared
- * journal, so the folder never grows with reloads and nothing is ever
- * rewritten. Older per-process observer journals are still read, never written.
- * Readers deduplicate events and requests; account decisions are recomputed so
- * delayed/conflicting evidence cannot permanently stamp a guessed account.
+ * live ledger; readers deduplicate events and requests and recompute account
+ * decisions, so delayed or conflicting evidence cannot permanently stamp a
+ * guessed account. Once the live ledger holds requests older than FREEZE_MS,
+ * a window renames it aside, waits for in-flight appends to settle, and writes
+ * a snapshot: old requests become per-day rollups with their final decision,
+ * their request evidence is dropped, auth history and younger lines are copied.
+ * Shared files change only by rename or by adding a whole file, and every
+ * window discards files the newest snapshot lists as absorbed. Older
+ * per-process observer journals are read until the first snapshot absorbs them.
  */
 export class AccountUsagePoc {
   private readonly entries = new Map<string, Entry>();
+  /** Saved entry keys by chat, for retained titles and the scanner's retained set. */
+  private readonly chats = new Map<string, Set<string>>();
+  private chatIds: string[] | undefined;
+  private readonly frozenRecords = new WeakSet<UsageRecord>();
+  private index = new EvidenceIndex();
+  private peers = new PeerIndex();
+  private readonly files = new Map<string, FileState>();
+  private snapshot: string | undefined;
+  private snapshotAt = -Infinity;
+  private absorbed = new Map<string, number>();
+  private readonly frozenKeys = new Set<string>();
+  // Snapshots written before request IDs were retained cannot identify older replays.
+  private legacyBefore = -Infinity;
+  private frozen: FrozenAggregate | undefined;
+  private revision = 0;
   private readonly offsets = new Map<string, { size: number; modified: number }>();
   private readonly sessionStarts = new Map<string, number | undefined>();
   private readonly ledger: string;
-  /** Byte offset of the last complete ledger line already loaded. */
-  private loaded = 0;
-  private tornLines = 0;
+  private cutoff = -Infinity;
   private startedAt = 0;
   private initialized = false;
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly storage: string, private readonly currentStream: string, private readonly logRoots: string[]) {
-    this.ledger = join(storage, 'ledger.jsonl');
+    this.ledger = join(storage, LIVE_LEDGER);
   }
 
   getRetainedChatIds(): string[] {
-    return [...new Set([...this.entries.values()].filter((entry): entry is Bill => entry.kind === 'bill')
-      .map((entry) => entry.record.chatId))];
+    return this.chatIds ??= [...this.chats.keys()];
   }
 
   refresh(summary: UsageSummary, now = new Date(), titleMetadata: UsageRecord[] = []): Promise<AccountPocView> {
@@ -217,18 +366,19 @@ export class AccountUsagePoc {
 
   private async refreshOnce(summary: UsageSummary, now: Date, titleMetadata: UsageRecord[]): Promise<AccountPocView> {
     await this.initialize(now.getTime());
-    await this.readJournals();
-    await this.readLedger();
+    this.cutoff = now.getTime() - FREEZE_MS;
+    const storage = await this.readStorage(now.getTime());
     const additions: Entry[] = [];
     const replaced = new Map<string, Entry | undefined>();
-    const readProblems: string[] = [];
+    const readProblems = [...storage.problems];
     const logFiles = await this.discoverLogs(readProblems);
     for (const file of logFiles) {
       try {
         const text = await this.readChanged(file);
         if (text === undefined) continue;
         for (const entry of parseAccountEvidence(text, resolve(dirname(file)))) {
-          if (isAuth(entry) || entry.at >= this.startedAt) this.add(entry, additions, replaced);
+          // Request evidence older than the freeze window can no longer resolve anything.
+          if (isAuth(entry) || (entry.at >= this.startedAt && entry.at >= this.cutoff)) this.add(entry, additions, replaced);
         }
       } catch {
         readProblems.push(`Cannot read Copilot log: ${file}`);
@@ -245,17 +395,18 @@ export class AccountUsagePoc {
     }
     // Title metadata can outlive billed debug logs. Resolve it against saved
     // requests without adding those requests to the scanner's usage totals.
-    const retainedTitles = titleMetadata.length ? aggregateUsage([
-      ...[...this.entries.values()].filter((entry): entry is Bill => entry.kind === 'bill').map((entry) =>
-        entry.titleTimestamp === undefined ? entry.record : { ...entry.record,
-          titleTimestamp: new Date(entry.titleTimestamp), titleModifiedAt: entry.titleModifiedAt }),
-      ...titleMetadata.filter((record) => record.metadataOnly === true),
+    const metadata = titleMetadata.filter((record) => record.metadataOnly === true);
+    const retainedTitles = metadata.length ? aggregateUsage([
+      ...this.savedRecords(new Set(metadata.map((record) => record.chatId))), ...metadata,
     ], now).chats : [];
     for (const chat of [...summary.chats, ...retainedTitles]) {
       for (const record of chat.records) {
-        if (record.timestamp.getTime() < this.startedAt || record.metadataOnly || record.hiddenFromExplorer || !(record.billing?.aiCredits)) continue;
-        const key = billKey(record);
+        if (this.frozenRecords.has(record) || record.timestamp.getTime() < this.startedAt || record.metadataOnly ||
+          record.hiddenFromExplorer || !(record.billing?.aiCredits)) continue;
         const previous = this.entries.get(billKey(record, true));
+        // A request this old may already be inside a rollup; only known bills keep updating.
+        if (!previous && record.timestamp.getTime() < Math.max(this.cutoff, this.legacyBefore)) continue;
+        const key = billKey(record);
         const sessionStart = previous?.kind === 'bill' ? previous.sessionStart : await this.readSessionStart(record.filePath);
         const savedRecord = { ...record, title: chat.title, titlePriority: chat.titlePriority ?? record.titlePriority };
         // The journal stores title time on the bill, never as part of request data.
@@ -264,12 +415,19 @@ export class AccountUsagePoc {
         this.add({ kind: 'bill', key, record: savedRecord, sessionStart,
           titleTimestamp: chat.titleTimestamp?.getTime(), titleModifiedAt: chat.titleModifiedAt }, additions, replaced);
       }
+      // Frozen chats keep following renames; the rollup line is rewritten like a bill.
+      for (const key of this.chats.get(chat.chatId) ?? []) {
+        const entry = this.entries.get(key);
+        if (entry?.kind !== 'rollup') continue;
+        this.add({ ...entry, record: { ...entry.record, title: chat.title, titlePriority: chat.titlePriority ?? entry.record.titlePriority },
+          titleTimestamp: chat.titleTimestamp?.getTime(), titleModifiedAt: chat.titleModifiedAt }, additions, replaced);
+      }
     }
     if (additions.length) {
       // Another window may have saved the same entries while this refresh ran.
       // Drop what it wrote identically or superseded, so a request is normally
       // stored once per machine.
-      const fresh = await this.readLedger();
+      const fresh = await this.readJournal(LIVE_LEDGER, 'live') ?? new Map<string, string>();
       const pending = additions.filter((entry) => {
         const key = entryKey(entry);
         return this.entries.get(key) === entry && fresh.get(key) !== JSON.stringify(entry);
@@ -287,16 +445,15 @@ export class AccountUsagePoc {
           if (previous) this.entries.set(key, previous);
           else this.entries.delete(key);
         }
+        // Incremental indexes must forget the same unsaved entries as the ledger.
+        const retained = [...this.entries.values()];
+        this.resetEntries();
+        for (const entry of retained) this.add(entry);
         for (const file of logFiles) this.offsets.delete(file);
         throw error;
       }
     }
-    const evidence = [...this.entries.values()].filter((entry): entry is Evidence => entry.kind !== 'bill');
-    const bills = [...this.entries.values()].filter((entry): entry is Bill => entry.kind === 'bill');
-    const peers = bills.map((entry) => entry.record);
-    const attributionIndex = indexEvidence(evidence);
-    const currentAuth = attributionIndex.auth.get(pathIdentity(this.currentStream)) ?? [];
-    const account = authAt(currentAuth, now.getTime());
+    const account = authAt(this.index.authFor(pathIdentity(this.currentStream)), now.getTime());
     // Historical usage stays in the ordinary display without entering the
     // account ledger. Only newer requests are filtered by account.
     const records: UsageRecord[] = summary.chats.flatMap((chat) => chat.records
@@ -306,25 +463,46 @@ export class AccountUsagePoc {
     let attributed = 0;
     let excluded = 0;
     let pending = 0;
+    let freezable = 0;
     const reasons = new Map<string, number>();
-    for (const entry of bills) {
-      const decision = attributeIndexedRequest(entry.record, entry.sessionStart, attributionIndex, now.getTime(), peers);
-      if (!account || ('account' in decision && decision.account === account)) {
-        records.push(entry.titleTimestamp === undefined ? entry.record :
-          { ...entry.record, titleTimestamp: new Date(entry.titleTimestamp), titleModifiedAt: entry.titleModifiedAt });
-      }
+    const decisions = new Map<string, Attribution>();
+    const count = (decision: Attribution, requests: number) => {
       if ('account' in decision) {
-        if (decision.account === account) attributed++;
+        if (decision.account === account) attributed += requests;
       } else {
         const reason = 'excluded' in decision ? decision.excluded : decision.pending;
-        if ('excluded' in decision) excluded++; else pending++;
-        reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
+        if ('excluded' in decision) excluded += requests; else pending += requests;
+        reasons.set(reason, (reasons.get(reason) ?? 0) + requests);
+      }
+    };
+    for (const [key, entry] of this.entries) {
+      if (entry.kind === 'bill') {
+        const decision = attributeIndexedRequest(entry.record, entry.sessionStart, this.index, now.getTime(), this.peers);
+        decisions.set(key, decision);
+        if (visibleTo(decision, account)) records.push(titledRecord(entry));
+        count(decision, 1);
+        if (entry.record.timestamp.getTime() < this.cutoff && !this.blocked(key)) freezable++;
+      } else if (entry.kind === 'rollup') {
+        count(entry.decision, entry.requests);
+      }
+    }
+    const young = aggregateUsage(records, now);
+    const frozen = this.frozenAggregate(account, now);
+    const merged = frozen ? mergeUsage(frozen, young, records, now) : young;
+    if (storage.stable) {
+      const live = this.files.get(LIVE_LEDGER);
+      if (live && live.oldest < this.cutoff) await this.roll(now.getTime(), readProblems);
+      // Batch bills aging out of an existing snapshot instead of rewriting it
+      // for each request that crosses the cutoff between polls.
+      if (storage.absorbable.length || (freezable && now.getTime() - this.snapshotAt >= ROLL_SETTLE_MS)) {
+        await this.freeze(now.getTime(), decisions, storage.absorbable);
       }
     }
     // Retained usage can outlive the window logs needed to identify its owner.
     // Such requests are diagnostic gaps, not active work the user can wait for.
     // Keep retrying their evidence without replacing or decorating known usage.
     const problem = readProblems[0];
+    const torn = [...this.files.values()].reduce((total, file) => total + file.torn, 0);
     const diagnostics = [
       `Account POC: ${account ?? 'unknown'}`,
       `Tracking began: ${new Date(this.startedAt).toLocaleString()}`,
@@ -333,10 +511,10 @@ export class AccountUsagePoc {
       `Excluded switch requests: ${excluded}; unresolved requests: ${pending}`,
       ...[...reasons].map(([reason, count]) => `${count}: ${reason}`),
       ...readProblems,
-      ...(this.tornLines ? [`Skipped unreadable ledger lines: ${this.tornLines}`] : []),
+      ...(torn ? [`Skipped unreadable ledger lines: ${torn}`] : []),
       `Local ledger: ${this.storage}`,
     ].join('\n');
-    return { summary: aggregateUsage(records, now), account, startedAt: new Date(this.startedAt), excluded, pending, problem, diagnostics };
+    return { summary: merged, account, startedAt: new Date(this.startedAt), excluded, pending, problem, diagnostics };
   }
 
   private async initialize(now: number): Promise<void> {
@@ -362,63 +540,132 @@ export class AccountUsagePoc {
     this.initialized = true;
   }
 
-  private add(entry: Entry, additions?: Entry[], replaced?: Map<string, Entry | undefined>): void {
-    const key = entryKey(entry);
-    const previous = this.entries.get(key);
-    if (previous) {
-      if (previous.kind !== 'bill' || entry.kind !== 'bill') return;
-      const priority = entry.record.titlePriority ?? TITLE_PRIORITY.record;
-      const previousPriority = previous.record.titlePriority ?? TITLE_PRIORITY.record;
-      const laterTitle = priority === TITLE_PRIORITY.custom && entry.titleModifiedAt !== undefined &&
-        previous.titleModifiedAt !== undefined && entry.titleModifiedAt !== previous.titleModifiedAt
-        ? entry.titleModifiedAt > previous.titleModifiedAt
-        : entry.titleTimestamp! > previous.titleTimestamp! ||
-          (entry.titleTimestamp === previous.titleTimestamp && (entry.titleModifiedAt ?? 0) > (previous.titleModifiedAt ?? 0));
-      // Older journals saved resolved labels with request-level priority. Keep
-      // descriptive labels until their source is rediscovered or a custom title
-      // replaces them, since their original priority cannot be recovered.
-      const legacyFallback = previous.titleTimestamp === undefined && previous.record.title !== previous.record.chatId &&
-        priority < TITLE_PRIORITY.custom && entry.record.title !== previous.record.title;
-      const newerTitle = !legacyFallback && entry.titleTimestamp !== undefined && (previous.titleTimestamp === undefined ||
-        priority > previousPriority || (priority === previousPriority && (priority === TITLE_PRIORITY.prompt
-          ? entry.titleTimestamp < previous.titleTimestamp : laterTitle)));
-      const sessionStart = previous.sessionStart ?? entry.sessionStart;
-      if (!newerTitle && sessionStart === previous.sessionStart) return;
-      // Copilot rewrites the chat file on every message, so title times move
-      // while the label stays. Carry them in memory only; a ledger line is
-      // worth writing for a changed label, priority, or session start.
-      const sameLabel = sessionStart === previous.sessionStart && entry.record.title === previous.record.title &&
-        priority === previousPriority;
-      entry = { ...previous, sessionStart, ...(newerTitle ? {
-        record: { ...previous.record, title: entry.record.title, titlePriority: entry.record.titlePriority },
-        titleTimestamp: entry.titleTimestamp,
-        titleModifiedAt: entry.titleModifiedAt,
-      } : {}) };
-      if (sameLabel) {
-        this.entries.set(key, entry);
-        return;
+  private savedRecords(chatIds: Set<string>): UsageRecord[] {
+    const records: UsageRecord[] = [];
+    for (const chatId of chatIds) {
+      for (const key of this.chats.get(chatId) ?? []) {
+        const entry = this.entries.get(key);
+        if (entry && isSaved(entry)) records.push(titledRecord(entry));
       }
     }
-    if (replaced && !replaced.has(key)) replaced.set(key, previous);
-    this.entries.set(key, entry);
-    additions?.push(entry);
+    return records;
   }
 
-  private async readJournals(): Promise<void> {
-    const files = (await readdir(this.storage)).filter((file) => /^observer-[\da-f-]+\.jsonl$/.test(file));
-    if (files.length > MAX_JOURNALS) throw new Error('Account POC has too many observer journals. Tracking data was left untouched.');
-    for (const name of files) {
-      const file = join(this.storage, name);
-      // Nothing writes these files any more, so a torn tail is final, not in progress.
-      const text = await this.readChanged(file, true);
-      if (text === undefined) continue;
-      try {
-        for (const line of text.split('\n').filter(Boolean)) this.add(validateEntry(JSON.parse(line)));
-      } catch (error) {
-        // Invalid journals must fail on every retry, never become cached success.
-        this.offsets.delete(file);
-        throw error;
+  private add(entry: Entry, additions?: Entry[], replaced?: Map<string, Entry | undefined>): void {
+    const key = entryKey(entry);
+    if (entry.kind === 'bill' && this.frozenKeys.has(key)) return;
+    const previous = this.entries.get(key);
+    if (previous) {
+      if (!isSaved(previous) || !isSaved(entry) || previous.kind !== entry.kind) return;
+      const merged = mergeSaved(previous, entry);
+      if (!merged) return;
+      if (merged.entry.kind === 'rollup') {
+        this.frozenRecords.add(merged.entry.record);
+        this.revision++;
       }
+      if (merged.sameLabel) {
+        this.entries.set(key, merged.entry);
+        return;
+      }
+      entry = merged.entry;
+    } else if (isSaved(entry)) {
+      const chat = this.chats.get(entry.record.chatId);
+      if (chat) chat.add(key);
+      else {
+        this.chats.set(entry.record.chatId, new Set([key]));
+        this.chatIds = undefined;
+      }
+      if (entry.kind === 'bill') this.peers.add(key, entry.record);
+      else {
+        this.frozenRecords.add(entry.record);
+        this.revision++;
+      }
+    } else {
+      this.index.add(entry);
+    }
+    // A request older than the freeze window is never appended as a bill: its
+    // lines are already on disk or it is being rolled up, and a new line would
+    // count it twice. Its title still updates in memory.
+    const persist = additions !== undefined && !(entry.kind === 'bill' && entry.record.timestamp.getTime() < this.cutoff);
+    if (persist && replaced && !replaced.has(key)) replaced.set(key, previous);
+    this.entries.set(key, entry);
+    if (persist) additions!.push(entry);
+  }
+
+  /** Whether a saved line still lives in a file the next snapshot cannot absorb. */
+  private blocked(key: string): boolean {
+    for (const state of this.files.values()) if (state.keys?.has(key)) return true;
+    return false;
+  }
+
+  private resetEntries(): void {
+    this.entries.clear();
+    this.chats.clear();
+    this.chatIds = undefined;
+    this.index = new EvidenceIndex();
+    this.peers = new PeerIndex();
+    this.frozen = undefined;
+    this.revision++;
+  }
+
+  private reset(): void {
+    this.resetEntries();
+    this.files.clear();
+    this.absorbed = new Map();
+    this.snapshotAt = -Infinity;
+    this.frozenKeys.clear();
+    this.legacyBefore = -Infinity;
+  }
+
+  /**
+   * Loads the newest snapshot, then every file it does not list as absorbed:
+   * legacy journals, rolled ledgers, and the live ledger. A newer snapshot
+   * replaces everything loaded before, so the state is rebuilt from disk.
+   */
+  private async readStorage(now: number): Promise<StorageView> {
+    const problems: string[] = [];
+    for (let attempt = 0; ; attempt++) {
+      const names = await readdir(this.storage);
+      const legacy = names.filter((name) => LEGACY_JOURNAL.test(name));
+      if (legacy.length > MAX_JOURNALS) throw new Error('Account POC has too many observer journals. Tracking data was left untouched.');
+      const snapshots = names.filter((name) => SNAPSHOT.test(name)).sort(compareSnapshots).reverse();
+      const newest = snapshots[0];
+      if (newest !== this.snapshot) {
+        this.reset();
+        this.snapshot = newest;
+      }
+      if (newest && !await this.readJournal(newest, 'snapshot')) {
+        if (attempt < 2) continue;
+        throw new Error('Account POC snapshot changed while it was being read.');
+      }
+      for (const name of names) {
+        const bytes = this.absorbed.get(name);
+        if (bytes !== undefined) await this.retire(name, bytes, problems);
+        else if ((SNAPSHOT.test(name) && name !== newest) || (SNAPSHOT_TEMP.test(name) && now - Number(SNAPSHOT_TEMP.exec(name)![1]) > STALE_TEMP_MS)) {
+          await unlink(join(this.storage, name)).catch((error: NodeJS.ErrnoException) => {
+            if (error.code !== 'ENOENT') problems.push(`Cannot remove superseded account snapshot: ${name}`);
+          });
+        }
+      }
+      let stable = true;
+      const absorbable: Absorbed[] = [];
+      for (const name of legacy) {
+        if (this.absorbed.has(name)) continue;
+        if (await this.readJournal(name, 'legacy')) absorbable.push({ name, bytes: this.files.get(name)!.loaded });
+        else stable = false;
+      }
+      const rolled = names.filter((name) => ROLLED_LEDGER.test(name) && !this.absorbed.has(name))
+        .sort((a, b) => rolledAt(a) - rolledAt(b));
+      // A rolled ledger this window has not seen means another window replaced
+      // the live ledger; reread the new one from its start whatever its file id.
+      if (rolled.some((name) => !this.files.has(name))) this.files.delete(LIVE_LEDGER);
+      for (const name of rolled) {
+        const settled = now - rolledAt(name) >= ROLL_SETTLE_MS;
+        if (!await this.readJournal(name, settled ? 'settled' : 'growing')) stable = false;
+        else if (settled) absorbable.push({ name, bytes: this.files.get(name)!.loaded });
+      }
+      await this.readJournal(LIVE_LEDGER, 'live');
+      return { absorbable, stable, problems };
     }
   }
 
@@ -426,28 +673,36 @@ export class AccountUsagePoc {
    * Resumes after the last complete line. A line that is not JSON is a torn
    * write from a window that failed mid-append; it is skipped and counted, never
    * repaired. A parsed entry that fails validation still fails every refresh.
-   * Returns the lines loaded by this call, by entry key.
+   * Returns the lines loaded by this call, by entry key, or undefined when the
+   * file no longer exists.
    */
-  private async readLedger(): Promise<Map<string, string>> {
+  private async readJournal(name: string, mode: FileMode): Promise<Map<string, string> | undefined> {
     const fresh = new Map<string, string>();
     let handle;
     try {
-      handle = await open(this.ledger, 'r');
+      handle = await open(join(this.storage, name), 'r');
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return fresh;
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
       throw error;
     }
     try {
-      const size = (await handle.stat()).size;
-      if (size < this.loaded) {
-        this.loaded = 0;
-        this.tornLines = 0;
+      const info = await handle.stat();
+      let state = this.files.get(name);
+      // A different file under the live name means the ledger was rolled.
+      if (!state || state.ino !== info.ino || info.size < state.loaded) {
+        state = { loaded: 0, torn: 0, ino: info.ino, oldest: Infinity, lines: 0,
+          keys: mode === 'live' || mode === 'growing' ? new Set() : undefined };
+        this.files.set(name, state);
+      } else if (mode === 'settled') {
+        // Settled files are absorbed by the next snapshot, so their lines no longer block freezing.
+        state.keys = undefined;
       }
       const chunk = Buffer.alloc(READ_CHUNK_BYTES);
       let pending = Buffer.alloc(0);
-      let position = this.loaded;
-      while (position < size) {
-        const { bytesRead } = await handle.read(chunk, 0, Math.min(chunk.length, size - position), position);
+      let position = state.loaded;
+      let first = state.loaded === 0;
+      while (position < info.size) {
+        const { bytesRead } = await handle.read(chunk, 0, Math.min(chunk.length, info.size - position), position);
         if (bytesRead === 0) break;
         position += bytesRead;
         pending = Buffer.concat([pending, chunk.subarray(0, bytesRead)]);
@@ -456,7 +711,8 @@ export class AccountUsagePoc {
           // A line this long cannot be an entry. Drop its bytes; whatever
           // remains before its newline is counted when it fails to parse.
           if (pending.length > MAX_LINE_BYTES) {
-            this.loaded = position;
+            if (mode === 'snapshot') throw new Error('Invalid account POC snapshot. Tracking data was left untouched.');
+            state.loaded = position;
             pending = Buffer.alloc(0);
           }
           continue;
@@ -465,21 +721,203 @@ export class AccountUsagePoc {
           if (!line) continue;
           let parsed;
           try { parsed = JSON.parse(line); }
-          catch { this.tornLines++; continue; }
+          catch {
+            if (mode === 'snapshot') throw new Error('Invalid account POC snapshot. Tracking data was left untouched.');
+            if (mode === 'legacy') throw new Error('Invalid account POC evidence journal. Tracking data was left untouched.');
+            state.torn++;
+            continue;
+          }
+          if (parsed?.kind === 'snapshot') {
+            if (mode !== 'snapshot' || !first) throw new Error('Invalid account POC snapshot. Tracking data was left untouched.');
+            const header = validateSnapshot(parsed);
+            this.snapshotAt = header.at;
+            this.absorbed = new Map(header.absorbed.map((file) => [file.name, file.bytes]));
+            state.expectedLines = header.lines;
+            this.legacyBefore = header.version === 1 ? header.at - LEGACY_FREEZE_MS : header.legacyBefore ?? -Infinity;
+            first = false;
+            continue;
+          }
+          if (mode === 'snapshot' && first) throw new Error('Invalid account POC snapshot. Tracking data was left untouched.');
+          state.lines++;
+          if (parsed?.kind === 'frozen-keys') {
+            if (mode !== 'snapshot' || !Array.isArray(parsed.keys) ||
+              parsed.keys.some((key: unknown) => typeof key !== 'string' || !/^[a-f\d]{64}$/.test(key))) {
+              throw new Error('Invalid account POC snapshot. Tracking data was left untouched.');
+            }
+            for (const key of parsed.keys) this.frozenKeys.add(key);
+            continue;
+          }
           const entry = validateEntry(parsed);
-          fresh.set(entryKey(entry), line);
+          const key = entryKey(entry);
+          if (entry.kind === 'bill' && mode !== 'snapshot' && !this.entries.has(key) &&
+            entry.record.timestamp.getTime() < this.legacyBefore) continue;
+          state.keys?.add(key);
+          if (entry.kind === 'bill') state.oldest = Math.min(state.oldest, entry.record.timestamp.getTime());
+          else if (entry.kind === 'completion' || entry.kind === 'request-summary') state.oldest = Math.min(state.oldest, entry.at);
+          fresh.set(key, line);
           this.add(entry);
         }
-        this.loaded += complete;
+        state.loaded += complete;
         pending = Buffer.from(pending.subarray(complete));
       }
+      // Snapshots are published as complete immutable files. A missing header
+      // or unfinished line must not authorize retiring their source journals.
+      if (mode === 'snapshot' && (first || pending.length > 0 || position < info.size ||
+        (state.expectedLines !== undefined && state.lines !== state.expectedLines))) {
+        throw new Error('Invalid account POC snapshot. Tracking data was left untouched.');
+      }
+      // A trailing fragment in a legacy journal or settled rolled ledger is
+      // final: count it once instead of rereading it.
+      if (mode !== 'live' && mode !== 'growing' && state.loaded < info.size) {
+        if (pending.length) state.torn++;
+        state.loaded = info.size;
+      }
+    } catch (error) {
+      // A snapshot authorizes retiring source journals only after every byte
+      // validates. Discard partial entries and offsets so every retry starts
+      // with its header, including files containing only blank lines.
+      if (mode === 'snapshot') this.reset();
+      throw error;
     } finally {
       await handle.close();
     }
     return fresh;
   }
 
-  private async readChanged(file: string, settled = false): Promise<string | undefined> {
+  /**
+   * Removes a file the loaded snapshot absorbed. Whole lines appended after the
+   * snapshot read it, by a window whose append was already in flight when the
+   * ledger was rolled, are moved to the live ledger first.
+   */
+  private async retire(name: string, bytes: number, problems: string[]): Promise<void> {
+    const path = join(this.storage, name);
+    try {
+      const handle = await open(path, 'r');
+      try {
+        const size = (await handle.stat()).size;
+        if (size > bytes) {
+          const tail = Buffer.alloc(size - bytes);
+          let read = 0;
+          while (read < tail.length) {
+            const { bytesRead } = await handle.read(tail, read, tail.length - read, bytes + read);
+            if (bytesRead === 0) break;
+            read += bytesRead;
+          }
+          const lines = tail.toString('utf8', 0, read).split('\n');
+          lines.pop();
+          const late = lines.filter((line) => {
+            if (!line) return false;
+            try { JSON.parse(line); return true; }
+            catch { return false; }
+          });
+          if (late.length) await appendLines(this.ledger, late);
+        }
+      } finally {
+        await handle.close();
+      }
+      await unlink(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') problems.push(`Cannot remove absorbed ledger file: ${name}`);
+    }
+  }
+
+  /** Moves the live ledger aside so its old requests can be frozen once appends settle. */
+  private async roll(now: number, problems: string[]): Promise<void> {
+    const name = `ledger-${now}-${randomUUID()}.jsonl`;
+    try {
+      await rename(this.ledger, join(this.storage, name));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') problems.push(`Cannot roll the account ledger: ${name}`);
+      return;
+    }
+    const state = this.files.get(LIVE_LEDGER);
+    if (state) {
+      this.files.set(name, state);
+      this.files.delete(LIVE_LEDGER);
+    }
+  }
+
+  /**
+   * Writes the next snapshot from memory: rollups for every request older than
+   * the freeze window whose lines are all in absorbable files, auth history,
+   * and every younger line. Published by exclusive hard link after fsync;
+   * readers rebuild from it and retire the files it absorbed.
+   */
+  private async freeze(now: number, decisions: Map<string, Attribution>, absorbable: Absorbed[]): Promise<void> {
+    // Another window may have published meanwhile; its snapshot supersedes this state.
+    const names = await readdir(this.storage);
+    if (names.filter((name) => SNAPSHOT.test(name)).sort(compareSnapshots).reverse()[0] !== this.snapshot) return;
+    const rollups = new Map<string, Rollup>();
+    const frozenKeys = new Set(this.frozenKeys);
+    const lines: string[] = [];
+    for (const [key, entry] of this.entries) {
+      if (entry.kind === 'rollup') {
+        rollups.set(key, entry);
+      } else if (entry.kind === 'bill') {
+        if (entry.record.timestamp.getTime() < this.cutoff && !this.blocked(key)) {
+          fold(rollups, entry, decisions.get(key) ?? { pending: 'Frozen before its request logs were read.' }, now);
+          frozenKeys.add(key);
+        } else {
+          lines.push(JSON.stringify(entry));
+        }
+      } else if (isAuth(entry) || entry.at >= this.cutoff || this.blocked(key)) {
+        lines.push(JSON.stringify(entry));
+      }
+    }
+    const carried = [...this.absorbed].filter(([name]) => names.includes(name)).map(([name, bytes]) => ({ name, bytes }));
+    const keyLines: string[] = [];
+    let keys: string[] = [];
+    for (const key of frozenKeys) {
+      keys.push(key);
+      if (keys.length === 1_024) {
+        keyLines.push(JSON.stringify({ kind: 'frozen-keys', keys }));
+        keys = [];
+      }
+    }
+    if (keys.length) keyLines.push(JSON.stringify({ kind: 'frozen-keys', keys }));
+    const body = [...keyLines, ...[...rollups.values()].map((entry) => JSON.stringify(entry)), ...lines];
+    const header: SnapshotHeader = { kind: 'snapshot', version: 2, at: now, absorbed: [...carried, ...absorbable],
+      lines: body.length, ...(Number.isFinite(this.legacyBefore) ? { legacyBefore: this.legacyBefore } : {}) };
+    const text = [JSON.stringify(header), ...body].join('\n') + '\n';
+    const id = `${now}-${randomUUID()}`;
+    const temp = join(this.storage, `snapshot-${id}.tmp`);
+    // Every writer based on the same snapshot competes for the same successor.
+    // A stale publisher can never replace it, even if its clock or UUID sorts later.
+    const generation = this.snapshot ? Number(SNAPSHOT.exec(this.snapshot)![1]) + 1 : 1;
+    const target = join(this.storage, `snapshot-${generation}-${SNAPSHOT_WRITER}.jsonl`);
+    try {
+      const handle = await open(temp, 'wx');
+      try {
+        await handle.writeFile(text, 'utf8');
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      try { await link(temp, target); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+    } finally {
+      await unlink(temp).catch(() => undefined);
+    }
+  }
+
+  private frozenAggregate(account: string | undefined, now: Date): FrozenAggregate | undefined {
+    const day = localDayKey(now.getTime());
+    if (this.frozen && this.frozen.revision === this.revision && this.frozen.account === account && this.frozen.day === day) {
+      return this.frozen.byChat.size ? this.frozen : undefined;
+    }
+    const records: UsageRecord[] = [];
+    const byChat = new Map<string, UsageRecord[]>();
+    for (const entry of this.entries.values()) {
+      if (entry.kind !== 'rollup' || !visibleTo(entry.decision, account)) continue;
+      const record = titledRecord(entry);
+      records.push(record);
+      push(byChat, record.chatId, record);
+    }
+    this.frozen = { revision: this.revision, account, day, summary: aggregateUsage(records, now), byChat, models: collectModelUsage(records) };
+    return byChat.size ? this.frozen : undefined;
+  }
+
+  private async readChanged(file: string): Promise<string | undefined> {
     const handle = await open(file, 'r');
     try {
       const info = await handle.stat();
@@ -496,7 +934,7 @@ export class AccountUsagePoc {
       // Read only the checked descriptor size, even if its contents grow.
       // Event keys deduplicate replay and tolerate delayed writes.
       const complete = buffer.subarray(0, read).lastIndexOf(10) + 1;
-      if (complete === info.size || (settled && read === info.size)) {
+      if (complete === info.size) {
         this.offsets.set(file, { size: info.size, modified: info.mtimeMs });
       } else {
         // A complete last line does not prove the read reached the stat's size.
@@ -573,11 +1011,155 @@ export class AccountUsagePoc {
   }
 }
 
+/**
+ * Applies a later saved line to the entry in memory. Copilot rewrites the chat
+ * file on every message, so title times move while the label stays. Those move
+ * in memory only; a ledger line is worth writing for a changed label, priority,
+ * or session start. Returns undefined when nothing changed.
+ */
+function mergeSaved(previous: Saved, entry: Saved): { entry: Saved; sameLabel: boolean } | undefined {
+  const priority = entry.record.titlePriority ?? TITLE_PRIORITY.record;
+  const previousPriority = previous.record.titlePriority ?? TITLE_PRIORITY.record;
+  const newerTitle = hasNewerTitle(previous, entry);
+  let merged: Saved = previous;
+  let sessionChanged = false;
+  let newerTotals = false;
+  if (previous.kind === 'bill' && entry.kind === 'bill') {
+    const sessionStart = previous.sessionStart ?? entry.sessionStart;
+    sessionChanged = sessionStart !== previous.sessionStart;
+    merged = { ...previous, sessionStart };
+  } else if (previous.kind === 'rollup' && entry.kind === 'rollup' && entry.frozenAt > previous.frozenAt) {
+    // A rollup from a later snapshot carries more requests under the same key.
+    newerTotals = true;
+    merged = { ...previous, requests: entry.requests, frozenAt: entry.frozenAt, record: { ...previous.record,
+      tokens: entry.record.tokens, billing: entry.record.billing, timestamp: entry.record.timestamp, filePath: entry.record.filePath } };
+  }
+  if (!newerTitle && !sessionChanged && !newerTotals) return undefined;
+  const sameLabel = !sessionChanged && entry.record.title === previous.record.title && priority === previousPriority;
+  if (newerTitle) {
+    merged = { ...merged, record: { ...merged.record, title: entry.record.title, titlePriority: entry.record.titlePriority },
+      titleTimestamp: entry.titleTimestamp, titleModifiedAt: entry.titleModifiedAt };
+  }
+  return { entry: merged, sameLabel };
+}
+
+function hasNewerTitle(previous: Saved, entry: Saved): boolean {
+  const priority = entry.record.titlePriority ?? TITLE_PRIORITY.record;
+  const previousPriority = previous.record.titlePriority ?? TITLE_PRIORITY.record;
+  const laterTitle = priority === TITLE_PRIORITY.custom && entry.titleModifiedAt !== undefined &&
+    previous.titleModifiedAt !== undefined && entry.titleModifiedAt !== previous.titleModifiedAt
+    ? entry.titleModifiedAt > previous.titleModifiedAt
+    : entry.titleTimestamp! > previous.titleTimestamp! ||
+      (entry.titleTimestamp === previous.titleTimestamp && (entry.titleModifiedAt ?? 0) > (previous.titleModifiedAt ?? 0));
+  // Older journals saved resolved labels with request-level priority. Keep
+  // descriptive labels until their source is rediscovered or a custom title
+  // replaces them, since their original priority cannot be recovered.
+  const legacyFallback = previous.titleTimestamp === undefined && previous.record.title !== previous.record.chatId &&
+    priority < TITLE_PRIORITY.custom && entry.record.title !== previous.record.title;
+  return !legacyFallback && entry.titleTimestamp !== undefined && (previous.titleTimestamp === undefined ||
+    priority > previousPriority || (priority === previousPriority && (priority === TITLE_PRIORITY.prompt
+      ? entry.titleTimestamp < previous.titleTimestamp : laterTitle)));
+}
+
+/** Adds a frozen bill to the rollup for its chat, model, local day, and decision. */
+function fold(rollups: Map<string, Rollup>, bill: Bill, decision: Attribution, frozenAt: number): void {
+  const record = bill.record;
+  const day = localDayKey(record.timestamp.getTime());
+  const key = rollupKey(record.chatId, record.model, day, record.tokens.source, decision);
+  const previous = rollups.get(key);
+  if (!previous) {
+    rollups.set(key, { kind: 'rollup', key, day, requests: 1, decision, frozenAt,
+      record: { chatId: record.chatId, title: record.title, titlePriority: record.titlePriority, timestamp: record.timestamp,
+        model: record.model, tokens: { ...record.tokens }, billing: { aiCredits: record.billing!.aiCredits, source: 'copilot-debug-log' },
+        filePath: record.filePath },
+      titleTimestamp: bill.titleTimestamp, titleModifiedAt: bill.titleModifiedAt });
+    return;
+  }
+  const later = record.timestamp > previous.record.timestamp;
+  const tokens = previous.record.tokens;
+  const merged: Rollup = { ...previous, requests: previous.requests + 1, record: { ...previous.record,
+    timestamp: later ? record.timestamp : previous.record.timestamp,
+    filePath: later ? record.filePath : previous.record.filePath,
+    tokens: { input: tokens.input + record.tokens.input, cachedInput: tokens.cachedInput + record.tokens.cachedInput,
+      output: tokens.output + record.tokens.output, cacheWriteInput: tokens.cacheWriteInput + record.tokens.cacheWriteInput,
+      total: tokens.total + record.tokens.total, source: tokens.source },
+    billing: { aiCredits: previous.record.billing!.aiCredits + record.billing!.aiCredits, source: 'copilot-debug-log' } } };
+  rollups.set(key, hasNewerTitle(previous, bill) ? { ...merged, titleTimestamp: bill.titleTimestamp, titleModifiedAt: bill.titleModifiedAt,
+    record: { ...merged.record, title: record.title, titlePriority: record.titlePriority } } : merged);
+}
+
+/**
+ * Combines the cached aggregate of frozen usage with this refresh's aggregate
+ * of younger records, giving the same result as aggregating them together.
+ * Frozen records are days old, so only chats, models, and period totals meet.
+ */
+function mergeUsage(frozen: FrozenAggregate, young: UsageSummary, youngRecords: UsageRecord[], now: Date): UsageSummary {
+  const overlap = new Map<string, ChatUsageSummary>();
+  const youngChats = young.chats.map((chat) => {
+    const frozenRecords = frozen.byChat.get(chat.chatId);
+    if (!frozenRecords) return chat;
+    const merged = aggregateUsage([...frozenRecords, ...chat.records], now).chats[0];
+    overlap.set(chat.chatId, merged);
+    return merged;
+  }).sort((left, right) => right.timestamp.getTime() - left.timestamp.getTime());
+  const frozenChats = overlap.size ? frozen.summary.chats.filter((chat) => !overlap.has(chat.chatId)) : frozen.summary.chats;
+  const chats: ChatUsageSummary[] = [];
+  for (let f = 0, y = 0; f < frozenChats.length || y < youngChats.length;) {
+    if (y >= youngChats.length || (f < frozenChats.length && frozenChats[f].timestamp >= youngChats[y].timestamp)) chats.push(frozenChats[f++]);
+    else chats.push(youngChats[y++]);
+  }
+  const youngModels = collectModelUsage(youngRecords);
+  const models: [string, { sessions: number; tokens: number; githubCopilot: CopilotCostEstimate }][] = [];
+  for (const [model, usage] of frozen.models) {
+    const extra = youngModels.get(model);
+    models.push([model, {
+      sessions: usage.chatIds.size + (extra ? [...extra.chatIds].filter((chatId) => !usage.chatIds.has(chatId)).length : 0),
+      tokens: usage.tokens + (extra?.tokens ?? 0),
+      githubCopilot: extra ? mergeCostEstimates(usage.githubCopilot, extra.githubCopilot) : usage.githubCopilot,
+    }]);
+  }
+  for (const [model, usage] of youngModels) {
+    if (!frozen.models.has(model)) models.push([model, { sessions: usage.chatIds.size, tokens: usage.tokens, githubCopilot: usage.githubCopilot }]);
+  }
+  const retitle = (chat: ChatUsageSummary | undefined) => {
+    const merged = chat && overlap.get(chat.chatId);
+    return merged ? { ...chat, title: merged.title, titlePriority: merged.titlePriority,
+      titleTimestamp: merged.titleTimestamp, titleModifiedAt: merged.titleModifiedAt } : chat;
+  };
+  return {
+    today: mergeUsageTotals(frozen.summary.today, young.today),
+    week: mergeUsageTotals(frozen.summary.week, young.week),
+    month: mergeUsageTotals(frozen.summary.month, young.month),
+    allTime: mergeUsageTotals(frozen.summary.allTime, young.allTime),
+    chats,
+    topModels: rankModelUsage(models),
+    highestSessionToday: retitle(young.highestSessionToday),
+    mostExpensiveSessionToday: retitle(young.mostExpensiveSessionToday),
+  };
+}
+
+type SnapshotHeader = { kind: 'snapshot'; version: 1 | 2; at: number; absorbed: Absorbed[]; lines?: number; legacyBefore?: number };
+
+function validateSnapshot(header: SnapshotHeader): SnapshotHeader {
+  if (![1, 2].includes(header.version) || !Number.isFinite(header.at) || !Array.isArray(header.absorbed) ||
+    header.absorbed.some((file) => typeof file?.name !== 'string' ||
+      (!ROLLED_LEDGER.test(file.name) && !LEGACY_JOURNAL.test(file.name)) || !Number.isSafeInteger(file.bytes) || file.bytes < 0) ||
+    new Set(header.absorbed.map((file) => file.name)).size !== header.absorbed.length ||
+    (header.version === 2 && (!Number.isSafeInteger(header.lines) || header.lines! < 0)) ||
+    (header.legacyBefore !== undefined && !Number.isFinite(header.legacyBefore))) {
+    throw new Error('Invalid account POC snapshot. Tracking data was left untouched.');
+  }
+  return header;
+}
+
 function validateEntry(entry: Entry): Entry {
   if (typeof entry !== 'object' || entry === null) throw new Error('Invalid account POC evidence journal. Tracking data was left untouched.');
-  if (entry.kind === 'bill') {
+  if (entry.kind === 'bill' || entry.kind === 'rollup') {
+    if (typeof entry.record !== 'object' || entry.record === null) throw new Error('Invalid account POC request journal. Tracking data was left untouched.');
     entry.record.timestamp = new Date(entry.record.timestamp);
-    if (!Number.isFinite(entry.record.timestamp.getTime()) || entry.key !== billKey(entry.record) ||
+    const expectedKey = entry.kind === 'bill' ? billKey(entry.record) : validRollup(entry)
+      ? rollupKey(entry.record.chatId, entry.record.model, entry.day, entry.record.tokens.source, entry.decision) : undefined;
+    if (!Number.isFinite(entry.record.timestamp.getTime()) || entry.key !== expectedKey ||
       typeof entry.record.billing?.aiCredits !== 'number' || !Number.isFinite(entry.record.billing.aiCredits) || entry.record.billing.aiCredits <= 0) {
       throw new Error('Invalid account POC request journal. Tracking data was left untouched.');
     }
@@ -587,8 +1169,23 @@ function validateEntry(entry: Entry): Entry {
     }
   } else if (!['login', 'token', 'unknown', 'completion', 'request-summary'].includes(entry.kind) || !Number.isFinite(entry.at) || typeof entry.stream !== 'string') {
     throw new Error('Invalid account POC evidence journal. Tracking data was left untouched.');
+  } else {
+    entry.stream = pathIdentity(entry.stream);
   }
   return entry;
+}
+
+function validRollup(entry: Rollup): boolean {
+  const record = entry.record;
+  const decision = entry.decision;
+  const tokens = record.tokens;
+  return typeof record.chatId === 'string' && typeof record.model === 'string' && typeof entry.day === 'string' &&
+    Number.isInteger(entry.requests) && entry.requests > 0 && Number.isFinite(entry.frozenAt) &&
+    typeof tokens === 'object' && tokens !== null && ['recorded', 'missing'].includes(tokens.source) &&
+    [tokens.input, tokens.cachedInput, tokens.output, tokens.cacheWriteInput, tokens.total].every(Number.isFinite) &&
+    typeof decision === 'object' && decision !== null && Object.keys(decision).length === 1 &&
+    ('account' in decision ? typeof decision.account === 'string' : 'excluded' in decision ? typeof decision.excluded === 'string' :
+      'pending' in decision && typeof decision.pending === 'string');
 }
 
 /**
@@ -603,14 +1200,35 @@ async function appendLines(file: string, lines: string[]): Promise<void> {
   for (const line of lines) {
     const size = Buffer.byteLength(line) + 1;
     if (bytes && bytes + size > MAX_APPEND_BYTES) {
-      await appendFile(file, `\n${group}`, 'utf8');
+      await appendLiveBatch(file, `\n${group}`);
       group = '';
       bytes = 0;
     }
     group += `${line}\n`;
     bytes += size;
   }
-  if (bytes) await appendFile(file, `\n${group}`, 'utf8');
+  if (bytes) await appendLiveBatch(file, `\n${group}`);
+}
+
+/** A rolled file may be retired while a slow appender still holds it open. */
+async function appendLiveBatch(file: string, batch: string): Promise<void> {
+  for (;;) {
+    // Pin the original inode until the check, so a replacement cannot reuse it.
+    const pinned = await open(file, 'a');
+    try {
+      const before = await pinned.stat({ bigint: true });
+      await appendFile(file, batch, 'utf8');
+      try {
+        const after = await stat(file, { bigint: true });
+        if (after.ino === before.ino) return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      // Replaying a whole batch is safe: readers deduplicate saved entry keys.
+    } finally {
+      await pinned.close();
+    }
+  }
 }
 
 function billKey(record: UsageRecord, canonical = false): string {
@@ -620,7 +1238,27 @@ function billKey(record: UsageRecord, canonical = false): string {
   ])).digest('hex');
 }
 
+function rollupKey(chatId: string, model: string, day: string, source: string, decision: Attribution): string {
+  const [state, value] = Object.entries(decision)[0];
+  return createHash('sha256').update(JSON.stringify(['rollup', chatId, model, day, source, state, value])).digest('hex');
+}
+
 function entryKey(entry: Entry): string {
   // Keep validating the original saved key, but collapse path aliases in memory.
-  return entry.kind === 'bill' ? billKey(entry.record, true) : JSON.stringify({ ...entry, stream: pathIdentity(entry.stream) });
+  if (entry.kind === 'bill') return billKey(entry.record, true);
+  if (entry.kind === 'rollup') return entry.key;
+  return JSON.stringify({ ...entry, stream: pathIdentity(entry.stream) });
+}
+
+function localDayKey(at: number): string {
+  const date = new Date(at);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function rolledAt(name: string): number {
+  return Number(ROLLED_LEDGER.exec(name)![1]);
+}
+
+function compareSnapshots(left: string, right: string): number {
+  return Number(SNAPSHOT.exec(left)![1]) - Number(SNAPSHOT.exec(right)![1]) || left.localeCompare(right);
 }

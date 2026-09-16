@@ -1483,6 +1483,80 @@ describe("activate", () => {
     expect(vscode.authentication.getSession).not.toHaveBeenCalled();
   });
 
+  it.each(['fresh install', 'previous release upgrade'])('initializes %s without assigning old usage or inventing daily history', async (scenario) => {
+    vi.useFakeTimers();
+    const start = new Date(2026, 8, 21, 12);
+    vi.setSystemTime(start);
+    const root = await mkdtemp(join(tmpdir(), 'copilot-release-upgrade-'));
+    roots.push(root);
+    vi.mocked(homedir).mockReturnValue(root);
+    vi.stubEnv('APPDATA', join(root, 'roaming'));
+    const host = join(root, 'logs', '20260921T120000', 'window1', 'exthost');
+    const logFolder = join(host, 'GitHub.copilot-chat');
+    const log = join(logFolder, 'GitHub Copilot Chat.log');
+    const dataRoot = join(root, 'usage');
+    const storage = join(root, 'storage');
+    await mkdir(logFolder, { recursive: true });
+    await mkdir(dataRoot);
+    await writeFile(log, '2026-09-21 11:59:00.000 [info] Got Copilot token for alice\n');
+    // The previous release persisted only sorting; its billed requests remained in Copilot's logs.
+    const oldLog = join(dataRoot, 'debug-logs', 'old-chat', 'main.jsonl');
+    const oldContents = JSON.stringify({ type: 'llm_request', ts: start.getTime() - 60_000,
+      spanId: 'old-span', attrs: { model: 'model', responseId: 'old-request',
+        inputTokens: 800, outputTokens: 200, copilotUsageNanoAiu: 20_000_000_000 } }) + '\n';
+    if (scenario === 'previous release upgrade') {
+      await mkdir(join(dataRoot, 'debug-logs', 'old-chat'), { recursive: true });
+      await writeFile(oldLog, oldContents);
+      await mkdir(storage);
+    }
+    const realIndex = await vi.importActual<typeof import('../src/core/usageIndex')>('../src/core/usageIndex');
+    const { UsageIndex } = await import('../src/core/usageIndex');
+    vi.mocked(UsageIndex).mockImplementationOnce(function () { return new realIndex.UsageIndex(); });
+    locateCopilotDataPaths.mockResolvedValue([dataRoot]);
+    const context = { ...createContext(scenario === 'previous release upgrade' ? 'cost' : undefined),
+      extensionMode: vscode.ExtensionMode.Production,
+      logUri: vscode.Uri.file(join(host, 'leonbjorklund.copilot-usage-extension')),
+      globalStorageUri: vscode.Uri.file(storage) };
+    activatedContexts.push(context);
+    activate(context);
+    const status = vi.mocked(vscode.window.createStatusBarItem).mock.results[0].value;
+    const expected = scenario === 'previous release upgrade' ? '1k | 0.2$' : 'No sessions today';
+    await vi.waitFor(() => expect(status.text).toBe(expected));
+    expect(status.tooltip.value).not.toContain('monthly pace');
+    expect(status.tooltip.value).not.toMatch(/title="[^\"]* · [\d<]/);
+    const started = await readFile(join(storage, 'account-poc', 'start.json'), 'utf8');
+    expect(JSON.parse(started).startedAt).toBeGreaterThanOrEqual(start.getTime());
+    expect(JSON.parse(started).startedAt).toBeLessThanOrEqual(Date.now());
+    const snapshot = (time: string, remaining: number) => `2026-09-21 ${time} [trace] [ChatQuota] processUserInfoQuotaSnapshot: `
+      + JSON.stringify({ quota: 1500, unlimited: false, hasQuota: true, percentRemaining: remaining,
+        resetDate: '2026-10-01T00:00:00.000Z' }) + '\n';
+    await appendFile(log, snapshot('12:00:00.000', 60));
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.waitFor(() => expect(status.text).toBe(`${expected} • 40/100%`));
+    expect(status.tooltip.value).toContain('21 Sep · 0% recorded · Incomplete');
+    expect(status.tooltip.value).toContain('20 Sep · Not tracked');
+    await appendFile(log, snapshot('12:00:01.000', 58));
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.waitFor(() => expect(status.tooltip.value).toContain('21 Sep · 2% recorded · Incomplete'));
+    await appendFile(log, '2026-09-21 12:00:03.000 [info] Got Copilot token for bob\n');
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.waitFor(() => expect(status.text).toBe(expected));
+    const journal = await readFile(join(storage, 'account-poc', 'ledger.jsonl'), 'utf8');
+    expect(journal.split('\n').filter(Boolean).map(line => JSON.parse(line)).some(entry => entry.kind === 'bill')).toBe(false);
+    for (const disposable of context.subscriptions.splice(0)) disposable.dispose?.();
+    vi.mocked(UsageIndex).mockImplementationOnce(function () { return new realIndex.UsageIndex(); });
+    vi.mocked(vscode.window.createStatusBarItem).mockReturnValueOnce(status);
+    activate(context);
+    await vi.waitFor(() => {
+      expect(status.text).toBe(expected);
+      expect(status.tooltip.value).not.toContain('Showing saved sessions. Checking for changes.');
+    });
+    expect(await readFile(join(storage, 'account-poc', 'start.json'), 'utf8')).toBe(started);
+    if (scenario === 'previous release upgrade') expect(await readFile(oldLog, 'utf8')).toBe(oldContents);
+    expect(vscode.window.showInformationMessage).not.toHaveBeenCalled();
+    expect(context.globalState.update).not.toHaveBeenCalled();
+  });
+
   it("journals quota percentages per account and keeps the daily graph across restarts", async () => {
     vi.useFakeTimers();
     const start = new Date(2026, 8, 21, 12);
@@ -1520,7 +1594,7 @@ describe("activate", () => {
     await appendFile(logPath, snapshot('11:45:00.000', 58.5) + snapshot('11:50:00.000', 57));
     await vi.advanceTimersByTimeAsync(2_000);
     await vi.waitFor(() => expect(status.tooltip.value).toContain('title="21 Sep · 3% recorded · Incomplete"'), { timeout: 5_000 });
-    const journal = (await readFile(join(storage, "quota-history.jsonl"), "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const journal = (await readFile(join(storage, "quota-history.jsonl"), "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line));
     expect(journal.map((entry) => [entry.account, entry.percentRemaining])).toEqual([["octocat", 60], ["octocat", 58.5], ["octocat", 57]]);
     // Another account's log never mixes into the graph, and the switch clears the quota row.
     await appendFile(logPath, "2026-09-21 11:55:00.000 [info] Logged in as hubot\n"

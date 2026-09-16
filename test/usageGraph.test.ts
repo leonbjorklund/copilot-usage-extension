@@ -6,6 +6,18 @@ const day = (date: number, month = 8) => new Date(2026, month, date).getTime();
 const decode = (image: string) => Buffer.from(/base64,([^"]+)"/.exec(image)![1], 'base64').toString('utf8');
 
 describe('daily usage graph rows', () => {
+  it('handles no history and a single incomplete baseline without drawing consumed usage', () => {
+    expect(formatDailyUsageGraphRows([], DARK_PALETTE)).toEqual([]);
+    const baseline = [{ day: day(16), used: 0, incomplete: true }];
+    const rows = formatDailyUsageGraphRows(baseline, DARK_PALETTE);
+    const images = rows[0].match(/<img [^>]+>/g)!;
+    expect(images).toHaveLength(1);
+    expect(images[0]).toContain('alt="16 Sep · 0% recorded · Incomplete"');
+    expect(images[0]).toContain('title="16 Sep · 0% recorded · Incomplete"');
+    expect(decode(images[0])).not.toContain('rx="1"');
+    expect(rows[1].match(/16 Sep/g)).toHaveLength(2);
+  });
+
   it('renders one bottom-aligned image per day with its hover label, bright for this month and dim before', () => {
     const days = dailyUsage([], day(16, 8)).map((slot): DailyUsage => slot.day === day(31, 7) ? { ...slot, used: 2.2, incomplete: false }
       : slot.day === day(14, 8) ? { ...slot, used: 17.6, incomplete: false }

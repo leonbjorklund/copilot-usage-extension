@@ -12,7 +12,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 
 import { aggregateUsage } from '../src/core/aggregator';
 import { TITLE_PRIORITY } from '../src/core/types';
-import type { UsageRecord } from '../src/core/types';
+import type { UsageRecord, UsageSummary } from '../src/core/types';
 import { UsageIndex } from '../src/core/usageIndex';
 import { AccountUsagePoc, attributeRequest, parseAccountEvidence } from '../src/dev/accountUsagePoc';
 
@@ -105,6 +105,15 @@ describe('request attribution', () => {
     expect(attributeRequest(a, base, failed, base + 30_000)).toHaveProperty('excluded');
   });
 
+  it.each(['onDidCopilotTokenChange from getCopilotToken token lost',
+    'onDidCopilotTokenChange resetCopilotToken',
+    'Logged in as devDeviceId'])(
+    'requires fresh successful evidence after %s', marker => {
+      const row = record();
+      const evidence = parseAccountEvidence(auth('Alice') + line(base, marker) + done(row), 'one');
+      expect(attributeRequest(row, base + 5_000, evidence, base + 30_000)).toHaveProperty('excluded');
+    });
+
   it('excludes in-flight switches and continued chats, including switches back', () => {
     const a = record();
     const switching = parseAccountEvidence(auth('Alice') + auth('Bob', base + 10_500) + done(a), 'one');
@@ -120,6 +129,14 @@ describe('request attribution', () => {
     const a = record();
     const evidence = parseAccountEvidence(auth('Alice') + auth('Alice', base + 10_100) + done(a), 'one');
     expect(attributeRequest(a, base, evidence, base + 30_000)).toEqual({ account: 'alice' });
+  });
+
+  it('keeps an existing chat after same-account startup reauthentication', () => {
+    const row = record();
+    const evidence = parseAccountEvidence(auth('Alice')
+      + line(base - 5_000, 'Auth state changed (identity change), minting a new CopilotToken...')
+      + auth('Alice', base - 4_900) + done(row), 'one');
+    expect(attributeRequest(row, base - 9_000, evidence, base + 30_000)).toEqual({ account: 'alice' });
   });
 
 });
@@ -719,6 +736,35 @@ describe('local POC ledger', () => {
     expect(await readFile(join(f.storage, 'start.json'), 'utf8')).toBe(start);
   });
 
+  it('forgets unsaved account evidence and retained chats after an append fails', async () => {
+    const f = await fixture();
+    const row = record(f.usage);
+    await appendFile(f.log, auth('Bob', base + 3_000) + done(row));
+    const now = new Date(base + 30_000);
+    vi.mocked(appendFile).mockRejectedValueOnce(new Error('Disk unavailable'));
+    await expect(f.poc.refresh(aggregateUsage([row], now), now)).rejects.toThrow('Disk unavailable');
+    await rm(f.log);
+    const recovered = await f.poc.refresh(aggregateUsage([], now), now);
+    const restarted = await new AccountUsagePoc(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([], now), now);
+    expect(recovered.account).toBe('alice');
+    expect(recovered).toEqual(restarted);
+    expect(f.poc.getRetainedChatIds()).toEqual([]);
+  });
+
+  it('forgets unsaved summary peers after an append fails', async () => {
+    const f = await fixture();
+    const row = record(f.usage);
+    const other = { ...row, chatId: 'unsaved', debugRequest: { ...row.debugRequest, spanId: 'other' } };
+    await appendFile(f.log, line(base + 11_000, 'ccreq:one | success | model | 1000ms | [panel/editAgent]'));
+    const now = new Date(base + 30_000);
+    vi.mocked(appendFile).mockRejectedValueOnce(new Error('Disk unavailable'));
+    await expect(f.poc.refresh(aggregateUsage([row, other], now), now)).rejects.toThrow('Disk unavailable');
+    const recovered = await f.poc.refresh(aggregateUsage([row], now), now);
+    expect(recovered.summary.allTime.tokens).toBe(100);
+    expect(recovered.pending).toBe(0);
+    expect(f.poc.getRetainedChatIds()).toEqual(['chat']);
+  });
+
   it('recovers after a failed partial journal append without losing or duplicating usage', async () => {
     const f = await fixture();
     const a = record(f.usage);
@@ -979,7 +1025,7 @@ describe('shared ledger', () => {
     expect((await restarted.refresh(aggregateUsage([]), now)).summary.allTime.tokens).toBe(100);
   });
 
-  it('reads older per-process journals without writing them, even with an unfinished tail', async () => {
+  it('absorbs older per-process journals into the first snapshot, torn tail included', async () => {
     const f = await fixture();
     const a = record(f.usage);
     const b = record(f.usage, base + 20_000, 'request-2');
@@ -989,28 +1035,17 @@ describe('shared ledger', () => {
     const bill = { kind: 'bill', key: createHash('sha256').update(JSON.stringify([
       resolve(a.filePath), a.timestamp.getTime(), a.debugRequest.spanId, a.debugRequest.responseId,
       a.debugRequest.durationMs, a.model])).digest('hex'), record: a, sessionStart: base + 1_000 };
-    const saved = JSON.stringify(bill) + '\n{"kind":"bill","key":"partial';
-    await writeFile(legacy, saved);
+    await writeFile(legacy, JSON.stringify(bill) + '\n{"kind":"bill","key":"partial');
     await rm(f.usage);
     expect((await f.poc.refresh(aggregateUsage([b]), now)).summary.allTime.tokens).toBe(200);
-    expect(await readFile(legacy, 'utf8')).toBe(saved);
+    // The journal is never written to; the snapshot that absorbed it replaces it.
+    expect(vi.mocked(appendFile).mock.calls.some(([file]) => String(file) === legacy)).toBe(false);
+    expect((await f.poc.refresh(aggregateUsage([]), now)).summary.allTime.tokens).toBe(200);
+    const names = (await readdir(f.storage)).filter((name) => name.endsWith('.jsonl'));
+    expect(names).not.toContain('observer-1234-0.jsonl');
+    expect(names.filter((name) => name.startsWith('snapshot-'))).toHaveLength(1);
     const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
     expect((await restarted.refresh(aggregateUsage([]), now)).summary.allTime.tokens).toBe(200);
-    expect(await readFile(legacy, 'utf8')).toBe(saved);
-    // The torn tail is final, so the file is not reread on every refresh.
-    const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
-    const reads = vi.fn();
-    vi.mocked(open).mockImplementation(async (...args) => {
-      const handle = await fs.open(...args);
-      const read = handle.read.bind(handle);
-      vi.spyOn(handle, 'read').mockImplementation((...readArgs: Parameters<typeof handle.read>) => {
-        reads(args[0]);
-        return read(...readArgs);
-      });
-      return handle;
-    });
-    expect((await restarted.refresh(aggregateUsage([]), now)).summary.allTime.tokens).toBe(200);
-    expect(reads).not.toHaveBeenCalledWith(legacy);
   });
 
   it('skips and counts a torn ledger line but keeps failing on an invalid entry', async () => {
@@ -1064,6 +1099,32 @@ describe('shared ledger', () => {
     expect((await restarted.refresh(aggregateUsage([]), now)).diagnostics).not.toContain('Skipped unreadable');
   });
 
+  it('retries a batch whose open ledger was rolled and retired before its write finished', async () => {
+    const f = await fixture();
+    const row = record(f.usage);
+    await appendFile(f.log, done(row));
+    const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    vi.mocked(appendFile).mockImplementationOnce(async (file, data) => {
+      const path = String(file);
+      const before = await fs.readFile(path, 'utf8');
+      const writer = await fs.open(path, 'a');
+      try {
+        const retired = `${path}.retired`;
+        await fs.rename(path, retired);
+        // Preserve previously saved entries while retirement removes the open file.
+        await fs.writeFile(path, before);
+        await fs.unlink(retired);
+        await fs.appendFile(writer, data);
+      } finally {
+        await writer.close();
+      }
+    });
+    const now = new Date(base + 30_000);
+    expect((await f.poc.refresh(aggregateUsage([row], now), now)).summary.allTime.tokens).toBe(100);
+    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    expect((await restarted.refresh(aggregateUsage([], now), now)).summary.allTime.tokens).toBe(100);
+  });
+
   it('bounds legacy journal discovery without touching existing journals', async () => {
     const f = await fixture();
     const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
@@ -1075,5 +1136,410 @@ describe('shared ledger', () => {
     expect(await readFile(legacy, 'utf8')).toBe('{"kind":"bill","key":"partial');
     vi.mocked(readdir).mockImplementation(fs.readdir);
     expect((await f.poc.refresh(aggregateUsage([]), new Date(base + 30_000))).summary.allTime.tokens).toBe(0);
+  });
+});
+
+describe('ledger rollover and freeze', () => {
+  const DAY = 86_400_000;
+  const savedKey = (row: UsageRecord) => createHash('sha256').update(JSON.stringify([
+    resolve(row.filePath), row.timestamp.getTime(), row.debugRequest!.spanId, row.debugRequest!.responseId,
+    row.debugRequest!.durationMs, row.model])).digest('hex');
+  const files = async (storage: string) => (await readdir(storage)).filter((name) => name.endsWith('.jsonl'));
+  const snapshotLines = async (storage: string) => {
+    const [name] = (await files(storage)).filter((file) => file.startsWith('snapshot-'));
+    return (await readFile(join(storage, name), 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  };
+
+  async function frozenFixture() {
+    const f = await fixture();
+    const a = record(f.usage);
+    const b = record(f.usage, base + 20_000, 'request-2');
+    await appendFile(f.log, done(a) + done(b));
+    const soon = new Date(base + 30_000);
+    expect((await f.poc.refresh(aggregateUsage([a, b], soon), soon)).summary.allTime.tokens).toBe(200);
+    const later = new Date(base + 8 * DAY);
+    const settled = new Date(later.getTime() + 11 * 60_000);
+    return { ...f, a, b, later, settled };
+  }
+
+  it('rolls the ledger aside, then freezes old requests into per-day rollups without their evidence', async () => {
+    const f = await frozenFixture();
+    // Old requests in the live ledger: it is renamed aside, never rewritten, and waits for in-flight appends.
+    const rolled = await f.poc.refresh(aggregateUsage([], f.later), f.later);
+    expect(rolled.summary.allTime.tokens).toBe(200);
+    let names = await files(f.storage);
+    expect(names.some((name) => /^ledger-\d+-[\da-f-]+\.jsonl$/.test(name))).toBe(true);
+    expect(names).not.toContain('ledger.jsonl');
+    expect(names.some((name) => name.startsWith('snapshot-'))).toBe(false);
+    const frozen = await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    expect(frozen.summary.allTime.tokens).toBe(200);
+    expect(frozen.diagnostics).toContain('Attributed requests for this account: 2');
+    expect(vi.mocked(writeFile).mock.calls.some(([file]) => String(file).startsWith(f.storage) && String(file).endsWith('.jsonl'))).toBe(false);
+    const lines = await snapshotLines(f.storage);
+    expect(lines[0]).toMatchObject({ kind: 'snapshot', version: 2, absorbed: [{ name: expect.stringMatching(/^ledger-/), bytes: expect.any(Number) }] });
+    expect(lines.filter((line) => line.kind === 'rollup')).toEqual([expect.objectContaining({ requests: 2, day: '2026-09-07', decision: { account: 'alice' } })]);
+    expect(lines.filter((line) => ['bill', 'completion', 'request-summary'].includes(line.kind))).toHaveLength(0);
+    expect(lines.filter((line) => line.kind === 'token')).toHaveLength(1);
+    // The next refresh retires the absorbed file and serves the rollup.
+    const after = await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    expect(after.summary.allTime.tokens).toBe(200);
+    expect(after.summary.allTime.githubCopilot.aiCredits).toBe(4);
+    expect(after.summary.chats).toHaveLength(1);
+    expect(after.summary.chats[0].records).toHaveLength(1);
+    expect(after.diagnostics).toContain('Attributed requests for this account: 2');
+    names = await files(f.storage);
+    expect(names.filter((name) => name.startsWith('snapshot-'))).toHaveLength(1);
+    expect(names.some((name) => name.startsWith('ledger'))).toBe(false);
+    // A new window needs only the snapshot, including the auth history it kept.
+    await rm(f.log);
+    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const view = await restarted.refresh(aggregateUsage([], f.settled), f.settled);
+    expect(view.account).toBe('alice');
+    expect(view.summary.allTime.tokens).toBe(200);
+    expect(restarted.getRetainedChatIds()).toEqual(['chat']);
+    // Another account's window hides the frozen usage.
+    await writeFile(f.log, auth('Bob', f.settled.getTime()));
+    const bob = await restarted.refresh(aggregateUsage([]), new Date(f.settled.getTime() + 5_000));
+    expect(bob.account).toBe('bob');
+    expect(bob.summary.allTime.tokens).toBe(0);
+    expect(bob.diagnostics).toContain('Attributed requests for this account: 0');
+  });
+
+  it('never appends a request older than the freeze window, not even for a rename', async () => {
+    const f = await fixture();
+    const a = record(f.usage);
+    await appendFile(f.log, done(a));
+    await f.poc.refresh(aggregateUsage([a]), new Date(base + 30_000));
+    const later = new Date(base + 8 * DAY);
+    vi.mocked(appendFile).mockClear();
+    const renamed = { ...a, metadataOnly: true, titlePriority: TITLE_PRIORITY.custom,
+      timestamp: new Date(base + 20_000), titleModifiedAt: base + 40_000, title: 'Renamed' };
+    const view = await f.poc.refresh(aggregateUsage([a, renamed], later), later);
+    expect(view.summary.chats[0].title).toBe('Renamed');
+    expect(view.summary.allTime.tokens).toBe(100);
+    // A request first seen this late may already sit inside a rollup, so it is not saved.
+    const missed = record(f.usage, base + 50_000, 'missed');
+    await appendFile(f.log, done(missed));
+    const ignored = await f.poc.refresh(aggregateUsage([a, missed], later), later);
+    expect(ignored.summary.allTime.tokens).toBe(100);
+    expect(ignored.pending).toBe(0);
+    expect(vi.mocked(appendFile).mock.calls.filter(([file]) => String(file).startsWith(f.storage))).toHaveLength(0);
+  });
+
+  it('rebuilds other windows from the snapshot, retires absorbed files, and salvages late appends', async () => {
+    const f = await frozenFixture();
+    const other = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    await f.poc.refresh(aggregateUsage([], f.later), f.later);
+    expect((await other.refresh(aggregateUsage([], f.later), f.later)).summary.allTime.tokens).toBe(200);
+    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    // A window whose append was in flight during the roll lands a whole line, then dies mid-write.
+    const [rolledName] = (await files(f.storage)).filter((name) => name.startsWith('ledger-'));
+    const late = record(f.usage, f.settled.getTime() - 10_000, 'late');
+    await appendFile(f.log, done(late));
+    const lateLine = JSON.stringify({ kind: 'bill', key: savedKey(late), record: late, sessionStart: base + 1_000 });
+    await appendFile(join(f.storage, rolledName), `\n${lateLine}\n{"kind":"bill","key":"torn`);
+    const view = await other.refresh(aggregateUsage([], f.settled), f.settled);
+    expect(view.summary.allTime.tokens).toBe(300);
+    expect(view.summary.chats[0].records).toHaveLength(2);
+    expect(await files(f.storage)).not.toContain(rolledName);
+    expect(await readFile(join(f.storage, 'ledger.jsonl'), 'utf8')).toContain(lateLine);
+    expect((await f.poc.refresh(aggregateUsage([], f.settled), f.settled)).summary.allTime.tokens).toBe(300);
+    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    expect((await restarted.refresh(aggregateUsage([], f.settled), f.settled)).summary.allTime.tokens).toBe(300);
+  });
+
+  it('retains request evidence for the full seven-day window', async () => {
+    const f = await fixture();
+    const row = record(f.usage);
+    await appendFile(f.log, done(row));
+    const now = new Date(base + 6 * DAY);
+    const view = await f.poc.refresh(aggregateUsage([row], now), now);
+    expect(view.summary.allTime.tokens).toBe(100);
+    expect(view.diagnostics).toContain('Attributed requests for this account: 1');
+    expect(await files(f.storage)).toEqual(['ledger.jsonl']);
+    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    expect((await restarted.refresh(aggregateUsage([], now), now)).summary.allTime.tokens).toBe(100);
+  });
+
+  it('keeps one snapshot when two windows freeze the same rolled ledger', async () => {
+    const f = await frozenFixture();
+    const other = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    await f.poc.refresh(aggregateUsage([], f.later), f.later);
+    await other.refresh(aggregateUsage([], f.later), f.later);
+    const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    let raced = false;
+    vi.mocked(open).mockImplementation(async (...args) => {
+      if (!raced && /snapshot-.*\.tmp$/.test(String(args[0]))) {
+        raced = true;
+        // The other window has not seen a snapshot yet, so it freezes too.
+        await other.refresh(aggregateUsage([], f.settled), f.settled);
+      }
+      return fs.open(...args);
+    });
+    expect((await f.poc.refresh(aggregateUsage([], f.settled), f.settled)).summary.allTime.tokens).toBe(200);
+    expect(raced).toBe(true);
+    vi.mocked(open).mockImplementation(fs.open);
+    expect((await files(f.storage)).filter((name) => name.startsWith('snapshot-'))).toHaveLength(1);
+    const later = new Date(f.settled.getTime() + 2_000);
+    for (const window of [f.poc, other]) {
+      expect((await window.refresh(aggregateUsage([], later), later)).summary.allTime.tokens).toBe(200);
+    }
+    const names = await files(f.storage);
+    expect(names.filter((name) => name.startsWith('snapshot-'))).toHaveLength(1);
+    expect(names.some((name) => name.startsWith('ledger'))).toBe(false);
+    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    expect((await restarted.refresh(aggregateUsage([], later), later)).summary.allTime.tokens).toBe(200);
+  });
+
+  it('deduplicates a frozen request while preserving a distinct late old request', async () => {
+    const f = await frozenFixture();
+    await f.poc.refresh(aggregateUsage([], f.later), f.later);
+    const [rolledName] = (await files(f.storage)).filter((name) => name.startsWith('ledger-'));
+    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    const late = record(f.usage, base + 25_000, 'late-old');
+    const lateEntries = [f.a, late].flatMap((row) => [
+      { kind: 'bill', key: savedKey(row), record: row, sessionStart: base + 1_000 },
+      ...parseAccountEvidence(done(row), f.stream),
+    ]);
+    await appendFile(join(f.storage, rolledName), lateEntries.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
+    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    for (let poll = 0; poll < 3; poll++) {
+      const now = new Date(f.settled.getTime() + poll * 11 * 60_000);
+      const view = await restarted.refresh(aggregateUsage([], now), now);
+      expect(view.summary.allTime.tokens).toBe(300);
+      expect(view.diagnostics).toContain('Attributed requests for this account: 3');
+    }
+    const now = new Date(f.settled.getTime() + 33 * 60_000);
+    expect((await new AccountUsagePoc(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([], now), now)).summary.allTime.tokens).toBe(300);
+  });
+
+  it('does not replace a newer complete snapshot with a paused stale publisher', async () => {
+    const f = await frozenFixture();
+    const other = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    await f.poc.refresh(aggregateUsage([], f.later), f.later);
+    const [rolledName] = (await files(f.storage)).filter((name) => name.startsWith('ledger-'));
+    const late = record(f.usage, base + 25_000, 'late-old');
+    const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    let raced = false;
+    vi.mocked(open).mockImplementation(async (...args) => {
+      if (!raced && /snapshot-.*\.tmp$/.test(String(args[0]))) {
+        raced = true;
+        const entries = [{ kind: 'bill', key: savedKey(late), record: late, sessionStart: base + 1_000 },
+          ...parseAccountEvidence(done(late), f.stream)];
+        await fs.appendFile(join(f.storage, rolledName), entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
+        for (let poll = 0; poll < 2; poll++) {
+          expect((await other.refresh(aggregateUsage([], f.settled), f.settled)).summary.allTime.tokens).toBe(300);
+        }
+        expect(await files(f.storage)).not.toContain(rolledName);
+      }
+      return fs.open(...args);
+    });
+    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    expect(raced).toBe(true);
+    vi.mocked(open).mockImplementation(fs.open);
+    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    expect((await restarted.refresh(aggregateUsage([], f.settled), f.settled)).summary.allTime.tokens).toBe(300);
+    expect((await files(f.storage)).filter((name) => name.startsWith('snapshot-'))).toHaveLength(1);
+  });
+
+  it('preserves legacy snapshot totals and saved bills when upgrading request identity tracking', async () => {
+    const f = await frozenFixture();
+    await f.poc.refresh(aggregateUsage([], f.later), f.later);
+    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    const [name] = (await files(f.storage)).filter((name) => name.startsWith('snapshot-'));
+    const lines = await snapshotLines(f.storage);
+    const known = record(f.usage, base + 25_000, 'legacy-known');
+    const legacy = [{ kind: 'snapshot', version: 1, at: f.settled.getTime(), absorbed: lines[0].absorbed },
+      ...lines.slice(1).filter((entry) => entry.kind !== 'frozen-keys'),
+      { kind: 'bill', key: savedKey(known), record: known, sessionStart: base + 1_000 },
+      ...parseAccountEvidence(done(known), f.stream)];
+    await writeFile(join(f.storage, name), legacy.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
+    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    expect((await restarted.refresh(aggregateUsage([], f.settled), f.settled)).summary.allTime.tokens).toBe(300);
+    const duplicate = { kind: 'bill', key: savedKey(f.a), record: f.a, sessionStart: base + 1_000 };
+    await appendFile(join(f.storage, 'ledger.jsonl'), JSON.stringify(duplicate) + '\n');
+    expect((await restarted.refresh(aggregateUsage([], f.settled), f.settled)).summary.allTime.tokens).toBe(300);
+    const migratedAt = new Date(f.settled.getTime() + 11 * 60_000);
+    expect((await restarted.refresh(aggregateUsage([], migratedAt), migratedAt)).summary.allTime.tokens).toBe(300);
+    await restarted.refresh(aggregateUsage([], migratedAt), migratedAt);
+    expect((await snapshotLines(f.storage))[0]).toMatchObject({ version: 2, legacyBefore: expect.any(Number) });
+    expect((await new AccountUsagePoc(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([], migratedAt), migratedAt)).summary.allTime.tokens).toBe(300);
+  });
+
+  it('does not resave four-day-old requests already compacted by a legacy snapshot', async () => {
+    const f = await frozenFixture();
+    await f.poc.refresh(aggregateUsage([], f.later), f.later);
+    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    const [name] = await files(f.storage);
+    const lines = await snapshotLines(f.storage);
+    // Recreate the snapshot the three-day writer would have saved on day four.
+    const now = new Date(base + 4 * DAY);
+    const legacy = [{ kind: 'snapshot', version: 1, at: now.getTime(), absorbed: [] },
+      ...lines.slice(1).filter((entry) => entry.kind !== 'frozen-keys')];
+    await writeFile(join(f.storage, name), legacy.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
+    const rescanned = aggregateUsage([f.a, f.b], now);
+    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    vi.mocked(appendFile).mockClear();
+    expect((await restarted.refresh(rescanned, now)).summary.allTime.tokens).toBe(200);
+    const appended = vi.mocked(appendFile).mock.calls.filter(([file]) => String(file).startsWith(f.storage))
+      .flatMap(([, data]) => String(data).split('\n').filter(Boolean).map((line) => JSON.parse(line)));
+    expect(appended.filter((entry) => entry.kind === 'bill')).toHaveLength(0);
+    const duplicate = { kind: 'bill', key: savedKey(f.a), record: f.a, sessionStart: base + 1_000 };
+    await appendFile(join(f.storage, 'ledger.jsonl'), JSON.stringify(duplicate) + '\n');
+    expect((await restarted.refresh(rescanned, now)).summary.allTime.tokens).toBe(200);
+    expect((await new AccountUsagePoc(f.storage, f.stream, [f.logRoot]).refresh(rescanned, now)).summary.allTime.tokens).toBe(200);
+  });
+
+  it('keeps a frozen chat following renames without touching its totals', async () => {
+    const f = await frozenFixture();
+    await f.poc.refresh(aggregateUsage([], f.later), f.later);
+    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    const now = new Date(f.settled.getTime() + 2_000);
+    const renamed = { ...f.a, metadataOnly: true, titlePriority: TITLE_PRIORITY.custom,
+      timestamp: new Date(base + 20_000), titleModifiedAt: now.getTime(), title: 'Frozen rename' };
+    vi.mocked(appendFile).mockClear();
+    const view = await f.poc.refresh(aggregateUsage([], now), now, [renamed]);
+    expect(view.summary.chats[0].title).toBe('Frozen rename');
+    expect(view.summary.allTime.tokens).toBe(200);
+    expect(appendFile).toHaveBeenCalledTimes(1);
+    const lines = (await readFile(join(f.storage, 'ledger.jsonl'), 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    expect(lines).toEqual([expect.objectContaining({ kind: 'rollup', requests: 2 })]);
+    // Copilot bumping the chat file without a new label writes nothing more.
+    const bumped = await f.poc.refresh(aggregateUsage([], now), now, [{ ...renamed, titleModifiedAt: now.getTime() + 1 }]);
+    expect(bumped.summary.chats[0].title).toBe('Frozen rename');
+    expect(appendFile).toHaveBeenCalledTimes(1);
+    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const saved = await restarted.refresh(aggregateUsage([], now), now);
+    expect(saved.summary.chats[0].title).toBe('Frozen rename');
+    expect(saved.summary.allTime.tokens).toBe(200);
+    expect(saved.summary.allTime.githubCopilot.aiCredits).toBe(4);
+  });
+
+  it('batches snapshot bills aging out between polls without changing their totals', async () => {
+    const f = await frozenFixture();
+    await f.poc.refresh(aggregateUsage([], f.later), f.later);
+    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    const [name] = (await files(f.storage)).filter((file) => file.startsWith('snapshot-'));
+    const path = join(f.storage, name);
+    const lines = await snapshotLines(f.storage);
+    for (let index = 0; index < 3; index++) {
+      const row = record(f.usage, f.settled.getTime() - 7 * DAY + 1_000 + index * 2_000, `aging-${index}`);
+      lines.push({ kind: 'bill', key: savedKey(row), record: row, sessionStart: base + 1_000 },
+        ...parseAccountEvidence(done(row), f.stream));
+    }
+    lines[0].lines = lines.length - 1;
+    const saved = lines.map((entry) => JSON.stringify(entry)).join('\n') + '\n';
+    await writeFile(path, saved);
+    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    for (const elapsed of [0, 2_000, 4_000, 6_000]) {
+      const now = new Date(f.settled.getTime() + elapsed);
+      expect((await restarted.refresh(aggregateUsage([], now), now)).summary.allTime.tokens).toBe(500);
+      expect(await files(f.storage)).toEqual([name]);
+      expect(await readFile(path, 'utf8')).toBe(saved);
+    }
+    const batchedAt = new Date(f.settled.getTime() + 10 * 60_000);
+    expect((await restarted.refresh(aggregateUsage([], batchedAt), batchedAt)).summary.allTime.tokens).toBe(500);
+    expect((await files(f.storage)).filter((file) => file.startsWith('snapshot-'))).toHaveLength(2);
+    const nextWindow = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    expect((await nextWindow.refresh(aggregateUsage([], batchedAt), batchedAt)).summary.allTime.tokens).toBe(500);
+    expect((await snapshotLines(f.storage)).filter((entry) => entry.kind === 'bill')).toHaveLength(0);
+  });
+
+  it('merges frozen and live usage the same way one aggregate would', async () => {
+    const f = await frozenFixture();
+    await f.poc.refresh(aggregateUsage([], f.later), f.later);
+    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    const now = new Date(f.settled.getTime() + 60_000);
+    const continued = record(f.usage, now.getTime() - 30_000, 'continued');
+    const otherUsage = join(f.root, 'debug-logs', 'other', 'main.jsonl');
+    await mkdir(join(f.root, 'debug-logs', 'other'));
+    await writeFile(otherUsage, JSON.stringify({ type: 'session_start', ts: base + 1_000 }) + '\n');
+    const fresh = { ...record(otherUsage, now.getTime() - 20_000, 'fresh'), chatId: 'other', title: 'Other chat', model: 'other-model',
+      tokens: { input: 200, output: 100, cachedInput: 0, cacheWriteInput: 0, total: 300, source: 'recorded' as const },
+      billing: { aiCredits: 5, source: 'copilot-debug-log' as const } };
+    await appendFile(f.log, done(continued) + done(fresh));
+    const view = await f.poc.refresh(aggregateUsage([continued, fresh], now), now);
+    const rollup: UsageRecord = { chatId: 'chat', title: 'A chat', model: 'model', timestamp: f.b.timestamp, filePath: f.usage,
+      tokens: { input: 160, output: 40, cachedInput: 20, cacheWriteInput: 0, total: 200, source: 'recorded' },
+      billing: { aiCredits: 4, source: 'copilot-debug-log' } };
+    const expected = aggregateUsage([rollup, continued, fresh], now);
+    const shape = (summary: UsageSummary) => ({
+      today: summary.today, week: summary.week, month: summary.month, allTime: summary.allTime, topModels: summary.topModels,
+      chats: summary.chats.map((chat) => ({ chatId: chat.chatId, title: chat.title, tokens: chat.tokens, cost: chat.githubCopilot,
+        at: chat.timestamp.getTime(), records: chat.records.length })),
+      highest: summary.highestSessionToday?.chatId, priciest: summary.mostExpensiveSessionToday?.chatId,
+    });
+    expect(shape(view.summary)).toEqual(shape(expected));
+    // The frozen Monday usage is outside this week but remains in this month.
+    expect(view.summary.week.tokens).toBe(400);
+    expect(view.summary.month.tokens).toBe(600);
+    expect(view.summary.today.tokens).toBe(400);
+    expect(view.summary.topModels.map((model) => model.model)).toEqual(['model', 'other-model']);
+  });
+
+  it.each(['malformed', 'truncated', 'missing line', 'empty', 'blank lines', 'headerless'] as const)(
+    'rejects a %s snapshot on every refresh without retiring its source ledger', async (damage) => {
+      const f = await frozenFixture();
+      await f.poc.refresh(aggregateUsage([], f.later), f.later);
+      await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+      const names = await files(f.storage);
+      const source = join(f.storage, names.find((name) => name.startsWith('ledger-'))!);
+      const sourceBytes = await readFile(source);
+      const path = join(f.storage, names.find((name) => name.startsWith('snapshot-'))!);
+      const original = await readFile(path, 'utf8');
+      const lines = original.split('\n').filter(Boolean);
+      const corrupt = damage === 'empty' ? '' : damage === 'blank lines' ? '\n'.repeat(70_000)
+        : damage === 'missing line' ? lines.slice(0, -1).join('\n') + '\n'
+        : damage === 'headerless' ? '\n'.repeat(70_000) + lines.slice(1).join('\n') + '\n'
+        : damage === 'truncated' ? original.slice(0, -3)
+        : lines.map((line) => line.includes('"kind":"rollup"') ? '{"kind":"rollup",' : line).join('\n') + '\n';
+      await writeFile(path, corrupt);
+      const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await expect(restarted.refresh(aggregateUsage([], f.settled), f.settled)).rejects.toThrow('Invalid account POC snapshot');
+        expect(await readFile(source)).toEqual(sourceBytes);
+        expect(await readFile(path, 'utf8')).toBe(corrupt);
+      }
+    },
+  );
+
+  it.each(['start.json', 'ledger.jsonl', '../outside.jsonl', 'snapshot-1-abc.jsonl'])(
+    'rejects snapshot permission to retire %s', async (name) => {
+      const f = await frozenFixture();
+      await f.poc.refresh(aggregateUsage([], f.later), f.later);
+      await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+      const snapshot = (await files(f.storage)).find((file) => file.startsWith('snapshot-'))!;
+      const path = join(f.storage, snapshot);
+      const lines = await snapshotLines(f.storage);
+      lines[0].absorbed.push({ name, bytes: 0 });
+      await writeFile(path, lines.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
+      const start = await readFile(join(f.storage, 'start.json'));
+      const names = await readdir(f.storage);
+      const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await expect(restarted.refresh(aggregateUsage([], f.settled), f.settled)).rejects.toThrow('Invalid account POC snapshot');
+        expect(await readdir(f.storage)).toEqual(names);
+        expect(await readFile(join(f.storage, 'start.json'))).toEqual(start);
+      }
+    },
+  );
+
+  it('keeps failing on a corrupt rollup without touching the snapshot', async () => {
+    const f = await frozenFixture();
+    await f.poc.refresh(aggregateUsage([], f.later), f.later);
+    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    const [name] = (await files(f.storage)).filter((file) => file.startsWith('snapshot-'));
+    const path = join(f.storage, name);
+    const corrupt = (await readFile(path, 'utf8')).replace('"aiCredits":4', '"aiCredits":"4"');
+    expect(corrupt).toContain('"aiCredits":"4"');
+    await writeFile(path, corrupt);
+    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    await expect(restarted.refresh(aggregateUsage([], f.settled), f.settled)).rejects.toThrow('Invalid account POC request journal');
+    await expect(restarted.refresh(aggregateUsage([], f.settled), f.settled)).rejects.toThrow('Invalid account POC request journal');
+    expect(await readFile(path, 'utf8')).toBe(corrupt);
   });
 });

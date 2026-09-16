@@ -78,6 +78,29 @@ describe('UsageIndex', () => {
     });
   });
 
+  it.each(['rebuild', 'restore'] as const)('accepts a previously supplied retained chat list after %s resets it', async (reset) => {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
+    roots.push(root);
+    const folder = join(root, 'chatSessions');
+    await mkdir(folder);
+    await writeFile(join(folder, 'saved-chat.json'), JSON.stringify({
+      kind: 0, v: { sessionId: 'saved-chat', customTitle: 'Saved title' },
+    }));
+    const options = { roots: [root], config: configForRoot(root) };
+    const index = new UsageIndex();
+    await index.rebuild(options);
+    const cache = join(root, 'cache');
+    await index.save(cache);
+    const retainedChatIds = ['saved-chat'];
+    expect((await index.poll({ ...options, retainedChatIds })).titleMetadata?.[0].title).toBe('Saved title');
+
+    const resetResult = reset === 'restore' ? await index.restore(options, cache) : await index.rebuild(options);
+    expect(resetResult?.titleMetadata).toEqual([]);
+    const result = await index.poll({ ...options, retainedChatIds });
+    expect(result.titleMetadata?.[0].title).toBe('Saved title');
+    expect(result.summary.allTime.tokens).toBe(0);
+  });
+
   it('does not reread unchanged JSON usage, metadata, or marker-free files when polling', async () => {
     const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
     roots.push(root);
@@ -450,14 +473,14 @@ describe('UsageIndex', () => {
     expect(index.getWatchFolders()).toEqual([root]);
   });
 
-  it('adds only complete appended JSONL lines to the cached records', async () => {
+  it('adds only complete appended JSONL lines and keeps the summary until records change', async () => {
     const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
     roots.push(root);
     const filePath = join(root, 'usage.jsonl');
     await writeFile(filePath, JSON.stringify(usageRecord('first', 1)) + '\n');
 
     const index = new UsageIndex();
-    await index.rebuild({ roots: [root], now: new Date('2026-05-28T12:00:00.000Z'), config: configForRoot(root) });
+    const initial = await index.rebuild({ roots: [root], now: new Date('2026-05-28T12:00:00.000Z'), config: configForRoot(root) });
 
     await appendFile(filePath, JSON.stringify(usageRecord('second', 2)));
     let result = await index.applyChanges({
@@ -466,6 +489,7 @@ describe('UsageIndex', () => {
       now: new Date('2026-05-28T12:00:00.000Z'),
       config: configForRoot(root),
     });
+    expect(result).toBe(initial);
     expect(result.summary.allTime.tokens).toBe(1);
     expect(result.diagnostics.normalizedRecords).toBe(1);
 
@@ -477,51 +501,10 @@ describe('UsageIndex', () => {
       config: configForRoot(root),
     });
 
+    expect(result).not.toBe(initial);
     expect(result.summary.allTime.tokens).toBe(3);
     expect(result.summary.chats.map((chat) => chat.chatId).sort()).toEqual(['first', 'second']);
     expect(result.diagnostics.normalizedRecords).toBe(2);
-  });
-
-  it('reuses the summary when an appended JSONL fragment has no complete line', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
-    roots.push(root);
-    const filePath = join(root, 'usage.jsonl');
-    await writeFile(filePath, JSON.stringify(usageRecord('first', 1)) + '\n');
-
-    const index = new UsageIndex();
-    const initial = await index.rebuild({ roots: [root], now: new Date('2026-05-28T12:00:00.000Z'), config: configForRoot(root) });
-
-    await appendFile(filePath, JSON.stringify(usageRecord('second', 2)));
-    const result = await index.applyChanges({
-      pathsToDelete: [],
-      pathsToUpdate: [filePath],
-      now: new Date('2026-05-28T12:00:00.000Z'),
-      config: configForRoot(root),
-    });
-
-    expect(result).toBe(initial);
-    expect(result.summary.allTime.tokens).toBe(1);
-  });
-
-  it('recomputes the summary after a complete appended JSONL line', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'copilot-usage-index-'));
-    roots.push(root);
-    const filePath = join(root, 'usage.jsonl');
-    await writeFile(filePath, JSON.stringify(usageRecord('first', 1)) + '\n');
-
-    const index = new UsageIndex();
-    const initial = await index.rebuild({ roots: [root], now: new Date('2026-05-28T12:00:00.000Z'), config: configForRoot(root) });
-
-    await appendFile(filePath, JSON.stringify(usageRecord('second', 2)) + '\n');
-    const result = await index.applyChanges({
-      pathsToDelete: [],
-      pathsToUpdate: [filePath],
-      now: new Date('2026-05-28T12:00:00.000Z'),
-      config: configForRoot(root),
-    });
-
-    expect(result).not.toBe(initial);
-    expect(result.summary.allTime.tokens).toBe(3);
   });
 
   it('reparses a JSONL file when content changes without growing', async () => {

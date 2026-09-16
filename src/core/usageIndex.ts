@@ -70,6 +70,7 @@ export class UsageIndex {
   private readonly files = new Map<string, FileUsageState>();
   private roots: string[] = [];
   private retainedChatIds = new Set<string>();
+  private retainedChatIdsSource: string[] | undefined;
   private watchFolders: string[] = [];
   private scanDiagnostics: ScanDiagnostics = createScanDiagnostics();
   private recordsCache: UsageRecord[] | undefined;
@@ -99,6 +100,7 @@ export class UsageIndex {
     for (const { key, ...state } of snapshot.files) this.files.set(key, state);
     this.roots = uniqueResolvedPaths(options.roots);
     this.retainedChatIds = new Set(options.retainedChatIds ?? []);
+    this.retainedChatIdsSource = options.retainedChatIds;
     this.watchFolders = snapshot.watchFolders;
     this.scanDiagnostics = snapshot.diagnostics;
     this.cacheScope = scope;
@@ -133,6 +135,7 @@ export class UsageIndex {
     this.roots = uniqueResolvedPaths(options.roots);
     this.cacheScope = usageIndexCacheScope(this.roots, options.config);
     this.retainedChatIds = new Set(options.retainedChatIds ?? []);
+    this.retainedChatIdsSource = options.retainedChatIds;
     const scan = await scanUsageFiles(this.roots, {
       maxFileSizeBytes: options.config.maxFileSizeMb * 1024 * 1024,
       maxDepth: options.config.maxScanDepth,
@@ -153,7 +156,7 @@ export class UsageIndex {
 
   async applyChanges(options: UsageIndexChangeOptions): Promise<UsageServiceResult> {
     const previousBilledChatIds = this.getBilledChatIds();
-    if (options.retainedChatIds !== undefined) this.retainedChatIds = new Set(options.retainedChatIds);
+    this.setRetainedChatIds(options.retainedChatIds);
     for (const path of options.pathsToDelete) {
       await this.deletePathState(path);
     }
@@ -171,9 +174,16 @@ export class UsageIndex {
     return this.summarize(options);
   }
 
+  /** Omit to keep the last supplied set; the same array again is a no-op. */
+  private setRetainedChatIds(chatIds: string[] | undefined): void {
+    if (chatIds === undefined || chatIds === this.retainedChatIdsSource) return;
+    this.retainedChatIdsSource = chatIds;
+    this.retainedChatIds = new Set(chatIds);
+  }
+
   /** Reconcile disk state when writers delay filesystem notifications. */
   async poll(options: UsageIndexUpdateOptions): Promise<UsageServiceResult> {
-    if (options.retainedChatIds !== undefined) this.retainedChatIds = new Set(options.retainedChatIds);
+    this.setRetainedChatIds(options.retainedChatIds);
     const scan = await scanUsageFiles(this.roots, {
       maxFileSizeBytes: options.config.maxFileSizeMb * 1024 * 1024,
       maxDepth: options.config.maxScanDepth,

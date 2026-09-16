@@ -143,8 +143,20 @@ function compareChatsByCost(left: ChatUsageSummary, right: ChatUsageSummary): nu
   );
 }
 
+export interface ModelUsage {
+  chatIds: Set<string>;
+  tokens: number;
+  githubCopilot: CopilotCostEstimate;
+}
+
 function buildTopModels(records: UsageRecord[]): ModelUsageSummary[] {
-  const models = new Map<string, { chatIds: Set<string>; tokens: number; githubCopilot: CopilotCostEstimate }>();
+  return rankModelUsage([...collectModelUsage(records)].map(([model, usage]) =>
+    [model, { sessions: usage.chatIds.size, tokens: usage.tokens, githubCopilot: usage.githubCopilot }]));
+}
+
+/** Per-model totals with the chats behind them, in first-seen order. */
+export function collectModelUsage(records: UsageRecord[]): Map<string, ModelUsage> {
+  const models = new Map<string, ModelUsage>();
 
   for (const record of records) {
     if (
@@ -168,15 +180,34 @@ function buildTopModels(records: UsageRecord[]): ModelUsageSummary[] {
     addCost(model.githubCopilot, estimateRecordCost(record));
   }
 
-  return Array.from(models.entries())
+  return models;
+}
+
+/** The three models used in the most chats, ties in the given order. */
+export function rankModelUsage(
+  models: Iterable<[string, { sessions: number; tokens: number; githubCopilot: CopilotCostEstimate }]>,
+): ModelUsageSummary[] {
+  return Array.from(models)
     .map(([model, usage]) => ({
       model,
-      sessions: usage.chatIds.size,
+      sessions: usage.sessions,
       tokens: usage.tokens,
       githubCopilot: usage.githubCopilot,
     }))
     .sort((left, right) => right.sessions - left.sessions)
     .slice(0, 3);
+}
+
+export function mergeUsageTotals(left: UsageTotal, right: UsageTotal): UsageTotal {
+  const total = { tokens: left.tokens + right.tokens, githubCopilot: { ...left.githubCopilot } };
+  addCost(total.githubCopilot, right.githubCopilot);
+  return total;
+}
+
+export function mergeCostEstimates(left: CopilotCostEstimate, right: CopilotCostEstimate): CopilotCostEstimate {
+  const total = { ...left };
+  addCost(total, right);
+  return total;
 }
 
 function emptyTotal(): UsageTotal {

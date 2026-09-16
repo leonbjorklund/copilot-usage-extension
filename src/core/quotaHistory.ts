@@ -21,6 +21,12 @@ export interface DailyUsage {
 }
 
 const MAX_READ_BYTES = 8 * 1024 * 1024;
+// Below Node's appendFile chunk size, keeping concurrent writes on line boundaries.
+const MAX_APPEND_BYTES = 256 * 1024;
+
+function observationKey(entry: QuotaObservation): string {
+  return JSON.stringify([entry.account.toLowerCase(), entry.at, entry.percentRemaining, entry.resetDate]);
+}
 
 export function localDayStart(at: number): number {
   const date = new Date(at);
@@ -108,6 +114,8 @@ export function dailyUsage(observations: QuotaObservation[], now: number, days =
 export class QuotaHistory {
   private readonly known = new Map<string, QuotaObservation[]>();
   private readonly keys = new Set<string>();
+  private queue: Promise<void> = Promise.resolve();
+  private retry: QuotaObservation[] = [];
   /** Byte offset of the last complete line already loaded. */
   private loaded = 0;
   /** Last journal failure; the graph keeps showing what was read before it. */
@@ -120,33 +128,56 @@ export class QuotaHistory {
   }
 
   /** Never throws: a journal failure must not hide the quota itself. */
-  async record(observations: QuotaObservation[]): Promise<void> {
+  record(observations: QuotaObservation[]): Promise<void> {
+    this.queue = this.queue.then(() => this.recordOnce(observations));
+    return this.queue;
+  }
+
+  private async recordOnce(observations: QuotaObservation[]): Promise<void> {
+    const incoming = [...this.retry, ...observations];
     const additions: QuotaObservation[] = [];
     try {
       await this.load();
-      for (const observation of [...observations].sort((a, b) => a.at - b.at)) {
+      for (const observation of incoming.sort((a, b) => a.at - b.at)) {
         const entry = { ...observation, account: observation.account.toLowerCase() };
         if (this.remember(entry)) additions.push(entry);
       }
       if (additions.length > 0) {
         await mkdir(dirname(this.file), { recursive: true });
-        await appendFile(this.file, additions.map((entry) => JSON.stringify(entry)).join('\n') + '\n', 'utf8');
+        let group = '';
+        let bytes = 0;
+        for (const entry of additions) {
+          const line = JSON.stringify(entry) + '\n';
+          const size = Buffer.byteLength(line);
+          if (bytes && bytes + size > MAX_APPEND_BYTES) {
+            await appendFile(this.file, '\n' + group, 'utf8');
+            group = '';
+            bytes = 0;
+          }
+          group += line;
+          bytes += size;
+        }
+        // Separate a previous interrupted write from the next complete entry.
+        if (bytes) await appendFile(this.file, '\n' + group, 'utf8');
       }
+      this.retry = [];
       this.problem = undefined;
     } catch (error) {
-      // Forget what was not saved so the next log parse can retry the append.
+      // An unchanged source log is cached. Keep unsaved observations for the
+      // next idle refresh as well as the next parsed quota response.
       for (const entry of additions) this.forget(entry);
+      this.retry = [...new Map(incoming.map((entry) => [observationKey(entry), entry])).values()];
       this.problem = `Daily usage history: ${error instanceof Error ? error.message : String(error)}`;
     }
   }
 
   private remember(entry: QuotaObservation): boolean {
-    const key = `${entry.account}|${entry.at}`;
+    const key = observationKey(entry);
     if (this.keys.has(key)) return false;
     this.keys.add(key);
     const list = this.known.get(entry.account) ?? [];
     const latest = list.at(-1);
-    if (latest && localDayStart(latest.at) === localDayStart(entry.at) &&
+    if (latest && entry.at >= latest.at && localDayStart(latest.at) === localDayStart(entry.at) &&
       latest.percentRemaining === entry.percentRemaining && latest.resetDate === entry.resetDate) return false;
     // Other windows' lines can arrive late; keep the list in time order so `latest` stays the newest.
     let index = list.length;
@@ -157,15 +188,15 @@ export class QuotaHistory {
   }
 
   private forget(entry: QuotaObservation): void {
-    this.keys.delete(`${entry.account}|${entry.at}`);
+    this.keys.delete(observationKey(entry));
     const list = this.known.get(entry.account) ?? [];
     this.known.set(entry.account, list.filter((known) => known !== entry));
   }
 
   /**
    * Resumes after the last complete line. The file only grows, so a bounded
-   * read of its newest bytes always covers the graph's window; a larger jump
-   * skips the partial line it lands in.
+   * read keeps its newest observations; older days outside that bound stay
+   * untracked. A larger jump skips the partial line it lands in.
    */
   private async load(): Promise<void> {
     let handle;

@@ -1,8 +1,17 @@
 import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { dailyUsage, localDayStart, QuotaHistory, type QuotaObservation } from '../src/core/quotaHistory';
+
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const fs = await importOriginal<typeof import('node:fs/promises')>();
+  return { ...fs, appendFile: vi.fn(fs.appendFile) };
+});
+afterEach(async () => {
+  const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+  vi.mocked(appendFile).mockImplementation(fs.appendFile);
+});
 
 const reset = '2026-10-01T00:00:00.000Z';
 const at = (day: number, hour: number, minute = 0) => new Date(2026, 8, day, hour, minute).getTime();
@@ -13,6 +22,35 @@ const slot = (usage: ReturnType<typeof dailyUsage>, day: number) =>
   usage.find((entry) => entry.day === at(day, 0))!;
 
 describe('dailyUsage', () => {
+  it.each([
+    ['Europe/Stockholm', 2, 29, 23], ['Europe/Stockholm', 9, 25, 25],
+    ['America/New_York', 2, 8, 23], ['America/New_York', 10, 1, 25],
+    ['Asia/Kolkata', 2, 29, 24],
+  ] as const)('uses local calendar days in %s across %s/%s', (zone, month, date, hours) => {
+    const original = process.env.TZ;
+    const originalZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    process.env.TZ = zone;
+    try {
+      const midnight = new Date(2026, month, date).getTime();
+      const following = new Date(2026, month, date + 1).getTime();
+      expect((following - midnight) / 3_600_000).toBe(hours);
+      const observations = [
+        { account: 'alice', at: midnight - 1, percentRemaining: 80 },
+        { account: 'alice', at: midnight, percentRemaining: 80 },
+        { account: 'alice', at: following - 1, percentRemaining: 77 },
+        { account: 'alice', at: following, percentRemaining: 77 },
+      ];
+      const usage = dailyUsage(observations, following + 3_600_000, 2);
+      expect(usage).toEqual([
+        { day: midnight, used: 3, incomplete: false },
+        { day: following, used: 0, incomplete: false },
+      ]);
+    } finally {
+      process.env.TZ = original ?? originalZone;
+      if (original === undefined) delete process.env.TZ;
+    }
+  });
+
   it('returns the latest days ending today, oldest first', () => {
     const usage = dailyUsage([], now);
     expect(usage).toHaveLength(30);
@@ -43,8 +81,8 @@ describe('dailyUsage', () => {
     expect(slot(usage, 15)).toEqual({ day: at(15, 0), used: 0, incomplete: false });
   });
   it('treats an allowance reset as an unknown edge instead of negative usage', () => {
-    // The allowance resets at 2026-09-15 00:00 UTC, which is 02:00 local on the 15th.
-    const ending = '2026-09-15T00:00:00.000Z';
+    // The allowance resets at 02:00 local on the 15th.
+    const ending = new Date(2026, 8, 15, 2).toISOString();
     const october = '2026-10-01T00:00:00.000Z';
     const observations = [observe(14, 10, 90, { resetDate: ending }), observe(14, 20, 95, { resetDate: ending }),
       observe(15, 9, 1, { resetDate: october }), observe(15, 12, 3, { resetDate: october }), observe(16, 9, 3, { resetDate: october })];
@@ -90,7 +128,7 @@ describe('QuotaHistory', () => {
       { account: 'Bob', at: at(16, 9), percentRemaining: 50 }]);
     await history.record([observe(16, 9, 20), observe(16, 12, 21), observe(16, 13, 22)]);
     await history.record([observe(16, 14, 21.5), observe(16, 15, 22)]);
-    const lines = (await readFile(file, 'utf8')).trim().split('\n');
+    const lines = (await readFile(file, 'utf8')).split('\n').filter(Boolean);
     expect(lines).toHaveLength(7);
     expect(history.get('ALICE').map((entry) => entry.at)).toEqual([at(15, 23), at(16, 9), at(16, 11), at(16, 13), at(16, 14), at(16, 15)]);
     expect(history.get('bob')).toEqual([{ account: 'bob', at: at(16, 9), percentRemaining: 50 }]);
@@ -120,11 +158,93 @@ describe('QuotaHistory', () => {
     await history.record([observe(16, 9, 21)]);
     expect(history.get('alice').map((entry) => entry.at)).toEqual([at(15, 9), at(16, 9)]);
   });
+
+  it('keeps an earlier baseline arriving after another window saved the day', async () => {
+    const file = await journal();
+    const history = new QuotaHistory(file);
+    await history.record([observe(16, 10, 25), observe(16, 12, 22)]);
+    await history.record([observe(16, 9, 22)]);
+    expect(slot(dailyUsage(history.get('alice'), now), 16).used).toBe(3);
+    const restarted = new QuotaHistory(file);
+    await restarted.record([]);
+    expect(slot(dailyUsage(restarted.get('alice'), now), 16).used).toBe(3);
+  });
+
+  it('preserves new observations after an interrupted append leaves a partial line', async () => {
+    const file = await journal();
+    const history = new QuotaHistory(file);
+    await history.record([observe(16, 9, 20)]);
+    await appendFile(file, '{"account":"alice","at":');
+    await history.record([observe(16, 10, 21)]);
+    const restarted = new QuotaHistory(file);
+    await restarted.record([]);
+    expect(restarted.get('alice').map((entry) => entry.percentRemaining)).toEqual([80, 79]);
+  });
+
+  it('retains distinct percentages and resets observed within the same millisecond', async () => {
+    const file = await journal();
+    const observations = [observe(16, 9, 20), observe(16, 9, 21),
+      observe(16, 9, 21, { resetDate: '2026-11-01T00:00:00.000Z' })];
+    const history = new QuotaHistory(file);
+    vi.mocked(appendFile).mockRejectedValueOnce(new Error('Temporary failure'));
+    await history.record(observations);
+    await history.record([]);
+    expect(history.get('alice')).toEqual(observations);
+    const restarted = new QuotaHistory(file);
+    await restarted.record([]);
+    expect(restarted.get('alice')).toEqual(observations);
+  });
+
+  it('retries a failed append on the next idle refresh without needing another quota log', async () => {
+    const file = await journal();
+    const history = new QuotaHistory(file);
+    vi.mocked(appendFile).mockRejectedValueOnce(new Error('Disk temporarily unavailable'));
+    const observations = [observe(16, 9, 20)];
+    await history.record(observations);
+    expect(history.problem).toContain('Disk temporarily unavailable');
+    expect(history.get('alice')).toEqual([]);
+    await history.record([]);
+    expect(history.problem).toBeUndefined();
+    const restarted = new QuotaHistory(file);
+    await restarted.record([]);
+    expect(restarted.get('alice')).toEqual(observations);
+  });
+
+  it('keeps simultaneous large window batches as complete journal lines', async () => {
+    const file = await journal();
+    const rows = (account: string) => Array.from({ length: 8_000 }, (_, index) =>
+      observe(16, 9, index % 2, { account, at: at(16, 9) + index }));
+    const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    let firstChunks = 0;
+    let resume!: () => void;
+    const bothStarted = new Promise<void>((resolve) => { resume = resolve; });
+    vi.mocked(appendFile).mockImplementation(async (path, data) => {
+      const buffer = Buffer.from(String(data));
+      if (buffer.length <= 512 * 1024) return fs.appendFile(path, buffer);
+      // Node splits large appendFile calls; force the two windows' chunks to overlap.
+      await fs.appendFile(path, buffer.subarray(0, 512 * 1024));
+      if (++firstChunks === 2) resume();
+      await bothStarted;
+      await fs.appendFile(path, buffer.subarray(512 * 1024));
+    });
+    vi.mocked(appendFile).mockClear();
+    await Promise.all([new QuotaHistory(file).record(rows('alice')), new QuotaHistory(file).record(rows('bob'))]);
+    const restarted = new QuotaHistory(file);
+    await restarted.record([]);
+    expect(restarted.get('alice')).toHaveLength(8_000);
+    expect(restarted.get('bob')).toHaveLength(8_000);
+    const writes = vi.mocked(appendFile).mock.calls.filter(([path]) => path === file);
+    expect(writes.length).toBeGreaterThan(2);
+    for (const [, data] of writes) {
+      expect(Buffer.byteLength(String(data))).toBeLessThanOrEqual(256 * 1024 + 1);
+      for (const line of String(data).split('\n').filter(Boolean)) expect(() => JSON.parse(line)).not.toThrow();
+    }
+  });
 });
 
 describe('dailyUsage edge cases from review', () => {
   it('keeps a day incomplete when the allowance resets inside it, even with idle neighbours', () => {
-    const ending = '2026-09-15T00:00:00.000Z';
+    const ending = new Date(2026, 8, 15, 2).toISOString();
     const october = '2026-10-01T00:00:00.000Z';
     const usage = dailyUsage([observe(14, 23, 61, { resetDate: ending }), observe(15, 1, 61, { resetDate: ending }),
       observe(15, 3, 0, { resetDate: october }), observe(15, 10, 2, { resetDate: october }), observe(16, 8, 2, { resetDate: october })], now);

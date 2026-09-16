@@ -14,7 +14,7 @@
     "compile:production": "npm run check-types && node esbuild.js --production",
     "vscode:prepublish": "npm test && npm run compile:production",
     "watch": "node esbuild.js --watch",
-    "test": "vitest run --passWithNoTests",
+    "test": "vitest run --dir test --passWithNoTests",
     "package": "vsce package --no-dependencies",
     "install:local": "vsce package --no-dependencies --out copilot-usage-extension.vsix && code --install-extension copilot-usage-extension.vsix --force && code --new-window ."
   },
