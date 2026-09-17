@@ -91,7 +91,8 @@ export function formatStatusBarTooltip(
   lines.push(...formatTopModelsTooltipRows(topModelRows));
 
   lines.push("", "---", "", ...formatHighestTodayTooltipRows(summary));
-  lines.push("", "---", "", ...formatMonthlyCreditTooltipRows(quotaState, now, history));
+  const monthlyCreditRows = formatMonthlyCreditTooltipRows(quotaState, now, history);
+  if (monthlyCreditRows.length) lines.push("", "---", "", ...monthlyCreditRows);
 
   const tooltip = new vscode.MarkdownString(lines.join("\n"), true);
   tooltip.supportHtml = true;
@@ -99,6 +100,7 @@ export function formatStatusBarTooltip(
 }
 
 function formatMonthlyCreditTooltipRows(state: QuotaState, now: number, history?: DailyUsage[]): string[] {
+  if (state.kind === "waiting" && state.reason) return [];
   const label = state.kind === "quota" ? formatQuotaLabel(state.quota, 'percentage-first') : "Waiting for Copilot quota";
   const pace = state.kind === "quota" ? formatQuotaPace(state.quota, state.observedAt, now) : undefined;
   const usage = escapeHtml(label).replaceAll(" ", "&nbsp;");
@@ -342,7 +344,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   function matchingQuotaState(): QuotaState {
     const state = quotaService.getState();
-    return state.kind === "quota" && pocView?.account && state.account.toLowerCase() !== pocView.account
+    return state.kind === "quota" && state.account && pocView?.account && state.account.toLowerCase() !== pocView.account
       ? { kind: "waiting" } : state;
   }
 
@@ -608,7 +610,7 @@ export function activate(context: vscode.ExtensionContext): void {
         applyResult({ summary: readySummary, diagnostics: latestDiagnostics });
       } else {
         // Quota remains useful when logging is off or the scan cannot run.
-        treeProvider.setQuotaState(quotaService.getState());
+        treeProvider.setQuotaState(matchingQuotaState());
       }
     }),
     vscode.commands.registerCommand("copilotUsage.refresh", () => runRefresh()),
@@ -626,16 +628,18 @@ export function activate(context: vscode.ExtensionContext): void {
         `@id:${COPILOT_FILE_LOGGING_SETTING}`,
       ),
     ),
-    vscode.commands.registerCommand("copilotUsage.showDiagnostics", async () =>
-      vscode.window.showInformationMessage(
+    vscode.commands.registerCommand("copilotUsage.showDiagnostics", async () => {
+      const quota = quotaService.getState();
+      return vscode.window.showInformationMessage(
         (latestDiagnostics
           ? formatDiagnostics(latestDiagnostics) + (pocView ? `\n\n${pocView.diagnostics}` : '') +
             (accountTrackingError ? `\n\nAccount tracking: ${accountTrackingError}` : '')
           : "No Copilot usage scan has completed yet.") + `\n\n${(await quotaLogging).reason}` +
-          (quotaHistory.problem ? `\n\n${quotaHistory.problem}` : ''),
+          (quotaHistory.problem ? `\n\n${quotaHistory.problem}` : '') +
+          (quota.kind === 'waiting' && quota.reason ? `\n\n${quota.reason}` : ''),
         { modal: true },
-      ),
-    ),
+      );
+    }),
     vscode.window.onDidChangeActiveColorTheme(() => {
       if (readySummary) updateStatusBarTooltip(readySummary);
     }),

@@ -1557,6 +1557,14 @@ describe("activate", () => {
     expect(context.globalState.update).not.toHaveBeenCalled();
   });
 
+  it('hides monthly quota and its graph when account evidence is unavailable', () => {
+    const tooltip = formatStatusBarTooltip(createEmptySummary(),
+      { kind: 'waiting', reason: 'Account evidence was lost.' }, Date.now(), []).value;
+    expect(tooltip).not.toContain('Monthly Credits');
+    expect(tooltip).not.toContain('<img ');
+    expect(tooltip).toContain('Today:');
+  });
+
   it("journals quota percentages per account and keeps the daily graph across restarts", async () => {
     vi.useFakeTimers();
     const start = new Date(2026, 8, 21, 12);
@@ -1629,6 +1637,151 @@ describe("activate", () => {
     expect(nextStatus.tooltip.value).toContain('title="21 Sep · 3% recorded · Incomplete"');
     expect(nextStatus.tooltip.value).not.toContain('title="21 Sep · 0%');
   }, 20_000);
+
+  it.each([false, true])("keeps quota visible without an account or history after lost log evidence; ledger saw switch: %s", async (ledgerSawSwitch) => {
+    vi.useFakeTimers();
+    const start = new Date(2026, 8, 21, 12);
+    vi.setSystemTime(start);
+    const root = await mkdtemp(join(tmpdir(), "copilot-truncated-log-"));
+    roots.push(root);
+    vi.stubEnv("APPDATA", join(root, "roaming"));
+    const host = join(root, "logs", "20260921T110000", "window1", "exthost");
+    const logFolder = join(host, "GitHub.copilot-chat");
+    const logPath = join(logFolder, "GitHub Copilot Chat.log");
+    await mkdir(logFolder, { recursive: true });
+    const quota = (time: string, percentRemaining: number, method = "processQuotaHeaders") =>
+      `2026-09-21 ${time} [trace] [ChatQuota] ${method}: ` + JSON.stringify({ quota: 1500, unlimited: false,
+        hasQuota: true, percentRemaining, additionalUsageUsed: 0, resetDate: "2026-10-01T00:00:00.000Z" }) + "\n";
+    const token = (time: string, account = "octocat") => `2026-09-21 ${time} [info] Logged in as ${account}\n2026-09-21 ${time} [info] Got Copilot token for ${account}\n`;
+    await writeFile(logPath, token("11:00:00.000") + quota("11:00:00.100", 60) + quota("11:10:00.000", 58.5));
+    const dataRoot = join(root, "usage");
+    await mkdir(dataRoot);
+    const realIndex = await vi.importActual<typeof import("../src/core/usageIndex")>("../src/core/usageIndex");
+    const { UsageIndex } = await import("../src/core/usageIndex");
+    vi.mocked(UsageIndex).mockImplementationOnce(function () { return new realIndex.UsageIndex(); });
+    locateCopilotDataPaths.mockResolvedValue([dataRoot]);
+    const storage = join(root, "storage");
+    const context = { ...createContext(), extensionMode: vscode.ExtensionMode.Production,
+      logUri: vscode.Uri.file(join(host, "leonbjorklund.copilot-usage-extension")), globalStorageUri: vscode.Uri.file(storage) };
+    const quotaRow = async () => (await registeredTreeProvider().getChildren())?.find((row) => row.kind === "quota");
+    try {
+      activate(context);
+      const status = vi.mocked(vscode.window.createStatusBarItem).mock.results[0].value;
+      await vi.waitFor(() => expect(status.text).toBe("No sessions today • 41.5/100%"), { timeout: 5_000 });
+      expect(status.tooltip.value).toContain('title="21 Sep · 1.5% recorded · Incomplete"');
+      const history = () => readFile(join(storage, "quota-history.jsonl"), "utf8");
+      const recorded = await history();
+      expect(recorded).toContain('"percentRemaining":60');
+
+      if (ledgerSawSwitch) {
+        // The independent readers can poll on either side of an account switch.
+        const pausedQuota = vi.spyOn(CopilotQuotaService.prototype, "refreshNow").mockResolvedValue();
+        try {
+          await appendFile(logPath, token("11:20:00.000", "bob"));
+          await commandCallback("copilotUsage.refresh")();
+          await commandCallback("copilotUsage.showDiagnostics")();
+          expect(vi.mocked(vscode.window.showInformationMessage).mock.calls.at(-1)?.[0]).toContain("Account POC: bob");
+          // A named quota still cannot be displayed under a different current account.
+          expect(status.text).toBe("No sessions today");
+          expect(await quotaRow()).toMatchObject({ state: { kind: "waiting" } });
+        } finally {
+          pausedQuota.mockRestore();
+        }
+      }
+
+      // Account lines are gone when quota next polls, including any switch in that gap.
+      await writeFile(logPath, quota("11:30:00.000", 55));
+      await commandCallback("copilotUsage.refresh")();
+      await vi.waitFor(() => expect(status.text).toBe("No sessions today • 45/100%"), { timeout: 5_000 });
+      const row = await quotaRow();
+      expect(row).toMatchObject({ state: { kind: "quota", quota: { percentRemaining: 55 } } });
+      expect(row).not.toHaveProperty("state.account");
+      expect(status.tooltip.value).toContain("Monthly Credits");
+      expect(status.tooltip.value).not.toContain("<img ");
+      expect(await history()).toBe(recorded);
+
+      await appendFile(logPath, quota("11:35:00.000", 54.5));
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.waitFor(() => expect(status.text).toBe("No sessions today • 45.5/100%"), { timeout: 5_000 });
+      expect(status.tooltip.value).not.toContain("<img ");
+      expect(await history()).toBe(recorded);
+
+      // Copilot names the account again when it mints its next token.
+      const recoveredAccount = ledgerSawSwitch ? "bob" : "octocat";
+      await appendFile(logPath, token("11:40:00.000", recoveredAccount)
+        + "2026-09-21 11:40:00.010 [debug] AuthenticationService: firing onDidCopilotTokenChange from getCopilotToken.\n"
+        + quota("11:40:00.020", 54, "processUserInfoQuotaSnapshot"));
+      await vi.advanceTimersByTimeAsync(2_000);
+      await vi.waitFor(async () => expect(await quotaRow()).toMatchObject({ state: { account: recoveredAccount, quota: { percentRemaining: 54 } } }), { timeout: 5_000 });
+      expect(status.tooltip.value).toContain("<img ");
+      expect(await history()).toContain('"percentRemaining":54');
+      expect(await history()).not.toContain('"percentRemaining":55');
+      expect(await history()).not.toContain('"percentRemaining":54.5');
+    } finally {
+      for (const disposable of context.subscriptions) disposable.dispose?.();
+      vi.useRealTimers();
+    }
+  }, 20_000);
+
+  it('keeps the tree account guard during Refresh while allowing anonymous quota', async () => {
+    vi.useFakeTimers();
+    const now = new Date(2026, 8, 21, 12);
+    vi.setSystemTime(now);
+    const root = await mkdtemp(join(tmpdir(), 'copilot-refresh-quota-'));
+    roots.push(root);
+    vi.stubEnv('APPDATA', join(root, 'roaming'));
+    const host = join(root, 'logs', '20260921T110000', 'window1', 'exthost');
+    const logFolder = join(host, 'GitHub.copilot-chat');
+    const logPath = join(logFolder, 'GitHub Copilot Chat.log');
+    await mkdir(logFolder, { recursive: true });
+    const quota = (percentRemaining: number, method = 'processQuotaHeaders') =>
+      '2026-09-21 11:30:00.000 [trace] [ChatQuota] ' + method + ': ' + JSON.stringify({
+        quota: 1500, unlimited: false, hasQuota: true, percentRemaining,
+      }) + '\n';
+    const token = (account: string) => `2026-09-21 11:00:00.000 [info] Got Copilot token for ${account}\n`
+      + '2026-09-21 11:00:00.010 [debug] AuthenticationService: firing onDidCopilotTokenChange from getCopilotToken.\n';
+    await writeFile(logPath, token('alice') + quota(60, 'processUserInfoQuotaSnapshot'));
+    const record = createUsageRecord(join(root, 'usage', 'chat.json'), new Date(2026, 8, 21, 10));
+    record.tokens = { ...record.tokens, input: 1000, total: 1000 };
+    record.billing = { aiCredits: 1, source: 'copilot-debug-log' };
+    state.usageIndexResult = { summary: aggregateUsage([record], now), diagnostics: createDiagnostics() };
+    const quotaRefresh = vi.spyOn(CopilotQuotaService.prototype, 'refreshNow');
+    const context = { ...createContext(), extensionMode: vscode.ExtensionMode.Production,
+      logUri: vscode.Uri.file(join(host, 'leonbjorklund.copilot-usage-extension')),
+      globalStorageUri: vscode.Uri.file(join(root, 'storage')) };
+    const quotaRow = async () => (await registeredTreeProvider().getChildren())?.find(row => row.kind === 'quota');
+    let finishRefresh: ((result: unknown) => void) | undefined;
+    let refresh: Promise<unknown> | undefined;
+    try {
+      await activateExtension(context);
+      await vi.waitFor(async () => expect(await quotaRow()).toMatchObject({ state: { account: 'alice' } }));
+      const index = usageIndexInstances[0];
+      await vi.waitFor(() => expect(index.save).toHaveBeenCalledTimes(1));
+      index.rebuild.mockImplementationOnce(() => new Promise(resolve => { finishRefresh = resolve; }));
+      refresh = commandCallback('copilotUsage.refresh')();
+      await vi.waitFor(() => expect(index.rebuild).toHaveBeenCalledTimes(2));
+
+      // Quota reads Bob's token while the session scan still holds Alice's view.
+      await appendFile(logPath, token('bob') + quota(80, 'processUserInfoQuotaSnapshot'));
+      await vi.advanceTimersByTimeAsync(2_000);
+      await quotaRefresh.mock.results.at(-1)?.value;
+      await commandCallback('copilotUsage.showDiagnostics')();
+      expect(vi.mocked(vscode.window.showInformationMessage).mock.calls.at(-1)?.[0]).toContain('Account POC: alice');
+      expect(await quotaRow()).toMatchObject({ state: { kind: 'waiting' } });
+      expect((await registeredTreeProvider().getChildren())?.some(row => row.kind === 'bucket')).toBe(true);
+
+      // Losing those lines permits current quota without naming either account.
+      await writeFile(logPath, quota(70));
+      await vi.advanceTimersByTimeAsync(2_000);
+      await quotaRefresh.mock.results.at(-1)?.value;
+      expect(await quotaRow()).toMatchObject({ state: { kind: 'quota', quota: { percentRemaining: 70 } } });
+      expect(await quotaRow()).not.toHaveProperty('state.account');
+    } finally {
+      finishRefresh?.(state.usageIndexResult);
+      await refresh;
+      quotaRefresh.mockRestore();
+    }
+  });
 
   it.each(['unknown account', 'known account', 'damaged tracking storage'])(
     'keeps local token and dollar displays without GitHub permission: %s', async (scenario) => {

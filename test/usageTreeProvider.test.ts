@@ -336,6 +336,19 @@ describe('UsageTreeProvider', () => {
     expect(provider.getTreeItem(rootChildren[1]).label).toBe('Today');
   });
 
+  it('shows quota without an account line when the account is unverified', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setSummary(createSummary());
+    provider.setQuotaState({ kind: 'quota', observedAt: Date.parse('2026-09-16T00:00:00Z'),
+      quota: { entitlement: 60_000, percentRemaining: 72.4, unlimited: false, hasQuota: true } });
+
+    const item = provider.getTreeItem(((await provider.getChildren()) ?? [])[0]);
+    expect(item.label).toBe('16 560 / 60 000 credits (27.6% / 100%)');
+    expect(item.description).toBeUndefined();
+    expect(item.tooltip).toContain(`${item.label}\n\nUsed credits are calculated from Copilot's reported percentage`);
+    expect(item.tooltip).not.toContain('Account');
+  });
+
   it('shows an unlimited plan without a tooltip', async () => {
     const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
     provider.setSummary(createSummary());
@@ -368,6 +381,18 @@ describe('UsageTreeProvider', () => {
     expect(item.label).toBe('Waiting for Copilot quota');
     expect(item.tooltip).toBeUndefined();
     expect(item.command).toBeUndefined();
+  });
+
+  it('hides unverifiable quota while keeping local sessions and restoring verified quota', async () => {
+    const provider = new UsageTreeProvider();
+    provider.setSummary(createSummary());
+    provider.setQuotaState({ kind: 'waiting', reason: 'Account evidence was lost.' });
+    const rows = (await provider.getChildren())!;
+    expect(rows.some(row => row.kind === 'quota')).toBe(false);
+    expect(rows.some(row => row.kind === 'bucket')).toBe(true);
+    provider.setQuotaState({ kind: 'quota', account: 'alice', observedAt: Date.now(),
+      quota: { entitlement: 1500, percentRemaining: 60, unlimited: false, hasQuota: true } });
+    expect((await provider.getChildren())![0].kind).toBe('quota');
   });
 
   it('keeps the quota row when Copilot logging is off and offers setup below it', async () => {

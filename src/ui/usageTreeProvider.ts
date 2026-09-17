@@ -192,7 +192,7 @@ export class UsageTreeProvider implements vscode.TreeDataProvider<UsageNode>, vs
 type QuotaRowState = Extract<QuotaState, { kind: "quota" | "waiting" }>;
 
 function showsQuotaRow(state: QuotaState): state is QuotaRowState {
-  return state.kind === "quota" || state.kind === "waiting";
+  return state.kind === "quota" || (state.kind === "waiting" && !state.reason);
 }
 
 function buildQuotaTreeItem(state: QuotaRowState): vscode.TreeItem {
@@ -207,9 +207,9 @@ function buildQuotaTreeItem(state: QuotaRowState): vscode.TreeItem {
     vscode.TreeItemCollapsibleState.None,
   );
   item.iconPath = new vscode.ThemeIcon("credit-card");
-  item.description = `Account: ${state.account}`;
+  if (state.account) item.description = `Account: ${state.account}`;
   if (!state.quota.unlimited && state.quota.entitlement > 0) {
-    item.tooltip = `${item.label}\n${item.description}\n\n${CREDIT_USAGE_EXPLANATION}`;
+    item.tooltip = `${item.label}\n${item.description ? `${item.description}\n` : ""}\n${CREDIT_USAGE_EXPLANATION}`;
   }
   return item;
 }
