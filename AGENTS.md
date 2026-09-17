@@ -40,7 +40,6 @@ Preview and F5 share real sign-ins. Use their test gates; never run old authenti
 - `src/core/quotaLogging.ts`: persistent scoped Copilot Trace logging.
 - `src/dev/accountUsagePoc.ts`: account attribution, the saved usage ledger, and its rollover into per-day snapshots. Runs in production despite its name.
 - `src/dev/preview.ps1`: development-window launcher.
-- `src/dev/reproQuotaLogTruncation.cjs`: Windows reproduction of quota loss when VS Code's logger empties the Copilot log, using synthetic temporary files.
 - `src/core/types.ts`: shared types; `test/`: Vitest tests and fixtures.
 
 ## Change guidance
