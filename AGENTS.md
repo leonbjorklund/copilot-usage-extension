@@ -44,6 +44,7 @@ Preview and F5 share real sign-ins. Use their test gates; never run old authenti
 
 ## Change guidance
 
+- If evidence shows an existing design rule causes incorrect behavior, present the evidence, proposed change, and drawbacks, then ask before changing the rule or affected product behavior. Do not preserve a bug merely to comply with the current design.
 - Prefer small changes in the relevant module. Preserve strict TypeScript and the CommonJS target; add focused regression tests for behavior changes.
 - Count only positive `copilotUsageNanoAiu`. Tokens are not billing; displayed USD is an estimate. Child runs bill to their parent session folder but never name the chat. Title-generation records supply metadata only.
 - Attribute newer requests only with a unique window match and successful authentication evidence. Preserve uncertain requests without assigning an account. Historical usage stays unassigned. Local usage must work when quota is unavailable.
