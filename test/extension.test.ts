@@ -195,7 +195,7 @@ import { activate, formatStatusBarSummary, formatStatusBarTooltip } from "../src
 import { aggregateUsage } from "../src/core/aggregator";
 import { dailyUsage } from "../src/core/quotaHistory";
 import { CopilotQuotaService } from "../src/core/quotaService";
-import { AccountUsagePoc } from "../src/dev/accountUsagePoc";
+import { AccountTracking } from "../src/core/accountTracking";
 import type { UsageNode } from "../src/ui/usageTreeProvider";
 
 const activatedContexts: vscode.ExtensionContext[] = [];
@@ -810,7 +810,7 @@ describe("activate", () => {
       "2026-09-21 12:00:06.000 [info] request done: requestId: [saved-request]\n" +
       "2026-09-21 12:00:11.000 [info] request done: requestId: [deleted-request]\n");
     const storage = join(root, "storage");
-    const ledger = join(storage, "account-poc");
+    const ledger = join(storage, "account-tracking");
     await mkdir(ledger, { recursive: true });
     const savedStart = JSON.stringify({ version: 1, startedAt: start.getTime() });
     await writeFile(join(ledger, "start.json"), savedStart);
@@ -822,7 +822,7 @@ describe("activate", () => {
       debugRequest: { responseId: "saved-request", spanId: "saved-span", durationMs: 1000 },
     };
     const savedSummary = aggregateUsage([savedRecord], new Date());
-    const seed = new AccountUsagePoc(ledger, logFolder, [join(root, "logs")]);
+    const seed = new AccountTracking(ledger, logFolder, [join(root, "logs")]);
     await seed.refresh(savedSummary, new Date());
     const deletedRecord: UsageRecord = {
       ...savedRecord, chatId: "deleted-chat", title: "Deleted cached request",
@@ -878,11 +878,11 @@ describe("activate", () => {
     const root = await mkdtemp(join(tmpdir(), "copilot-cache-damaged-ledger-"));
     roots.push(root);
     vi.stubEnv("APPDATA", join(root, "roaming"));
-    const ledger = join(root, "storage", "account-poc");
+    const ledger = join(root, "storage", "account-tracking");
     await mkdir(ledger, { recursive: true });
     const savedStart = JSON.stringify({ version: 1, startedAt: Date.now() - 60_000 });
     await writeFile(join(ledger, "start.json"), savedStart);
-    await writeFile(join(ledger, "observer-abcdef.jsonl"), "broken\n");
+    await writeFile(join(ledger, "ledger.jsonl"), '{"kind":"bill"}\n');
     state.restoredResult = { summary: createSummaryWithTokens(999000), diagnostics: createDiagnostics() };
     state.usageIndexResult = { summary: createSummaryWithTokens(1000), diagnostics: createDiagnostics() };
     let finishPoll!: (value: unknown) => void;
@@ -901,7 +901,7 @@ describe("activate", () => {
     await vi.waitFor(() => expect(index.save).toHaveBeenCalledTimes(1));
     expect(status.text).toBe("1k");
     expect((await registeredTreeProvider().getChildren())?.some((row) => row.kind === "error")).toBe(true);
-    expect(await readFile(join(ledger, "observer-abcdef.jsonl"), "utf8")).toBe("broken\n");
+    expect(await readFile(join(ledger, "ledger.jsonl"), "utf8")).toBe('{"kind":"bill"}\n');
     expect(await readFile(join(ledger, "start.json"), "utf8")).toBe(savedStart);
   });
 
@@ -921,7 +921,7 @@ describe("activate", () => {
       "2026-09-21 12:00:10.000 [info] Got Copilot token for bob\n" +
       "2026-09-21 12:00:16.000 [info] request done: requestId: [bob-request]\n");
     const storage = join(root, "storage");
-    const ledger = join(storage, "account-poc");
+    const ledger = join(storage, "account-tracking");
     await mkdir(ledger, { recursive: true });
     await writeFile(join(ledger, "start.json"), JSON.stringify({ version: 1, startedAt: start.getTime() }));
     const makeRecord = (chatId: string, offset: number, tokens: number): UsageRecord => ({
@@ -938,7 +938,7 @@ describe("activate", () => {
       await mkdir(join(root, "usage", record.chatId), { recursive: true });
       await writeFile(record.filePath, JSON.stringify({ type: "session_start", ts: record.timestamp.getTime() - 1_000 }) + "\n");
     }
-    const seed = new AccountUsagePoc(ledger, logFolder, [join(root, "logs")]);
+    const seed = new AccountTracking(ledger, logFolder, [join(root, "logs")]);
     await seed.refresh(aggregateUsage([alice, bob], new Date()), new Date());
     state.restoredResult = { summary: aggregateUsage([historical, alice, bob], new Date()), diagnostics: createDiagnostics() };
     let finishPoll!: (value: unknown) => void;
@@ -1524,7 +1524,7 @@ describe("activate", () => {
     await vi.waitFor(() => expect(status.text).toBe(expected));
     expect(status.tooltip.value).not.toContain('monthly pace');
     expect(status.tooltip.value).not.toMatch(/title="[^\"]* · [\d<]/);
-    const started = await readFile(join(storage, 'account-poc', 'start.json'), 'utf8');
+    const started = await readFile(join(storage, 'account-tracking', 'start.json'), 'utf8');
     expect(JSON.parse(started).startedAt).toBeGreaterThanOrEqual(start.getTime());
     expect(JSON.parse(started).startedAt).toBeLessThanOrEqual(Date.now());
     const snapshot = (time: string, remaining: number) => `2026-09-21 ${time} [trace] [ChatQuota] processUserInfoQuotaSnapshot: `
@@ -1541,7 +1541,7 @@ describe("activate", () => {
     await appendFile(log, '2026-09-21 12:00:03.000 [info] Got Copilot token for bob\n');
     await vi.advanceTimersByTimeAsync(2_000);
     await vi.waitFor(() => expect(status.text).toBe(expected));
-    const journal = await readFile(join(storage, 'account-poc', 'ledger.jsonl'), 'utf8');
+    const journal = await readFile(join(storage, 'account-tracking', 'ledger.jsonl'), 'utf8');
     expect(journal.split('\n').filter(Boolean).map(line => JSON.parse(line)).some(entry => entry.kind === 'bill')).toBe(false);
     for (const disposable of context.subscriptions.splice(0)) disposable.dispose?.();
     vi.mocked(UsageIndex).mockImplementationOnce(function () { return new realIndex.UsageIndex(); });
@@ -1551,7 +1551,7 @@ describe("activate", () => {
       expect(status.text).toBe(expected);
       expect(status.tooltip.value).not.toContain('Showing saved sessions. Checking for changes.');
     });
-    expect(await readFile(join(storage, 'account-poc', 'start.json'), 'utf8')).toBe(started);
+    expect(await readFile(join(storage, 'account-tracking', 'start.json'), 'utf8')).toBe(started);
     if (scenario === 'previous release upgrade') expect(await readFile(oldLog, 'utf8')).toBe(oldContents);
     expect(vscode.window.showInformationMessage).not.toHaveBeenCalled();
     expect(context.globalState.update).not.toHaveBeenCalled();
@@ -1680,7 +1680,7 @@ describe("activate", () => {
           await appendFile(logPath, token("11:20:00.000", "bob"));
           await commandCallback("copilotUsage.refresh")();
           await commandCallback("copilotUsage.showDiagnostics")();
-          expect(vi.mocked(vscode.window.showInformationMessage).mock.calls.at(-1)?.[0]).toContain("Account POC: bob");
+          expect(vi.mocked(vscode.window.showInformationMessage).mock.calls.at(-1)?.[0]).toContain("Account: bob");
           // A named quota still cannot be displayed under a different current account.
           expect(status.text).toBe("No sessions today");
           expect(await quotaRow()).toMatchObject({ state: { kind: "waiting" } });
@@ -1766,7 +1766,7 @@ describe("activate", () => {
       await vi.advanceTimersByTimeAsync(2_000);
       await quotaRefresh.mock.results.at(-1)?.value;
       await commandCallback('copilotUsage.showDiagnostics')();
-      expect(vi.mocked(vscode.window.showInformationMessage).mock.calls.at(-1)?.[0]).toContain('Account POC: alice');
+      expect(vi.mocked(vscode.window.showInformationMessage).mock.calls.at(-1)?.[0]).toContain('Account: alice');
       expect(await quotaRow()).toMatchObject({ state: { kind: 'waiting' } });
       expect((await registeredTreeProvider().getChildren())?.some(row => row.kind === 'bucket')).toBe(true);
 
@@ -1808,11 +1808,11 @@ describe("activate", () => {
             inputTokens: 800, outputTokens: 200, copilotUsageNanoAiu: 20_000_000_000 } },
       ].map(row => JSON.stringify(row)).join('\n') + '\n');
       const storage = join(root, 'storage');
-      const ledger = join(storage, 'account-poc');
+      const ledger = join(storage, 'account-tracking');
       await mkdir(ledger, { recursive: true });
       const savedStart = JSON.stringify({ version: 1, startedAt: start.getTime() });
       await writeFile(join(ledger, 'start.json'), savedStart);
-      if (scenario === 'damaged tracking storage') await writeFile(join(ledger, 'observer-abcdef.jsonl'), 'broken\n');
+      if (scenario === 'damaged tracking storage') await writeFile(join(ledger, 'ledger.jsonl'), '{"kind":"bill"}\n');
       const realIndex = await vi.importActual<typeof import('../src/core/usageIndex')>('../src/core/usageIndex');
       const { UsageIndex } = await import('../src/core/usageIndex');
       vi.mocked(UsageIndex).mockImplementationOnce(function () { return new realIndex.UsageIndex(); });
@@ -1837,7 +1837,7 @@ describe("activate", () => {
         if (scenario === 'damaged tracking storage') {
           await commandCallback('copilotUsage.showDiagnostics')();
           expect(vi.mocked(vscode.window.showInformationMessage).mock.calls.at(-1)?.[0]).toContain('Account tracking:');
-          expect(await readFile(join(ledger, 'observer-abcdef.jsonl'), 'utf8')).toBe('broken\n');
+          expect(await readFile(join(ledger, 'ledger.jsonl'), 'utf8')).toBe('{"kind":"bill"}\n');
         }
         expect(await readFile(join(ledger, 'start.json'), 'utf8')).toBe(savedStart);
       } finally {
@@ -1857,7 +1857,7 @@ describe("activate", () => {
     vi.useFakeTimers();
     const start = new Date(2026, 8, 21, 12);
     vi.setSystemTime(start);
-    const root = await mkdtemp(join(tmpdir(), "copilot-poc-integration-"));
+    const root = await mkdtemp(join(tmpdir(), "copilot-tracking-integration-"));
     vi.mocked(homedir).mockReturnValue(root);
     roots.push(root);
     vi.stubEnv("APPDATA", join(root, "roaming"));

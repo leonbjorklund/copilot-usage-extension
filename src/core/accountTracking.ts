@@ -1,17 +1,16 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFile, link, mkdir, open, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 
-import { aggregateUsage, collectModelUsage, mergeCostEstimates, mergeUsageTotals, rankModelUsage } from '../core/aggregator';
-import type { ModelUsage } from '../core/aggregator';
-import { TITLE_PRIORITY } from '../core/types';
-import type { ChatUsageSummary, CopilotCostEstimate, UsageRecord, UsageSummary } from '../core/types';
+import { aggregateUsage, collectModelUsage, mergeCostEstimates, mergeUsageTotals, rankModelUsage } from './aggregator';
+import type { ModelUsage } from './aggregator';
+import { TITLE_PRIORITY } from './types';
+import type { ChatUsageSummary, CopilotCostEstimate, UsageRecord, UsageSummary } from './types';
 
 const MAX_FILE_BYTES = 32 * 1024 * 1024;
 const MATCH_TOLERANCE_MS = 2_000;
 const SETTLE_MS = 2_000;
 const SUMMARY_TOLERANCE_MS = 25;
-const MAX_JOURNALS = 256;
 // Below Node's 512 KiB appendFile chunk, so each group is one write call.
 const MAX_APPEND_BYTES = 256 * 1024;
 const READ_CHUNK_BYTES = 64 * 1024;
@@ -23,18 +22,17 @@ const MAX_LINE_BYTES = 4 * 1024 * 1024;
  * freezing no longer changes attribution.
  */
 const FREEZE_MS = 7 * 86_400_000;
-/** Version 1 snapshots already compacted requests after three days. */
-const LEGACY_FREEZE_MS = 3 * 86_400_000;
 /** A rolled ledger waits this long for in-flight appends before it is frozen. */
 const ROLL_SETTLE_MS = 10 * 60_000;
 /** A snapshot temp file older than this belongs to a window that died mid-write. */
 const STALE_TEMP_MS = 60 * 60_000;
 const LIVE_LEDGER = 'ledger.jsonl';
-const LEGACY_JOURNAL = /^observer-[\da-f-]+\.jsonl$/;
 const ROLLED_LEDGER = /^ledger-(\d+)-[\da-f-]+\.jsonl$/;
 const SNAPSHOT = /^snapshot-(\d+)-[\da-f-]+\.jsonl$/;
 const SNAPSHOT_TEMP = /^snapshot-(\d+)-[\da-f-]+\.tmp$/;
 const SNAPSHOT_WRITER = '00000000-0000-0000-0000-000000000000';
+/** A window log VS Code has already rotated aside; it never grows again. */
+const ROTATED_LOG = /\.\d+\.log$/i;
 
 type AuthEvent = { kind: 'login' | 'token' | 'unknown'; stream: string; at: number; account?: string };
 type Completion = { kind: 'completion'; stream: string; at: number; responseId: string };
@@ -49,7 +47,7 @@ type Entry = Evidence | Saved;
 type Absorbed = { name: string; bytes: number };
 export type Attribution = { account: string } | { excluded: string } | { pending: string };
 
-export interface AccountPocView {
+export interface AccountTrackingView {
   summary: UsageSummary;
   account?: string;
   startedAt: Date;
@@ -261,6 +259,10 @@ function matchesSummary(record: UsageRecord, summary: RequestSummary): boolean {
     summary.model.split(' -> ').includes(record.model);
 }
 
+function digest(bytes: Buffer): string {
+  return createHash('sha256').update(bytes).digest('hex');
+}
+
 function pathIdentity(path: string): string {
   const absolute = resolve(path);
   return process.platform === 'win32' ? absolute.toLowerCase() : absolute;
@@ -281,6 +283,23 @@ function titledRecord(entry: Saved): UsageRecord {
     { ...entry.record, titleTimestamp: new Date(entry.titleTimestamp), titleModifiedAt: entry.titleModifiedAt };
 }
 
+/** A window log's consumed prefix, for proving the file still continues it. */
+interface LogOffset {
+  /** Stat size of a fully consumed read; -1 after a partial read, so it is read again. */
+  size: number;
+  modified: number;
+  consumed: number;
+  digest: string;
+}
+
+interface LogRead {
+  file: string;
+  /** Whole lines read from the file. */
+  bytes: Buffer;
+  prior?: LogOffset;
+  continuous: boolean;
+}
+
 interface FileState {
   /** Byte offset of the last complete line already loaded. */
   loaded: number;
@@ -294,7 +313,7 @@ interface FileState {
   keys?: Set<string>;
 }
 
-type FileMode = 'snapshot' | 'legacy' | 'settled' | 'growing' | 'live';
+type FileMode = 'snapshot' | 'settled' | 'growing' | 'live';
 
 interface StorageView {
   /** Files read to their end that the next snapshot may absorb. */
@@ -322,10 +341,9 @@ interface FrozenAggregate {
  * a snapshot: old requests become per-day rollups with their final decision,
  * their request evidence is dropped, auth history and younger lines are copied.
  * Shared files change only by rename or by adding a whole file, and every
- * window discards files the newest snapshot lists as absorbed. Older
- * per-process observer journals are read until the first snapshot absorbs them.
+ * window discards files the newest snapshot lists as absorbed.
  */
-export class AccountUsagePoc {
+export class AccountTracking {
   private readonly entries = new Map<string, Entry>();
   /** Saved entry keys by chat, for retained titles and the scanner's retained set. */
   private readonly chats = new Map<string, Set<string>>();
@@ -338,11 +356,12 @@ export class AccountUsagePoc {
   private snapshotAt = -Infinity;
   private absorbed = new Map<string, number>();
   private readonly frozenKeys = new Set<string>();
-  // Snapshots written before request IDs were retained cannot identify older replays.
-  private legacyBefore = -Infinity;
   private frozen: FrozenAggregate | undefined;
   private revision = 0;
-  private readonly offsets = new Map<string, { size: number; modified: number }>();
+  private readonly offsets = new Map<string, LogOffset>();
+  /** Newest line time this process has read from each window's logs. */
+  private readonly streamReadTo = new Map<string, number>();
+  private lostLogs = 0;
   private readonly sessionStarts = new Map<string, number | undefined>();
   private readonly ledger: string;
   private cutoff = -Infinity;
@@ -358,13 +377,13 @@ export class AccountUsagePoc {
     return this.chatIds ??= [...this.chats.keys()];
   }
 
-  refresh(summary: UsageSummary, now = new Date(), titleMetadata: UsageRecord[] = []): Promise<AccountPocView> {
+  refresh(summary: UsageSummary, now = new Date(), titleMetadata: UsageRecord[] = []): Promise<AccountTrackingView> {
     const work = this.queue.then(() => this.refreshOnce(summary, now, titleMetadata));
     this.queue = work.catch(() => undefined);
     return work;
   }
 
-  private async refreshOnce(summary: UsageSummary, now: Date, titleMetadata: UsageRecord[]): Promise<AccountPocView> {
+  private async refreshOnce(summary: UsageSummary, now: Date, titleMetadata: UsageRecord[]): Promise<AccountTrackingView> {
     await this.initialize(now.getTime());
     this.cutoff = now.getTime() - FREEZE_MS;
     const storage = await this.readStorage(now.getTime());
@@ -372,16 +391,58 @@ export class AccountUsagePoc {
     const replaced = new Map<string, Entry | undefined>();
     const readProblems = [...storage.problems];
     const logFiles = await this.discoverLogs(readProblems);
-    for (const file of logFiles) {
-      try {
-        const text = await this.readChanged(file);
-        if (text === undefined) continue;
-        for (const entry of parseAccountEvidence(text, resolve(dirname(file)))) {
+    // Read each window's logs together: a rotated copy of the same window's log
+    // can still hold bytes that vanished from the file being written.
+    const streams = new Map<string, string[]>();
+    for (const file of logFiles) push(streams, pathIdentity(dirname(file)), file);
+    // Restored when the ledger append fails, so the next refresh rereads the
+    // logs and can still recognise content that went missing.
+    const priorOffsets = new Map<string, LogOffset | undefined>();
+    const priorReadTo = new Map<string, number | undefined>();
+    const lostBefore = this.lostLogs;
+    for (const [stream, files] of streams) {
+      // Anything erased before it was read is newer than every line this
+      // process already read from this window.
+      const gapAt = this.streamReadTo.get(stream);
+      priorReadTo.set(stream, gapAt);
+      const reads: LogRead[] = [];
+      for (const file of files) {
+        try {
+          priorOffsets.set(file, this.offsets.get(file));
+          const read = await this.readChanged(file);
+          if (read) reads.push(read);
+        } catch {
+          readProblems.push(`Cannot read Copilot log: ${file}`);
+        }
+      }
+      const lost = reads.filter((read) => read.prior && !read.continuous &&
+        // A rotated file never grows again, so once it was read to its end,
+        // rotation replacing or deleting it drops nothing this window had yet
+        // to read. Only the file being written can lose unread lines.
+        !(read.prior.size >= 0 && ROTATED_LOG.test(basename(read.file))))
+        .filter((read) => !reads.some((other) => other.bytes.length >= read.prior!.consumed &&
+          digest(other.bytes.subarray(0, read.prior!.consumed)) === read.prior!.digest));
+      if (lost.length) {
+        this.lostLogs++;
+        // Treat the replacement as a possible switch, even if the next token
+        // names the same account. Everything erased was written after reading
+        // stopped, so uncertainty starts there, and a later token that another
+        // window recorded before the lines vanished still names an owner. Place
+        // it just past the matching tolerance: the request that completed last
+        // was read in full and must not be rejected as a change around itself,
+        // while one dispatched into the lost span still straddles the marker.
+        // Never later than this refresh, or a prompt detection and a clock
+        // stamped in the future would both leave the old account on display.
+        this.add({ kind: 'unknown', stream, at: Math.min(now.getTime(),
+          (gapAt ?? Math.min(...lost.map((read) => read.prior!.modified))) + MATCH_TOLERANCE_MS + 1) },
+          additions, replaced);
+      }
+      for (const read of reads) {
+        for (const entry of parseAccountEvidence(read.bytes.toString('utf8'), stream)) {
+          if (entry.at > (this.streamReadTo.get(stream) ?? -Infinity)) this.streamReadTo.set(stream, entry.at);
           // Request evidence older than the freeze window can no longer resolve anything.
           if (isAuth(entry) || (entry.at >= this.startedAt && entry.at >= this.cutoff)) this.add(entry, additions, replaced);
         }
-      } catch {
-        readProblems.push(`Cannot read Copilot log: ${file}`);
       }
     }
     // A request may arrive while its session header is still missing. Retry
@@ -405,7 +466,7 @@ export class AccountUsagePoc {
           record.hiddenFromExplorer || !(record.billing?.aiCredits)) continue;
         const previous = this.entries.get(billKey(record, true));
         // A request this old may already be inside a rollup; only known bills keep updating.
-        if (!previous && record.timestamp.getTime() < Math.max(this.cutoff, this.legacyBefore)) continue;
+        if (!previous && record.timestamp.getTime() < this.cutoff) continue;
         const key = billKey(record);
         const sessionStart = previous?.kind === 'bill' ? previous.sessionStart : await this.readSessionStart(record.filePath);
         const savedRecord = { ...record, title: chat.title, titlePriority: chat.titlePriority ?? record.titlePriority };
@@ -449,7 +510,15 @@ export class AccountUsagePoc {
         const retained = [...this.entries.values()];
         this.resetEntries();
         for (const entry of retained) this.add(entry);
-        for (const file of logFiles) this.offsets.delete(file);
+        for (const [file, prior] of priorOffsets) {
+          if (prior) this.offsets.set(file, prior);
+          else this.offsets.delete(file);
+        }
+        for (const [stream, readTo] of priorReadTo) {
+          if (readTo === undefined) this.streamReadTo.delete(stream);
+          else this.streamReadTo.set(stream, readTo);
+        }
+        this.lostLogs = lostBefore;
         throw error;
       }
     }
@@ -504,11 +573,12 @@ export class AccountUsagePoc {
     const problem = readProblems[0];
     const torn = [...this.files.values()].reduce((total, file) => total + file.torn, 0);
     const diagnostics = [
-      `Account POC: ${account ?? 'unknown'}`,
+      `Account: ${account ?? 'unknown'}`,
       `Tracking began: ${new Date(this.startedAt).toLocaleString()}`,
       `Attributed requests for this account: ${attributed}`,
       ...(!account ? ['Current account unavailable; showing combined local usage.'] : []),
       `Excluded switch requests: ${excluded}; unresolved requests: ${pending}`,
+      ...(this.lostLogs ? [`Times a window log lost account history since this window started: ${this.lostLogs}`] : []),
       ...[...reasons].map(([reason, count]) => `${count}: ${reason}`),
       ...readProblems,
       ...(torn ? [`Skipped unreadable ledger lines: ${torn}`] : []),
@@ -534,7 +604,7 @@ export class AccountUsagePoc {
     }
     const data = JSON.parse(await readFile(path, 'utf8'));
     if (data.version !== 1 || !Number.isFinite(data.startedAt) || data.startedAt <= 0) {
-      throw new Error('Account POC start file is invalid. Existing tracking data was left untouched.');
+      throw new Error('Account tracking start file is invalid. Existing tracking data was left untouched.');
     }
     this.startedAt = data.startedAt;
     this.initialized = true;
@@ -614,20 +684,17 @@ export class AccountUsagePoc {
     this.absorbed = new Map();
     this.snapshotAt = -Infinity;
     this.frozenKeys.clear();
-    this.legacyBefore = -Infinity;
   }
 
   /**
    * Loads the newest snapshot, then every file it does not list as absorbed:
-   * legacy journals, rolled ledgers, and the live ledger. A newer snapshot
-   * replaces everything loaded before, so the state is rebuilt from disk.
+   * rolled ledgers and the live ledger. A newer snapshot replaces everything
+   * loaded before, so the state is rebuilt from disk.
    */
   private async readStorage(now: number): Promise<StorageView> {
     const problems: string[] = [];
     for (let attempt = 0; ; attempt++) {
       const names = await readdir(this.storage);
-      const legacy = names.filter((name) => LEGACY_JOURNAL.test(name));
-      if (legacy.length > MAX_JOURNALS) throw new Error('Account POC has too many observer journals. Tracking data was left untouched.');
       const snapshots = names.filter((name) => SNAPSHOT.test(name)).sort(compareSnapshots).reverse();
       const newest = snapshots[0];
       if (newest !== this.snapshot) {
@@ -636,7 +703,7 @@ export class AccountUsagePoc {
       }
       if (newest && !await this.readJournal(newest, 'snapshot')) {
         if (attempt < 2) continue;
-        throw new Error('Account POC snapshot changed while it was being read.');
+        throw new Error('Account tracking snapshot changed while it was being read.');
       }
       for (const name of names) {
         const bytes = this.absorbed.get(name);
@@ -649,11 +716,6 @@ export class AccountUsagePoc {
       }
       let stable = true;
       const absorbable: Absorbed[] = [];
-      for (const name of legacy) {
-        if (this.absorbed.has(name)) continue;
-        if (await this.readJournal(name, 'legacy')) absorbable.push({ name, bytes: this.files.get(name)!.loaded });
-        else stable = false;
-      }
       const rolled = names.filter((name) => ROLLED_LEDGER.test(name) && !this.absorbed.has(name))
         .sort((a, b) => rolledAt(a) - rolledAt(b));
       // A rolled ledger this window has not seen means another window replaced
@@ -711,7 +773,7 @@ export class AccountUsagePoc {
           // A line this long cannot be an entry. Drop its bytes; whatever
           // remains before its newline is counted when it fails to parse.
           if (pending.length > MAX_LINE_BYTES) {
-            if (mode === 'snapshot') throw new Error('Invalid account POC snapshot. Tracking data was left untouched.');
+            if (mode === 'snapshot') throw new Error('Invalid account tracking snapshot. Tracking data was left untouched.');
             state.loaded = position;
             pending = Buffer.alloc(0);
           }
@@ -722,35 +784,31 @@ export class AccountUsagePoc {
           let parsed;
           try { parsed = JSON.parse(line); }
           catch {
-            if (mode === 'snapshot') throw new Error('Invalid account POC snapshot. Tracking data was left untouched.');
-            if (mode === 'legacy') throw new Error('Invalid account POC evidence journal. Tracking data was left untouched.');
+            if (mode === 'snapshot') throw new Error('Invalid account tracking snapshot. Tracking data was left untouched.');
             state.torn++;
             continue;
           }
           if (parsed?.kind === 'snapshot') {
-            if (mode !== 'snapshot' || !first) throw new Error('Invalid account POC snapshot. Tracking data was left untouched.');
+            if (mode !== 'snapshot' || !first) throw new Error('Invalid account tracking snapshot. Tracking data was left untouched.');
             const header = validateSnapshot(parsed);
             this.snapshotAt = header.at;
             this.absorbed = new Map(header.absorbed.map((file) => [file.name, file.bytes]));
             state.expectedLines = header.lines;
-            this.legacyBefore = header.version === 1 ? header.at - LEGACY_FREEZE_MS : header.legacyBefore ?? -Infinity;
             first = false;
             continue;
           }
-          if (mode === 'snapshot' && first) throw new Error('Invalid account POC snapshot. Tracking data was left untouched.');
+          if (mode === 'snapshot' && first) throw new Error('Invalid account tracking snapshot. Tracking data was left untouched.');
           state.lines++;
           if (parsed?.kind === 'frozen-keys') {
             if (mode !== 'snapshot' || !Array.isArray(parsed.keys) ||
               parsed.keys.some((key: unknown) => typeof key !== 'string' || !/^[a-f\d]{64}$/.test(key))) {
-              throw new Error('Invalid account POC snapshot. Tracking data was left untouched.');
+              throw new Error('Invalid account tracking snapshot. Tracking data was left untouched.');
             }
             for (const key of parsed.keys) this.frozenKeys.add(key);
             continue;
           }
           const entry = validateEntry(parsed);
           const key = entryKey(entry);
-          if (entry.kind === 'bill' && mode !== 'snapshot' && !this.entries.has(key) &&
-            entry.record.timestamp.getTime() < this.legacyBefore) continue;
           state.keys?.add(key);
           if (entry.kind === 'bill') state.oldest = Math.min(state.oldest, entry.record.timestamp.getTime());
           else if (entry.kind === 'completion' || entry.kind === 'request-summary') state.oldest = Math.min(state.oldest, entry.at);
@@ -764,10 +822,10 @@ export class AccountUsagePoc {
       // or unfinished line must not authorize retiring their source journals.
       if (mode === 'snapshot' && (first || pending.length > 0 || position < info.size ||
         (state.expectedLines !== undefined && state.lines !== state.expectedLines))) {
-        throw new Error('Invalid account POC snapshot. Tracking data was left untouched.');
+        throw new Error('Invalid account tracking snapshot. Tracking data was left untouched.');
       }
-      // A trailing fragment in a legacy journal or settled rolled ledger is
-      // final: count it once instead of rereading it.
+      // A trailing fragment in a settled rolled ledger is final: count it once
+      // instead of rereading it.
       if (mode !== 'live' && mode !== 'growing' && state.loaded < info.size) {
         if (pending.length) state.torn++;
         state.loaded = info.size;
@@ -865,19 +923,12 @@ export class AccountUsagePoc {
       }
     }
     const carried = [...this.absorbed].filter(([name]) => names.includes(name)).map(([name, bytes]) => ({ name, bytes }));
+    const keys = [...frozenKeys];
     const keyLines: string[] = [];
-    let keys: string[] = [];
-    for (const key of frozenKeys) {
-      keys.push(key);
-      if (keys.length === 1_024) {
-        keyLines.push(JSON.stringify({ kind: 'frozen-keys', keys }));
-        keys = [];
-      }
-    }
-    if (keys.length) keyLines.push(JSON.stringify({ kind: 'frozen-keys', keys }));
+    for (let i = 0; i < keys.length; i += 1_024) keyLines.push(JSON.stringify({ kind: 'frozen-keys', keys: keys.slice(i, i + 1_024) }));
     const body = [...keyLines, ...[...rollups.values()].map((entry) => JSON.stringify(entry)), ...lines];
     const header: SnapshotHeader = { kind: 'snapshot', version: 2, at: now, absorbed: [...carried, ...absorbable],
-      lines: body.length, ...(Number.isFinite(this.legacyBefore) ? { legacyBefore: this.legacyBefore } : {}) };
+      lines: body.length };
     const text = [JSON.stringify(header), ...body].join('\n') + '\n';
     const id = `${now}-${randomUUID()}`;
     const temp = join(this.storage, `snapshot-${id}.tmp`);
@@ -917,13 +968,18 @@ export class AccountUsagePoc {
     return byChat.size ? this.frozen : undefined;
   }
 
-  private async readChanged(file: string): Promise<string | undefined> {
+  /**
+   * Reads a window log that changed since the last refresh. Reports whether the
+   * bytes this process already consumed are still the start of the same file:
+   * a replaced or truncated log may have dropped an account change.
+   */
+  private async readChanged(file: string): Promise<LogRead | undefined> {
     const handle = await open(file, 'r');
     try {
       const info = await handle.stat();
       const previous = this.offsets.get(file);
       if (previous?.size === info.size && previous.modified === info.mtimeMs) return undefined;
-      if (info.size > MAX_FILE_BYTES) throw new Error(`Account POC file exceeds its read limit: ${file}`);
+      if (info.size > MAX_FILE_BYTES) throw new Error(`Account tracking file exceeds its read limit: ${file}`);
       const buffer = Buffer.alloc(info.size);
       let read = 0;
       while (read < buffer.length) {
@@ -934,14 +990,13 @@ export class AccountUsagePoc {
       // Read only the checked descriptor size, even if its contents grow.
       // Event keys deduplicate replay and tolerate delayed writes.
       const complete = buffer.subarray(0, read).lastIndexOf(10) + 1;
-      if (complete === info.size) {
-        this.offsets.set(file, { size: info.size, modified: info.mtimeMs });
-      } else {
-        // A complete last line does not prove the read reached the stat's size.
-        // Retry snapshots taken while the writer was replacing or growing logs.
-        this.offsets.delete(file);
-      }
-      return buffer.toString('utf8', 0, complete);
+      const bytes = buffer.subarray(0, complete);
+      // A complete last line does not prove the read reached the stat's size.
+      // A partial read stores no reusable size, so the file is read again.
+      this.offsets.set(file, { size: complete === info.size ? info.size : -1, modified: info.mtimeMs,
+        consumed: complete, digest: digest(bytes) });
+      return { file, bytes, prior: previous, continuous: previous === undefined ||
+        (complete >= previous.consumed && digest(buffer.subarray(0, previous.consumed)) === previous.digest) };
     } finally {
       await handle.close();
     }
@@ -965,7 +1020,7 @@ export class AccountUsagePoc {
             const hosts = await readdir(windowRoot, { withFileTypes: true });
             for (const host of hosts.filter((entry) => entry.isDirectory() && /^exthost\d*$/.test(entry.name))) {
               folders.add(pathIdentity(join(windowRoot, host.name, 'GitHub.copilot-chat')));
-              if (folders.size > 512) throw new Error('Account POC found too many window log folders.');
+              if (folders.size > 512) throw new Error('Account tracking found too many window log folders.');
             }
           }
         } catch (error) {
@@ -1051,12 +1106,7 @@ function hasNewerTitle(previous: Saved, entry: Saved): boolean {
     ? entry.titleModifiedAt > previous.titleModifiedAt
     : entry.titleTimestamp! > previous.titleTimestamp! ||
       (entry.titleTimestamp === previous.titleTimestamp && (entry.titleModifiedAt ?? 0) > (previous.titleModifiedAt ?? 0));
-  // Older journals saved resolved labels with request-level priority. Keep
-  // descriptive labels until their source is rediscovered or a custom title
-  // replaces them, since their original priority cannot be recovered.
-  const legacyFallback = previous.titleTimestamp === undefined && previous.record.title !== previous.record.chatId &&
-    priority < TITLE_PRIORITY.custom && entry.record.title !== previous.record.title;
-  return !legacyFallback && entry.titleTimestamp !== undefined && (previous.titleTimestamp === undefined ||
+  return entry.titleTimestamp !== undefined && (previous.titleTimestamp === undefined ||
     priority > previousPriority || (priority === previousPriority && (priority === TITLE_PRIORITY.prompt
       ? entry.titleTimestamp < previous.titleTimestamp : laterTitle)));
 }
@@ -1138,37 +1188,36 @@ function mergeUsage(frozen: FrozenAggregate, young: UsageSummary, youngRecords: 
   };
 }
 
-type SnapshotHeader = { kind: 'snapshot'; version: 1 | 2; at: number; absorbed: Absorbed[]; lines?: number; legacyBefore?: number };
+type SnapshotHeader = { kind: 'snapshot'; version: 2; at: number; absorbed: Absorbed[]; lines: number };
 
 function validateSnapshot(header: SnapshotHeader): SnapshotHeader {
-  if (![1, 2].includes(header.version) || !Number.isFinite(header.at) || !Array.isArray(header.absorbed) ||
-    header.absorbed.some((file) => typeof file?.name !== 'string' ||
-      (!ROLLED_LEDGER.test(file.name) && !LEGACY_JOURNAL.test(file.name)) || !Number.isSafeInteger(file.bytes) || file.bytes < 0) ||
+  if (header.version !== 2 || !Number.isFinite(header.at) || !Array.isArray(header.absorbed) ||
+    header.absorbed.some((file) => typeof file?.name !== 'string' || !ROLLED_LEDGER.test(file.name) ||
+      !Number.isSafeInteger(file.bytes) || file.bytes < 0) ||
     new Set(header.absorbed.map((file) => file.name)).size !== header.absorbed.length ||
-    (header.version === 2 && (!Number.isSafeInteger(header.lines) || header.lines! < 0)) ||
-    (header.legacyBefore !== undefined && !Number.isFinite(header.legacyBefore))) {
-    throw new Error('Invalid account POC snapshot. Tracking data was left untouched.');
+    !Number.isSafeInteger(header.lines) || header.lines < 0) {
+    throw new Error('Invalid account tracking snapshot. Tracking data was left untouched.');
   }
   return header;
 }
 
 function validateEntry(entry: Entry): Entry {
-  if (typeof entry !== 'object' || entry === null) throw new Error('Invalid account POC evidence journal. Tracking data was left untouched.');
+  if (typeof entry !== 'object' || entry === null) throw new Error('Invalid account tracking evidence journal. Tracking data was left untouched.');
   if (entry.kind === 'bill' || entry.kind === 'rollup') {
-    if (typeof entry.record !== 'object' || entry.record === null) throw new Error('Invalid account POC request journal. Tracking data was left untouched.');
+    if (typeof entry.record !== 'object' || entry.record === null) throw new Error('Invalid account tracking request journal. Tracking data was left untouched.');
     entry.record.timestamp = new Date(entry.record.timestamp);
     const expectedKey = entry.kind === 'bill' ? billKey(entry.record) : validRollup(entry)
       ? rollupKey(entry.record.chatId, entry.record.model, entry.day, entry.record.tokens.source, entry.decision) : undefined;
     if (!Number.isFinite(entry.record.timestamp.getTime()) || entry.key !== expectedKey ||
       typeof entry.record.billing?.aiCredits !== 'number' || !Number.isFinite(entry.record.billing.aiCredits) || entry.record.billing.aiCredits <= 0) {
-      throw new Error('Invalid account POC request journal. Tracking data was left untouched.');
+      throw new Error('Invalid account tracking request journal. Tracking data was left untouched.');
     }
     if ((entry.titleTimestamp !== undefined && (!Number.isFinite(entry.titleTimestamp) || !Number.isFinite(entry.record.titlePriority))) ||
       (entry.titleModifiedAt !== undefined && !Number.isFinite(entry.titleModifiedAt))) {
-      throw new Error('Invalid account POC title journal. Tracking data was left untouched.');
+      throw new Error('Invalid account tracking title journal. Tracking data was left untouched.');
     }
   } else if (!['login', 'token', 'unknown', 'completion', 'request-summary'].includes(entry.kind) || !Number.isFinite(entry.at) || typeof entry.stream !== 'string') {
-    throw new Error('Invalid account POC evidence journal. Tracking data was left untouched.');
+    throw new Error('Invalid account tracking evidence journal. Tracking data was left untouched.');
   } else {
     entry.stream = pathIdentity(entry.stream);
   }

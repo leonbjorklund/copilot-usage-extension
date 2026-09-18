@@ -24,7 +24,7 @@ import type {
   UsageSummary,
 } from "./core/types";
 import { UsageIndex } from "./core/usageIndex";
-import { AccountUsagePoc, type AccountPocView } from "./dev/accountUsagePoc";
+import { AccountTracking, type AccountTrackingView } from "./core/accountTracking";
 import { formatPeriodPercentage, formatQuotaLabel, formatQuotaPace, formatTokens, formatUsd } from "./ui/formatters";
 import { DARK_PALETTE, formatDailyUsageGraphRows, LIGHT_PALETTE } from "./ui/usageGraph";
 import {
@@ -214,8 +214,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const quotaHistory = new QuotaHistory(join(context.globalStorageUri.fsPath, 'quota-history.jsonl'));
   const quotaService = new CopilotQuotaService(context.logUri.fsPath, quotaHistory);
   const quotaLogging = enableQuotaLogging();
-  const accountPoc = accountTrackingEnabled ? new AccountUsagePoc(
-    join(context.globalStorageUri.fsPath, 'account-poc'),
+  const accountTracking = accountTrackingEnabled ? new AccountTracking(
+    join(context.globalStorageUri.fsPath, 'account-tracking'),
     join(dirname(context.logUri.fsPath), 'GitHub.copilot-chat'),
     [dirname(dirname(dirname(dirname(context.logUri.fsPath)))),
       ...['Code', 'Code - Insiders'].flatMap((editor) => [
@@ -224,10 +224,10 @@ export function activate(context: vscode.ExtensionContext): void {
         join(homedir(), 'Library', 'Application Support', editor, 'logs'),
       ])],
   ) : undefined;
-  let pocView: AccountPocView | undefined;
+  let trackingView: AccountTrackingView | undefined;
   let accountTrackingError: string | undefined;
   let rawSummary: UsageSummary | undefined;
-  let pocTimer: ReturnType<typeof setTimeout> | undefined;
+  let trackingTimer: ReturnType<typeof setTimeout> | undefined;
   let disposed = false;
   let latestDiagnostics: UsageDiagnostics | undefined;
   let readySummary: UsageSummary | undefined;
@@ -274,7 +274,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
       const roots = await locateCopilotDataPaths(config.dataPath);
       if (disposed || refreshGeneration !== generation) return;
-      const options = { roots, config, now: now(), retainedChatIds: accountPoc?.getRetainedChatIds() };
+      const options = { roots, config, now: now(), retainedChatIds: accountTracking?.getRetainedChatIds() };
       // The cache is disposable. Failure must fall back to the normal scan.
       const cached = restoreCached
         ? await usageIndex.restore(options, scanCacheDirectory).catch(() => undefined) : undefined;
@@ -284,7 +284,7 @@ export function activate(context: vscode.ExtensionContext): void {
         if (disposed || refreshGeneration !== generation) return;
       }
       const result = cached
-        ? await usageIndex.poll({ config, now: now(), retainedChatIds: accountPoc?.getRetainedChatIds() })
+        ? await usageIndex.poll({ config, now: now(), retainedChatIds: accountTracking?.getRetainedChatIds() })
         : await usageIndex.rebuild(options);
       if (disposed || refreshGeneration !== generation) return;
 
@@ -333,7 +333,7 @@ export function activate(context: vscode.ExtensionContext): void {
   function applyResult(result: { summary: UsageSummary; diagnostics: UsageDiagnostics }): void {
     latestDiagnostics = result.diagnostics;
     readySummary = result.summary;
-    treeProvider.setSummary(result.summary, accountTrackingError ?? pocView?.problem);
+    treeProvider.setSummary(result.summary, accountTrackingError ?? trackingView?.problem);
     const quotaState = matchingQuotaState();
     const matchingQuota = quotaState.kind === "quota" ? quotaState.quota : undefined;
     treeProvider.setQuotaState(quotaState);
@@ -344,13 +344,13 @@ export function activate(context: vscode.ExtensionContext): void {
 
   function matchingQuotaState(): QuotaState {
     const state = quotaService.getState();
-    return state.kind === "quota" && state.account && pocView?.account && state.account.toLowerCase() !== pocView.account
+    return state.kind === "quota" && state.account && trackingView?.account && state.account.toLowerCase() !== trackingView.account
       ? { kind: "waiting" } : state;
   }
 
   function updateStatusBarTooltip(summary: UsageSummary, quotaState = matchingQuotaState()): void {
     // The graph follows the account whose quota is shown, or the ledger's account while quota waits.
-    const account = quotaState.kind === "quota" ? quotaState.account : pocView?.account;
+    const account = quotaState.kind === "quota" ? quotaState.account : trackingView?.account;
     const history = account ? dailyUsage(quotaHistory.get(account), now().getTime()) : undefined;
     const tooltip = formatStatusBarTooltip(summary, quotaState, now().getTime(), history);
     if (showingCachedUsage) {
@@ -366,13 +366,13 @@ export function activate(context: vscode.ExtensionContext): void {
     cached: { summary: UsageSummary; diagnostics: UsageDiagnostics }, cachedGeneration: number,
   ): Promise<void> {
     let summary = cached.summary;
-    if (accountPoc) {
-      let retained: AccountPocView;
+    if (accountTracking) {
+      let retained: AccountTrackingView;
       try {
         // Never feed unverified cached requests or titles into the durable ledger.
         // It already retains newer billed usage; only older usage needs the cache.
         const timestamp = now();
-        retained = await accountPoc.refresh(aggregateUsage([], timestamp), timestamp);
+        retained = await accountTracking.refresh(aggregateUsage([], timestamp), timestamp);
       } catch {
         // A reconciled scan can still use the existing account-error fallback.
         return;
@@ -385,7 +385,7 @@ export function activate(context: vscode.ExtensionContext): void {
       summary = aggregateUsage([
         ...historical, ...retained.summary.chats.flatMap((chat) => chat.records),
       ], now());
-      pocView = retained;
+      trackingView = retained;
       accountTrackingError = undefined;
     }
     if (disposed || cachedGeneration !== generation) return;
@@ -395,10 +395,10 @@ export function activate(context: vscode.ExtensionContext): void {
 
   async function acceptResult(result: { summary: UsageSummary; diagnostics: UsageDiagnostics; titleMetadata?: UsageRecord[] }, acceptedGeneration: number): Promise<void> {
     if (disposed || acceptedGeneration !== generation) return;
-    let nextPocView: AccountPocView | undefined;
+    let nextTrackingView: AccountTrackingView | undefined;
     let trackingError: string | undefined;
     try {
-      nextPocView = await accountPoc?.refresh(result.summary, now(), result.titleMetadata);
+      nextTrackingView = await accountTracking?.refresh(result.summary, now(), result.titleMetadata);
     } catch (error) {
       // Account storage must not block a successful local usage scan. Preserve
       // the storage error for recovery without resetting or rewriting data.
@@ -406,29 +406,29 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     if (disposed || acceptedGeneration !== generation) return;
     rawSummary = result.summary;
-    pocView = nextPocView;
+    trackingView = nextTrackingView;
     accountTrackingError = trackingError;
     showingCachedUsage = false;
-    applyResult({ ...result, summary: pocView?.summary ?? result.summary });
+    applyResult({ ...result, summary: trackingView?.summary ?? result.summary });
     // Save during normal operation, not only on shutdown. Cache write failures
     // must not hide successful usage or change the durable account ledger.
     await usageIndex.save(scanCacheDirectory).catch(() => undefined);
   }
 
-  function schedulePocPoll(): void {
-    if (!accountPoc || disposed) return;
-    pocTimer = setTimeout(() => {
-      pocTimer = undefined;
+  function scheduleTrackingPoll(): void {
+    if (!accountTracking || disposed) return;
+    trackingTimer = setTimeout(() => {
+      trackingTimer = undefined;
       const pollGeneration = generation;
       updateChain = updateChain.then(async () => {
         if (disposed || pollGeneration !== generation || !rawSummary || !isCopilotFileLoggingEnabled()) return;
-        const result = await usageIndex.poll({ config: currentConfig, now: now(), retainedChatIds: accountPoc.getRetainedChatIds() });
+        const result = await usageIndex.poll({ config: currentConfig, now: now(), retainedChatIds: accountTracking.getRetainedChatIds() });
         await acceptResult(result, pollGeneration);
         if (disposed || pollGeneration !== generation) return;
         syncWatchers(usageIndex.getWatchFolders());
       }).catch((error: unknown) => {
         if (!disposed && pollGeneration === generation) reportScanFailure(error);
-      }).finally(schedulePocPoll);
+      }).finally(scheduleTrackingPoll);
     }, 2_000);
   }
 
@@ -580,7 +580,7 @@ export function activate(context: vscode.ExtensionContext): void {
       pathsToUpdate,
       config,
       now: now(),
-      retainedChatIds: accountPoc?.getRetainedChatIds(),
+      retainedChatIds: accountTracking?.getRetainedChatIds(),
     });
 
     if (flushGeneration !== generation) {
@@ -632,7 +632,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const quota = quotaService.getState();
       return vscode.window.showInformationMessage(
         (latestDiagnostics
-          ? formatDiagnostics(latestDiagnostics) + (pocView ? `\n\n${pocView.diagnostics}` : '') +
+          ? formatDiagnostics(latestDiagnostics) + (trackingView ? `\n\n${trackingView.diagnostics}` : '') +
             (accountTrackingError ? `\n\nAccount tracking: ${accountTrackingError}` : '')
           : "No Copilot usage scan has completed yet.") + `\n\n${(await quotaLogging).reason}` +
           (quotaHistory.problem ? `\n\n${quotaHistory.problem}` : '') +
@@ -656,7 +656,7 @@ export function activate(context: vscode.ExtensionContext): void {
     new vscode.Disposable(() => {
       disposed = true;
       clearInterval(tooltipTimer);
-      if (pocTimer) clearTimeout(pocTimer);
+      if (trackingTimer) clearTimeout(trackingTimer);
       disposeWatchers();
       if (eventTimer) {
         clearTimeout(eventTimer);
@@ -665,7 +665,7 @@ export function activate(context: vscode.ExtensionContext): void {
   );
 
   void runRefresh(true);
-  schedulePocPoll();
+  scheduleTrackingPoll();
 }
 
 function readPersistedSortMode(context: vscode.ExtensionContext): UsageTreeSortMode {

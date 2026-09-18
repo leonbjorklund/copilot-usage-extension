@@ -14,7 +14,7 @@ import { aggregateUsage } from '../src/core/aggregator';
 import { TITLE_PRIORITY } from '../src/core/types';
 import type { UsageRecord, UsageSummary } from '../src/core/types';
 import { UsageIndex } from '../src/core/usageIndex';
-import { AccountUsagePoc, attributeRequest, parseAccountEvidence } from '../src/dev/accountUsagePoc';
+import { AccountTracking, attributeRequest, parseAccountEvidence } from '../src/core/accountTracking';
 
 const base = new Date(2026, 8, 7, 12).getTime();
 const roots: string[] = [];
@@ -65,6 +65,16 @@ describe('request attribution', () => {
     const text = auth('Alice') + line(base + 16_168,
       'ccreq:0b641048.copilotmd | success | mai-code-1.1-flash | 6168ms | [panel/editAgent]');
     expect(attributeRequest(row, base, parseAccountEvidence(text, 'one'), base + 30_000)).toEqual({ account: 'alice' });
+  });
+
+  it('keeps a request unresolved when only a longer summary of the same model ends with it', () => {
+    // A summary that merely covers the billed attempt cannot identify its
+    // window: a long unbilled run finishing at the same moment would capture it.
+    const row = { ...record(), model: 'claude-sonnet-5' };
+    row.debugRequest!.durationMs = 9_879;
+    const text = auth('Alice') + line(base + 19_880,
+      'ccreq:6f2a1b0c.copilotmd | success | claude-sonnet-5 | 10747ms | [panel/editAgent]');
+    expect(attributeRequest(row, base, parseAccountEvidence(text, 'one'), base + 40_000)).toHaveProperty('pending');
   });
 
   it('uses each originating window, not the selected account or shared request ID', () => {
@@ -142,7 +152,7 @@ describe('request attribution', () => {
 });
 
 async function fixture() {
-  const root = await mkdtemp(join(tmpdir(), 'copilot-account-poc-'));
+  const root = await mkdtemp(join(tmpdir(), 'copilot-account-tracking-'));
   roots.push(root);
   const storage = join(root, 'ledger');
   const logRoot = join(root, 'logs');
@@ -153,12 +163,12 @@ async function fixture() {
   const usage = join(root, 'debug-logs', 'chat', 'main.jsonl');
   await mkdir(join(root, 'debug-logs', 'chat'), { recursive: true });
   await writeFile(usage, JSON.stringify({ type: 'session_start', ts: base + 1_000 }) + '\n');
-  const poc = new AccountUsagePoc(storage, stream, [logRoot]);
-  await poc.refresh(aggregateUsage([], new Date(base)), new Date(base));
-  return { root, storage, logRoot, stream, log, usage, poc };
+  const tracking = new AccountTracking(storage, stream, [logRoot]);
+  await tracking.refresh(aggregateUsage([], new Date(base)), new Date(base));
+  return { root, storage, logRoot, stream, log, usage, tracking };
 }
 
-describe('local POC ledger', () => {
+describe('local ledger', () => {
   it('keeps historical usage visible across accounts without saving it as account usage', async () => {
     const f = await fixture();
     const old = { ...record(f.usage, base - 1, 'old'), chatId: 'historical', title: 'Old chat' };
@@ -167,13 +177,13 @@ describe('local POC ledger', () => {
     await appendFile(f.log, done(current));
     const summary = aggregateUsage([old, current], now);
     const start = await readFile(join(f.storage, 'start.json'), 'utf8');
-    const alice = await f.poc.refresh(summary, now);
+    const alice = await f.tracking.refresh(summary, now);
     expect(alice.summary.allTime.tokens).toBe(200);
     expect(alice.summary.allTime.githubCopilot.usd).toBe(0.04);
     expect(alice.summary.chats.find(chat => chat.chatId === 'historical')).toMatchObject(summary.chats.find(chat => chat.chatId === 'historical')!);
-    expect(f.poc.getRetainedChatIds()).not.toContain('historical');
+    expect(f.tracking.getRetainedChatIds()).not.toContain('historical');
     await appendFile(f.log, auth('Bob', base + 40_000));
-    const bob = await f.poc.refresh(summary, new Date(base + 45_000));
+    const bob = await f.tracking.refresh(summary, new Date(base + 45_000));
     expect(bob.summary.allTime.tokens).toBe(100);
     expect(bob.summary.chats[0].title).toBe('Old chat');
     expect(bob.diagnostics).toContain('Attributed requests for this account: 0');
@@ -186,10 +196,10 @@ describe('local POC ledger', () => {
     const pending = record(f.usage, base + 20_000, 'pending');
     await appendFile(f.log, done(a));
     const now = new Date(base + 30_000);
-    await f.poc.refresh(aggregateUsage([a, pending], now), now);
+    await f.tracking.refresh(aggregateUsage([a, pending], now), now);
     const other = join(f.logRoot, '20260907T110000', 'window2', 'exthost', 'GitHub.copilot-chat');
     await mkdir(other, { recursive: true });
-    const observer = new AccountUsagePoc(f.storage, other, [f.logRoot]);
+    const observer = new AccountTracking(f.storage, other, [f.logRoot]);
     const unknown = await observer.refresh(aggregateUsage([a, pending], now), now);
     expect(unknown.account).toBeUndefined();
     expect(unknown.problem).toBeUndefined();
@@ -215,24 +225,24 @@ describe('local POC ledger', () => {
     const index = new UsageIndex();
     const options = { config: { dataPath: f.root, maxFileSizeMb: 10, maxScanDepth: 6 }, now: new Date(base + 90_000) };
     const first = await index.rebuild({ roots: [f.root], ...options });
-    expect((await f.poc.refresh(first.summary, options.now)).summary.chats[0].title).toBe('chat');
+    expect((await f.tracking.refresh(first.summary, options.now)).summary.chats[0].title).toBe('chat');
     const titleFile = join(f.root, 'debug-logs', 'chat', 'title-response.jsonl');
     const generatedTitle = (title: string) => JSON.stringify({ type: 'agent_response', ts: base + 20_000,
       attrs: { response: JSON.stringify([{ role: 'assistant', parts: [{ type: 'text', content: title }] }]) } }) + '\n';
     await writeFile(titleFile, generatedTitle('Generated title'));
     await utimes(titleFile, new Date(base + 21_000), new Date(base + 21_000));
     const generated = await index.poll(options);
-    expect((await f.poc.refresh(generated.summary, options.now)).summary.chats[0].title).toBe('Generated title');
+    expect((await f.tracking.refresh(generated.summary, options.now)).summary.chats[0].title).toBe('Generated title');
     await appendFile(titleFile, generatedTitle('Later generated title'));
     await utimes(titleFile, new Date(base + 22_000), new Date(base + 22_000));
     const appended = await index.poll(options);
-    expect((await f.poc.refresh(appended.summary, options.now)).summary.chats[0].title).toBe('Later generated title');
+    expect((await f.tracking.refresh(appended.summary, options.now)).summary.chats[0].title).toBe('Later generated title');
     // Unrelated appends must not make an older title look newer on a full scan.
     await appendFile(titleFile, '{}\n');
     await utimes(titleFile, new Date(base + 23_000), new Date(base + 23_000));
     const rebuilt = await index.rebuild({ roots: [f.root], ...options });
-    expect((await f.poc.refresh(rebuilt.summary, options.now)).summary.chats[0].title).toBe('Later generated title');
-    const savedGenerated = await new AccountUsagePoc(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([]), options.now);
+    expect((await f.tracking.refresh(rebuilt.summary, options.now)).summary.chats[0].title).toBe('Later generated title');
+    const savedGenerated = await new AccountTracking(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([]), options.now);
     expect(savedGenerated.summary.chats[0].title).toBe('Later generated title');
     const customFile = join(f.root, 'chatSessions', 'chat.json');
     await mkdir(join(f.root, 'chatSessions'));
@@ -240,16 +250,16 @@ describe('local POC ledger', () => {
     await writeFile(customFile, customTitle('Custom title'));
     await utimes(customFile, new Date(base + 30_000), new Date(base + 30_000));
     const custom = await index.poll(options);
-    expect((await f.poc.refresh(custom.summary, options.now)).summary.chats[0].title).toBe('Custom title');
+    expect((await f.tracking.refresh(custom.summary, options.now)).summary.chats[0].title).toBe('Custom title');
     await writeFile(customFile, customTitle('Renamed chat'));
     await utimes(customFile, new Date(base + 40_000), new Date(base + 40_000));
     const renamed = await index.poll(options);
     expect(renamed.summary.chats[0].title).toBe('Renamed chat');
-    const view = await f.poc.refresh(renamed.summary, options.now);
+    const view = await f.tracking.refresh(renamed.summary, options.now);
     expect(view.summary.chats[0].title).toBe('Renamed chat');
     expect(view.summary.allTime.tokens).toBe(100);
     expect(view.summary.allTime.githubCopilot.aiCredits).toBe(2);
-    const restarted = await new AccountUsagePoc(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([]), options.now);
+    const restarted = await new AccountTracking(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([]), options.now);
     expect(restarted.summary.chats[0].title).toBe('Renamed chat');
   });
 
@@ -258,9 +268,9 @@ describe('local POC ledger', () => {
     const a = { ...record(f.usage), title: 'panel/editAgent', titlePriority: TITLE_PRIORITY.generic };
     await appendFile(f.log, done(a));
     const now = new Date(base + 30_000);
-    const first = await f.poc.refresh(aggregateUsage([a]), now);
+    const first = await f.tracking.refresh(aggregateUsage([a]), now);
     expect(first.summary.chats[0].title).toBe('chat');
-    const observer = restartBeforeTitle ? new AccountUsagePoc(f.storage, f.stream, [f.logRoot]) : f.poc;
+    const observer = restartBeforeTitle ? new AccountTracking(f.storage, f.stream, [f.logRoot]) : f.tracking;
     const title = { ...a, title: 'Generated chat title', titlePriority: TITLE_PRIORITY.generated,
       timestamp: new Date(base + 20_000), metadataOnly: true };
     const titled = aggregateUsage([a, title]);
@@ -268,7 +278,7 @@ describe('local POC ledger', () => {
     const updated = await observer.refresh(titled, now);
     expect(updated.summary.chats[0].title).toBe('Generated chat title');
     expect(updated.summary.allTime).toEqual(first.summary.allTime);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     expect((await restarted.refresh(aggregateUsage([]), now)).summary.chats[0].title).toBe('Generated chat title');
   });
 
@@ -277,7 +287,7 @@ describe('local POC ledger', () => {
     const a = record(f.usage);
     await appendFile(f.log, done(a));
     const now = new Date(base + 90_000);
-    const first = await f.poc.refresh(aggregateUsage([a]), now);
+    const first = await f.tracking.refresh(aggregateUsage([a]), now);
     const folder = join(f.root, 'chatSessions');
     await mkdir(folder);
     const file = join(folder, 'chat.jsonl');
@@ -289,16 +299,16 @@ describe('local POC ledger', () => {
     const index = new UsageIndex();
     const options = { config: { dataPath: f.root, maxFileSizeMb: 10, maxScanDepth: 6 }, now, retainedChatIds: ['chat'] };
     const initial = await index.rebuild({ roots: [f.root], ...options });
-    expect((await f.poc.refresh(initial.summary, now, initial.titleMetadata)).summary.chats[0].title).toBe('Original title');
+    expect((await f.tracking.refresh(initial.summary, now, initial.titleMetadata)).summary.chats[0].title).toBe('Original title');
 
     await appendFile(file, JSON.stringify({ kind: 1, k: ['customTitle'], v: 'Renamed title' }) + '\n');
     await utimes(file, new Date(base + 20_000), new Date(base + 20_000));
     const renamed = await index.poll(options);
-    const saved = await f.poc.refresh(renamed.summary, now, renamed.titleMetadata);
+    const saved = await f.tracking.refresh(renamed.summary, now, renamed.titleMetadata);
     expect(saved.summary.chats[0].title).toBe('Renamed title');
     expect(saved.summary.allTime).toEqual(first.summary.allTime);
     const rebuilt = await index.rebuild({ roots: [f.root], ...options });
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     expect((await restarted.refresh(rebuilt.summary, now, rebuilt.titleMetadata)).summary.chats[0].title).toBe('Renamed title');
 
     await appendFile(file, JSON.stringify({ kind: 1, k: ['customTitle'], v: 'Second rename' }) + '\n');
@@ -311,7 +321,7 @@ describe('local POC ledger', () => {
     await utimes(file, new Date(base + 30_000), new Date(base + 30_000));
     const compacted = await index.poll(options);
     expect((await restarted.refresh(compacted.summary, now, compacted.titleMetadata)).summary.chats[0].title).toBe('Snapshot rename');
-    const final = await new AccountUsagePoc(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([]), now);
+    const final = await new AccountTracking(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([]), now);
     expect(final.summary.chats[0].title).toBe('Snapshot rename');
     expect(final.summary.allTime).toEqual(first.summary.allTime);
   });
@@ -321,7 +331,7 @@ describe('local POC ledger', () => {
     const a = { ...record(f.usage), title: 'panel/editAgent', titlePriority: TITLE_PRIORITY.generic };
     await appendFile(f.log, done(a));
     const now = new Date(base + 90_000);
-    const first = await f.poc.refresh(aggregateUsage([a]), now);
+    const first = await f.tracking.refresh(aggregateUsage([a]), now);
     const stages = [
       ['First prompt', TITLE_PRIORITY.prompt, base + 20_000, 'First prompt'],
       ['Earlier prompt', TITLE_PRIORITY.prompt, base + 15_000, 'Earlier prompt'],
@@ -335,17 +345,17 @@ describe('local POC ledger', () => {
     for (const [title, priority, at, expected] of stages) {
       const metadata = { ...a, title, titlePriority: priority, timestamp: new Date(at), metadataOnly: true };
       const rescanned = { ...a, tokens: { ...a.tokens, total: 999 }, billing: { ...a.billing, aiCredits: 999 } };
-      const view = await f.poc.refresh(aggregateUsage([rescanned, metadata]), now);
+      const view = await f.tracking.refresh(aggregateUsage([rescanned, metadata]), now);
       expect(view.summary.chats[0].title).toBe(expected);
       expect(view.summary.allTime).toEqual(first.summary.allTime);
     }
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     const saved = await restarted.refresh(aggregateUsage([]), now);
     expect(saved.summary.chats[0].title).toBe('Renamed custom title');
     expect(saved.summary.allTime).toEqual(first.summary.allTime);
   });
 
-  it('ignores stale title revisions across observers and preserves existing journals', async () => {
+  it('ignores stale title revisions and preserves existing journals', async () => {
     const f = await fixture();
     const a = record(f.usage);
     await appendFile(f.log, done(a));
@@ -353,22 +363,20 @@ describe('local POC ledger', () => {
     const metadata = { ...a, metadataOnly: true, titlePriority: TITLE_PRIORITY.custom,
       timestamp: new Date(base + 20_000), titleModifiedAt: base + 30_000, title: 'Old title' };
     const stale = aggregateUsage([a, metadata]);
-    await f.poc.refresh(stale, now);
+    await f.tracking.refresh(stale, now);
     const oldFiles = (await readdir(f.storage)).filter((file) => file.endsWith('.jsonl'));
     const oldJournal = await readFile(join(f.storage, oldFiles[0]), 'utf8');
     const start = await readFile(join(f.storage, 'start.json'), 'utf8');
-    const newer = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const newer = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     const fresh = aggregateUsage([a, { ...metadata, title: 'New title', titleModifiedAt: base + 40_000 }]);
     expect((await newer.refresh(fresh, now)).summary.chats[0].title).toBe('New title');
     expect((await readFile(join(f.storage, oldFiles[0]), 'utf8')).startsWith(oldJournal)).toBe(true);
     expect(await readFile(join(f.storage, 'start.json'), 'utf8')).toBe(start);
-    // Put stale entries after all normal observer names to exercise replay order.
-    await writeFile(join(f.storage, 'observer-ffffffff.jsonl'), oldJournal);
     vi.mocked(appendFile).mockClear();
-    expect((await f.poc.refresh(stale, now)).summary.chats[0].title).toBe('New title');
+    expect((await f.tracking.refresh(stale, now)).summary.chats[0].title).toBe('New title');
     expect((await newer.refresh(fresh, now)).summary.chats[0].title).toBe('New title');
     expect(appendFile).not.toHaveBeenCalled();
-    const restarted = await new AccountUsagePoc(f.storage, f.stream, [f.logRoot]).refresh(stale, now);
+    const restarted = await new AccountTracking(f.storage, f.stream, [f.logRoot]).refresh(stale, now);
     expect(restarted.summary.chats[0].title).toBe('New title');
     expect(restarted.summary.allTime.tokens).toBe(100);
   });
@@ -380,81 +388,24 @@ describe('local POC ledger', () => {
     const now = new Date(base + 90_000);
     const custom = { ...a, metadataOnly: true, titlePriority: TITLE_PRIORITY.custom,
       timestamp: new Date(base + 20_000), titleModifiedAt: base + 30_000, title: 'My title' };
-    expect((await f.poc.refresh(aggregateUsage([a, custom]), now)).summary.chats[0].title).toBe('My title');
+    expect((await f.tracking.refresh(aggregateUsage([a, custom]), now)).summary.chats[0].title).toBe('My title');
     const ledger = join(f.storage, 'ledger.jsonl');
     const saved = await readFile(ledger, 'utf8');
     vi.mocked(appendFile).mockClear();
     // Copilot bumps the chat file on every message without changing the title.
     for (const bump of [40_000, 50_000]) {
       const touched = aggregateUsage([a, { ...custom, titleModifiedAt: base + bump }]);
-      expect((await f.poc.refresh(touched, now)).summary.chats[0].title).toBe('My title');
+      expect((await f.tracking.refresh(touched, now)).summary.chats[0].title).toBe('My title');
     }
     expect(appendFile).not.toHaveBeenCalled();
     expect(await readFile(ledger, 'utf8')).toBe(saved);
     const renamed = aggregateUsage([a, { ...custom, title: 'Renamed', titleModifiedAt: base + 60_000 }]);
-    expect((await f.poc.refresh(renamed, now)).summary.chats[0].title).toBe('Renamed');
+    expect((await f.tracking.refresh(renamed, now)).summary.chats[0].title).toBe('Renamed');
     expect(appendFile).toHaveBeenCalledTimes(1);
     await rm(f.usage);
-    const restarted = await new AccountUsagePoc(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([]), now);
+    const restarted = await new AccountTracking(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([]), now);
     expect(restarted.summary.chats[0].title).toBe('Renamed');
     expect(restarted.summary.allTime.tokens).toBe(100);
-  });
-
-  it('retains legacy labels against lower-priority sources and accepts a custom rename', async () => {
-    const f = await fixture();
-    const a = { ...record(f.usage), title: 'panel/editAgent', titlePriority: TITLE_PRIORITY.generic };
-    await appendFile(f.log, done(a));
-    const now = new Date(base + 30_000);
-    await f.poc.refresh(aggregateUsage([a]), now);
-    const journalFile = join(f.storage, (await readdir(f.storage)).find((file) => file.endsWith('.jsonl'))!);
-    const entries = (await readFile(journalFile, 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line));
-    const bill = entries.find((entry) => entry.kind === 'bill');
-    bill.record.title = 'Saved custom title';
-    delete bill.titleTimestamp;
-    delete bill.titleModifiedAt;
-    await writeFile(journalFile, entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
-    const legacyJournal = await readFile(journalFile, 'utf8');
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
-    expect((await restarted.refresh(aggregateUsage([a]), now)).summary.chats[0].title).toBe('Saved custom title');
-    for (const titlePriority of [TITLE_PRIORITY.prompt, TITLE_PRIORITY.generated]) {
-      const fallback = { ...a, title: 'Surviving lower-priority title', metadataOnly: true,
-        titlePriority, timestamp: new Date(base + 20_000) };
-      expect((await restarted.refresh(aggregateUsage([a, fallback]), now)).summary.chats[0].title).toBe('Saved custom title');
-    }
-    const metadata = { ...a, title: 'Updated custom title', metadataOnly: true,
-      titlePriority: TITLE_PRIORITY.custom, timestamp: new Date(base + 20_000) };
-    expect((await restarted.refresh(aggregateUsage([a, metadata]), now)).summary.chats[0].title).toBe('Updated custom title');
-    expect((await readFile(journalFile, 'utf8')).startsWith(legacyJournal)).toBe(true);
-    const saved = await new AccountUsagePoc(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([]), now);
-    expect(saved.summary.chats[0].title).toBe('Updated custom title');
-    expect(saved.summary.allTime.tokens).toBe(100);
-  });
-
-  it.each(['chat', 'Saved generated title'])('recovers legacy title priority for %s', async (savedTitle) => {
-    const f = await fixture();
-    const a = { ...record(f.usage), title: 'panel/editAgent', titlePriority: TITLE_PRIORITY.generic };
-    await appendFile(f.log, done(a));
-    const now = new Date(base + 40_000);
-    await f.poc.refresh(aggregateUsage([a]), now);
-    const journalFile = join(f.storage, (await readdir(f.storage)).find((file) => file.endsWith('.jsonl'))!);
-    const entries = (await readFile(journalFile, 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line));
-    const bill = entries.find((entry) => entry.kind === 'bill');
-    bill.record.title = savedTitle;
-    delete bill.titleTimestamp;
-    delete bill.titleModifiedAt;
-    await writeFile(journalFile, entries.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
-    const legacyJournal = await readFile(journalFile, 'utf8');
-    const observer = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
-    const generated = { ...a, title: 'Saved generated title', titlePriority: TITLE_PRIORITY.generated,
-      timestamp: new Date(base + 20_000), metadataOnly: true };
-    expect((await observer.refresh(aggregateUsage([a, generated]), now)).summary.chats[0].title).toBe(generated.title);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
-    const renamed = { ...generated, title: 'New generated title', timestamp: new Date(base + 30_000) };
-    const updated = await restarted.refresh(aggregateUsage([a, renamed]), now);
-    expect(updated.summary.chats[0].title).toBe(renamed.title);
-    expect(updated.summary.allTime.tokens).toBe(100);
-    expect(updated.summary.allTime.githubCopilot.aiCredits).toBe(2);
-    expect((await readFile(journalFile, 'utf8')).startsWith(legacyJournal)).toBe(true);
   });
 
   it('retries an interrupted title append without losing saved usage', async () => {
@@ -462,7 +413,7 @@ describe('local POC ledger', () => {
     const a = record(f.usage);
     await appendFile(f.log, done(a));
     const now = new Date(base + 30_000);
-    await f.poc.refresh(aggregateUsage([a]), now);
+    await f.tracking.refresh(aggregateUsage([a]), now);
     const metadata = { ...a, title: 'Delayed title', titlePriority: TITLE_PRIORITY.generated,
       timestamp: new Date(base + 20_000), metadataOnly: true };
     const summary = aggregateUsage([a, metadata]);
@@ -471,11 +422,11 @@ describe('local POC ledger', () => {
       await fs.appendFile(file, String(data).slice(0, 20));
       throw new Error('Simulated interrupted title write');
     });
-    await expect(f.poc.refresh(summary, now)).rejects.toThrow('Simulated interrupted title write');
-    const recovered = await f.poc.refresh(summary, now);
+    await expect(f.tracking.refresh(summary, now)).rejects.toThrow('Simulated interrupted title write');
+    const recovered = await f.tracking.refresh(summary, now);
     expect(recovered.summary.chats[0].title).toBe('Delayed title');
     expect(recovered.summary.allTime.tokens).toBe(100);
-    const restarted = await new AccountUsagePoc(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([]), now);
+    const restarted = await new AccountTracking(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([]), now);
     expect(restarted.summary.chats[0].title).toBe('Delayed title');
     expect(restarted.summary.allTime.tokens).toBe(100);
   });
@@ -485,7 +436,7 @@ describe('local POC ledger', () => {
     const a = { ...record(f.usage), title: 'chat', titlePriority: TITLE_PRIORITY.generic };
     await appendFile(f.log, done(a));
     const now = new Date(base + 90_000);
-    const first = await f.poc.refresh(aggregateUsage([a]), now);
+    const first = await f.tracking.refresh(aggregateUsage([a]), now);
     const start = await readFile(join(f.storage, 'start.json'), 'utf8');
     await rm(join(f.root, 'debug-logs'), { recursive: true });
     await mkdir(join(f.root, 'chatSessions'));
@@ -493,7 +444,7 @@ describe('local POC ledger', () => {
     await writeFile(titleFile, JSON.stringify({ kind: 0, v: {
       sessionId: 'chat', customTitle: 'Retained chat renamed', creationDate: base,
     } }));
-    const observer = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const observer = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     await observer.refresh(aggregateUsage([]), now);
     const index = new UsageIndex();
     const options = { config: { dataPath: f.root, maxFileSizeMb: 10, maxScanDepth: 6 }, now,
@@ -504,7 +455,7 @@ describe('local POC ledger', () => {
     expect(updated.summary.chats[0].title).toBe('Retained chat renamed');
     expect(updated.summary.allTime).toEqual(first.summary.allTime);
     expect(observer.getRetainedChatIds()).toEqual(['chat']);
-    const saved = await new AccountUsagePoc(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([]), now);
+    const saved = await new AccountTracking(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([]), now);
     expect(saved.summary.chats[0].title).toBe('Retained chat renamed');
     expect(saved.summary.allTime).toEqual(first.summary.allTime);
     expect(await readFile(join(f.storage, 'start.json'), 'utf8')).toBe(start);
@@ -515,8 +466,8 @@ describe('local POC ledger', () => {
     const a = record(f.usage);
     await appendFile(f.log, done(a));
     const summary = aggregateUsage([a]);
-    await f.poc.refresh(summary, new Date(base + 30_000));
-    await f.poc.refresh(summary, new Date(base + 30_000));
+    await f.tracking.refresh(summary, new Date(base + 30_000));
+    await f.tracking.refresh(summary, new Date(base + 30_000));
     const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
     const reads = vi.fn();
     vi.mocked(open).mockImplementation(async (...args) => {
@@ -528,7 +479,7 @@ describe('local POC ledger', () => {
       });
       return handle;
     });
-    expect((await f.poc.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(100);
+    expect((await f.tracking.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(100);
     expect(reads).not.toHaveBeenCalled();
   });
 
@@ -539,7 +490,7 @@ describe('local POC ledger', () => {
     const a = record(f.usage);
     await appendFile(f.log, done(a));
     const summary = aggregateUsage([a]);
-    expect((await f.poc.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(0);
+    expect((await f.tracking.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(0);
     await writeFile(f.usage, JSON.stringify({ type: 'session_start', ts: base + 7_000 }) + '\n');
     if (failAppend) {
       const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
@@ -547,13 +498,13 @@ describe('local POC ledger', () => {
         await fs.appendFile(file, String(data).slice(0, 20));
         throw new Error('Simulated interrupted header write');
       });
-      await expect(f.poc.refresh(aggregateUsage([]), new Date(base + 30_000))).rejects.toThrow('Simulated interrupted header write');
+      await expect(f.tracking.refresh(aggregateUsage([]), new Date(base + 30_000))).rejects.toThrow('Simulated interrupted header write');
     }
-    const recovered = await f.poc.refresh(aggregateUsage([]), new Date(base + 30_000));
+    const recovered = await f.tracking.refresh(aggregateUsage([]), new Date(base + 30_000));
     expect(recovered.excluded).toBe(0);
     expect(recovered.summary.allTime.tokens).toBe(100);
     await rm(f.usage);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     expect((await restarted.refresh(aggregateUsage([]), new Date(base + 30_000))).summary.allTime.tokens).toBe(100);
   });
 
@@ -567,17 +518,17 @@ describe('local POC ledger', () => {
     const second = record(f.usage, base + 20_000, 'second-request');
     await appendFile(f.log, done(first) + done(second));
     const now = new Date(base + 30_000);
-    let view = await f.poc.refresh(aggregateUsage([first, second], now), now);
+    let view = await f.tracking.refresh(aggregateUsage([first, second], now), now);
     if (delayed) {
       expect(view.summary.today.tokens).toBe(0);
       await appendFile(f.usage, header);
       // Previously saved requests must recover without being rescanned or reset.
-      view = await f.poc.refresh(aggregateUsage([], now), now);
+      view = await f.tracking.refresh(aggregateUsage([], now), now);
     }
     expect(view.account).toBe('bob');
     expect(view.summary.today.tokens).toBe(200);
     expect(view.excluded).toBe(0);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     expect((await restarted.refresh(aggregateUsage([], now), now)).summary.today.tokens).toBe(200);
   });
 
@@ -589,7 +540,7 @@ describe('local POC ledger', () => {
     const request = record(f.usage);
     await appendFile(f.log, done(request));
     const now = new Date(base + 30_000);
-    const view = await f.poc.refresh(aggregateUsage([request], now), now);
+    const view = await f.tracking.refresh(aggregateUsage([request], now), now);
     expect(view.account).toBe('bob');
     expect(view.summary.today.tokens).toBe(0);
     expect(view.excluded).toBe(1);
@@ -617,8 +568,8 @@ describe('local POC ledger', () => {
       }
       return handle;
     });
-    expect((await f.poc.refresh(summary, new Date(base + 30_000))).pending).toBe(1);
-    const caughtUp = await f.poc.refresh(summary, new Date(base + 30_000));
+    expect((await f.tracking.refresh(summary, new Date(base + 30_000))).pending).toBe(1);
+    const caughtUp = await f.tracking.refresh(summary, new Date(base + 30_000));
     expect(caughtUp.pending).toBe(0);
     expect(caughtUp.summary.allTime.tokens).toBe(100);
   });
@@ -637,8 +588,8 @@ describe('local POC ledger', () => {
       await canFinish;
       await fs.writeFile(file, data);
     });
-    const first = new AccountUsagePoc(storage, f.stream, [f.logRoot]);
-    const second = new AccountUsagePoc(storage, f.stream, [f.logRoot]);
+    const first = new AccountTracking(storage, f.stream, [f.logRoot]);
+    const second = new AccountTracking(storage, f.stream, [f.logRoot]);
     const firstRefresh = first.refresh(aggregateUsage([]), new Date(base));
     await fileCreated;
     const other = await second.refresh(aggregateUsage([]), new Date(base + 1))
@@ -676,12 +627,12 @@ describe('local POC ledger', () => {
       return handle;
     });
     const summary = aggregateUsage([a]);
-    expect((await f.poc.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(100);
+    expect((await f.tracking.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(100);
     expect(checkedSize).toBeGreaterThan(0);
     expect(allocatedSize).toBe(checkedSize);
     expect(allocatedSize).toBeLessThan(1024);
     vi.mocked(open).mockImplementation(fs.open);
-    expect((await f.poc.refresh(summary, new Date(base + 30_000))).problem).toContain('Cannot read Copilot log');
+    expect((await f.tracking.refresh(summary, new Date(base + 30_000))).problem).toContain('Cannot read Copilot log');
   });
 
   it('stops discovering windows as soon as the folder limit is reached', async () => {
@@ -703,7 +654,7 @@ describe('local POC ledger', () => {
       }
       return fs.readdir(path, options);
     });
-    await expect(f.poc.refresh(aggregateUsage([]))).rejects.toThrow('too many window log folders');
+    await expect(f.tracking.refresh(aggregateUsage([]))).rejects.toThrow('too many window log folders');
     expect(visited).toHaveLength(513);
   });
 
@@ -721,17 +672,17 @@ describe('local POC ledger', () => {
       await fs.appendFile(file, lines.slice(0, firstBill + 1).join('\n') + '\n{"kind"');
       throw new Error('Interrupted after a complete bill');
     });
-    await expect(f.poc.refresh(aggregateUsage([a, b]), now)).rejects.toThrow('Interrupted after a complete bill');
-    const other = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    await expect(f.tracking.refresh(aggregateUsage([a, b]), now)).rejects.toThrow('Interrupted after a complete bill');
+    const other = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     const observed = await other.refresh(aggregateUsage([]), now);
     expect(observed.summary.allTime.githubCopilot.aiCredits).toBe(2);
 
     // The original writer retries after the request logs have disappeared.
     await rm(f.usage);
-    const recovered = await f.poc.refresh(aggregateUsage([]), now);
+    const recovered = await f.tracking.refresh(aggregateUsage([]), now);
     expect(recovered.summary.allTime).toEqual(observed.summary.allTime);
     expect((await other.refresh(aggregateUsage([]), now)).summary.allTime).toEqual(observed.summary.allTime);
-    const restarted = await new AccountUsagePoc(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([]), now);
+    const restarted = await new AccountTracking(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([]), now);
     expect(restarted.summary.allTime).toEqual(observed.summary.allTime);
     expect(await readFile(join(f.storage, 'start.json'), 'utf8')).toBe(start);
   });
@@ -742,13 +693,13 @@ describe('local POC ledger', () => {
     await appendFile(f.log, auth('Bob', base + 3_000) + done(row));
     const now = new Date(base + 30_000);
     vi.mocked(appendFile).mockRejectedValueOnce(new Error('Disk unavailable'));
-    await expect(f.poc.refresh(aggregateUsage([row], now), now)).rejects.toThrow('Disk unavailable');
+    await expect(f.tracking.refresh(aggregateUsage([row], now), now)).rejects.toThrow('Disk unavailable');
     await rm(f.log);
-    const recovered = await f.poc.refresh(aggregateUsage([], now), now);
-    const restarted = await new AccountUsagePoc(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([], now), now);
+    const recovered = await f.tracking.refresh(aggregateUsage([], now), now);
+    const restarted = await new AccountTracking(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([], now), now);
     expect(recovered.account).toBe('alice');
     expect(recovered).toEqual(restarted);
-    expect(f.poc.getRetainedChatIds()).toEqual([]);
+    expect(f.tracking.getRetainedChatIds()).toEqual([]);
   });
 
   it('forgets unsaved summary peers after an append fails', async () => {
@@ -758,11 +709,11 @@ describe('local POC ledger', () => {
     await appendFile(f.log, line(base + 11_000, 'ccreq:one | success | model | 1000ms | [panel/editAgent]'));
     const now = new Date(base + 30_000);
     vi.mocked(appendFile).mockRejectedValueOnce(new Error('Disk unavailable'));
-    await expect(f.poc.refresh(aggregateUsage([row, other], now), now)).rejects.toThrow('Disk unavailable');
-    const recovered = await f.poc.refresh(aggregateUsage([row], now), now);
+    await expect(f.tracking.refresh(aggregateUsage([row, other], now), now)).rejects.toThrow('Disk unavailable');
+    const recovered = await f.tracking.refresh(aggregateUsage([row], now), now);
     expect(recovered.summary.allTime.tokens).toBe(100);
     expect(recovered.pending).toBe(0);
-    expect(f.poc.getRetainedChatIds()).toEqual(['chat']);
+    expect(f.tracking.getRetainedChatIds()).toEqual(['chat']);
   });
 
   it('recovers after a failed partial journal append without losing or duplicating usage', async () => {
@@ -776,9 +727,9 @@ describe('local POC ledger', () => {
       throw new Error('Simulated interrupted write');
     });
 
-    await expect(f.poc.refresh(summary, new Date(base + 30_000))).rejects.toThrow('Simulated interrupted write');
-    expect((await f.poc.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(100);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    await expect(f.tracking.refresh(summary, new Date(base + 30_000))).rejects.toThrow('Simulated interrupted write');
+    expect((await f.tracking.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(100);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     expect((await restarted.refresh(aggregateUsage([]), new Date(base + 30_000))).summary.allTime.tokens).toBe(100);
   });
 
@@ -787,9 +738,9 @@ describe('local POC ledger', () => {
     const a = record(f.usage);
     await appendFile(f.log, done(a));
     const summary = aggregateUsage([a]);
-    expect((await f.poc.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(100);
+    expect((await f.tracking.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(100);
     await appendFile(f.log, auth('Bob_company', base + 40_000));
-    const switched = await f.poc.refresh(summary, new Date(base + 45_000));
+    const switched = await f.tracking.refresh(summary, new Date(base + 45_000));
     expect(switched.account).toBe('bob_company');
     expect(switched.summary.allTime.tokens).toBe(0);
     expect(switched.problem).toBeUndefined();
@@ -800,14 +751,14 @@ describe('local POC ledger', () => {
     const b = { ...a, filePath: f.usage.toLowerCase() };
     await appendFile(f.log, done(a));
     const summary = aggregateUsage([a, b]);
-    expect((await f.poc.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(100);
-    // Reproduce the old observer's duplicate entry without resetting its ledger.
+    expect((await f.tracking.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(100);
+    // Reproduce another window's duplicate entry without resetting the ledger.
     const oldKey = createHash('sha256').update(JSON.stringify([
       resolve(b.filePath), b.timestamp.getTime(), b.debugRequest!.spanId,
       b.debugRequest!.responseId, b.debugRequest!.durationMs, b.model,
     ])).digest('hex');
-    await writeFile(join(f.storage, 'observer-abcdef.jsonl'), JSON.stringify({ kind: 'bill', key: oldKey, record: b, sessionStart: base + 1_000 }) + '\n');
-    const restarted = new AccountUsagePoc(f.storage, f.stream.toLowerCase(), [f.logRoot]);
+    await appendFile(join(f.storage, 'ledger.jsonl'), JSON.stringify({ kind: 'bill', key: oldKey, record: b, sessionStart: base + 1_000 }) + '\n');
+    const restarted = new AccountTracking(f.storage, f.stream.toLowerCase(), [f.logRoot]);
     expect((await restarted.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(100);
   });
 
@@ -816,29 +767,29 @@ describe('local POC ledger', () => {
     const old = record(f.usage, base - 1);
     const current = record(f.usage);
     const summary = aggregateUsage([old, current], new Date(base + 30_000));
-    const pending = await f.poc.refresh(summary, new Date(base + 30_000));
+    const pending = await f.tracking.refresh(summary, new Date(base + 30_000));
     expect(pending.pending).toBe(1);
     expect(pending.problem).toBeUndefined();
     expect(pending.summary.allTime.tokens).toBe(100);
     const completion = done(current);
     await appendFile(f.log, completion.slice(0, -1));
-    expect((await f.poc.refresh(summary, new Date(base + 30_000))).pending).toBe(1);
+    expect((await f.tracking.refresh(summary, new Date(base + 30_000))).pending).toBe(1);
     await appendFile(f.log, '\n');
-    const resolved = await f.poc.refresh(summary, new Date(base + 30_000));
+    const resolved = await f.tracking.refresh(summary, new Date(base + 30_000));
     expect(resolved.problem).toBeUndefined();
     expect(resolved.summary.allTime.tokens).toBe(200);
     expect(resolved.summary.month.githubCopilot.usd).toBe(0.04);
     expect(resolved.summary.topModels[0].sessions).toBe(1);
-    expect((await f.poc.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(200);
+    expect((await f.tracking.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(200);
   });
 
   it('survives restart and log cleanup using saved evidence and usage', async () => {
     const f = await fixture();
     const current = record(f.usage);
     await appendFile(f.log, line(base + 11_001, 'ccreq:abc.copilotmd | success | model | 1001ms | [panel/editAgent]'));
-    await f.poc.refresh(aggregateUsage([current]), new Date(base + 30_000));
+    await f.tracking.refresh(aggregateUsage([current]), new Date(base + 30_000));
     await rm(f.log);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     const view = await restarted.refresh(aggregateUsage([]), new Date(base + 60_000));
     expect(view.startedAt.getTime()).toBe(base);
     expect(view.summary.allTime.tokens).toBe(100);
@@ -853,7 +804,7 @@ describe('local POC ledger', () => {
     const f = await fixture();
     const saved = record(f.usage);
     await appendFile(f.log, done(saved));
-    await f.poc.refresh(aggregateUsage([saved]), new Date(base + 30_000));
+    await f.tracking.refresh(aggregateUsage([saved]), new Date(base + 30_000));
     await rm(f.log);
 
     const stream = join(f.logRoot, '20260907T130000', 'window1', 'exthost', 'GitHub.copilot-chat');
@@ -864,7 +815,7 @@ describe('local POC ledger', () => {
     const fresh = record(f.usage, base + 3_610_000, 'fresh-request');
     await appendFile(log, done(fresh));
     const summary = aggregateUsage([saved, missed, fresh]);
-    const restarted = new AccountUsagePoc(f.storage, stream, [f.logRoot]);
+    const restarted = new AccountTracking(f.storage, stream, [f.logRoot]);
     const now = new Date(base + 3_630_000);
     const view = await restarted.refresh(summary, now);
 
@@ -873,12 +824,12 @@ describe('local POC ledger', () => {
     expect(view.diagnostics).toContain('unresolved requests: 1');
     expect(view.summary.allTime.tokens).toBe(200);
     expect(view.summary.chats.flatMap((chat) => chat.records).map((row) => row.debugRequest?.responseId)).not.toContain('missed-request');
-    expect((await new AccountUsagePoc(f.storage, stream, [f.logRoot]).refresh(aggregateUsage([]), now)).problem).toBeUndefined();
+    expect((await new AccountTracking(f.storage, stream, [f.logRoot]).refresh(aggregateUsage([]), now)).problem).toBeUndefined();
 
     // Evidence restored later can still resolve the request; it was not lost
     // or assigned to whichever account happened to open the new window.
     const recoveredEvidence = parseAccountEvidence(auth('Alice') + done(saved) + done(missed), f.stream);
-    await writeFile(join(f.storage, 'observer-abcdef.jsonl'),
+    await appendFile(join(f.storage, 'ledger.jsonl'),
       recoveredEvidence.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
     const recovered = await restarted.refresh(summary, now);
     expect(recovered.pending).toBe(0);
@@ -893,15 +844,15 @@ describe('local POC ledger', () => {
     const b = { ...record(f.usage, base + 20_000), tokens: { ...a.tokens, total: 200 }, billing: { ...a.billing!, aiCredits: 5 } };
     await appendFile(f.log, done(a));
     await writeFile(join(other, 'GitHub Copilot Chat.log'), auth('Bob') + done(b));
-    const second = new AccountUsagePoc(f.storage, other, [f.logRoot]);
+    const second = new AccountTracking(f.storage, other, [f.logRoot]);
     const summary = aggregateUsage([a, b]);
     const [alice, bob] = await Promise.all([
-      f.poc.refresh(summary, new Date(base + 30_000)), second.refresh(summary, new Date(base + 30_000)),
+      f.tracking.refresh(summary, new Date(base + 30_000)), second.refresh(summary, new Date(base + 30_000)),
     ]);
     expect(alice.summary.allTime.tokens).toBe(100);
     expect(bob.summary.allTime.tokens).toBe(200);
     await appendFile(f.log, auth('Bob', base + 40_000));
-    const switched = await f.poc.refresh(summary, new Date(base + 45_000));
+    const switched = await f.tracking.refresh(summary, new Date(base + 45_000));
     expect(switched.account).toBe('bob');
     expect(switched.summary.allTime.tokens).toBe(200);
     expect(switched.summary.allTime.githubCopilot.aiCredits).toBe(5);
@@ -915,16 +866,16 @@ describe('local POC ledger', () => {
       debugRequest: { ...a.debugRequest!, responseId: 'request-2', spanId: 'second-span' } };
     const now = new Date(base + 90_000);
     await appendFile(f.log, line(base + 11_000, 'ccreq:summary-1 | success | original-model -> model | 1000ms | [panel/editAgent]'));
-    const initial = await f.poc.refresh(aggregateUsage([a]), now);
+    const initial = await f.tracking.refresh(aggregateUsage([a]), now);
     expect(initial.summary.allTime.tokens).toBe(100);
     expect(initial.pending).toBe(0);
 
-    const ambiguous = await f.poc.refresh(aggregateUsage([a, b]), now);
+    const ambiguous = await f.tracking.refresh(aggregateUsage([a, b]), now);
     expect(ambiguous.summary.allTime.tokens).toBe(0);
     expect(ambiguous.pending).toBe(2);
 
     await appendFile(f.log, done(a));
-    const resolved = await f.poc.refresh(aggregateUsage([a, b]), now);
+    const resolved = await f.tracking.refresh(aggregateUsage([a, b]), now);
     expect(resolved.summary.allTime.tokens).toBe(100);
     expect(resolved.pending).toBe(1);
     expect(resolved.summary.chats[0].records[0].debugRequest?.responseId).toBe(a.debugRequest.responseId);
@@ -935,9 +886,9 @@ describe('local POC ledger', () => {
     const a = record(f.usage);
     await writeFile(join(f.stream, 'GitHub Copilot Chat.1.log'), auth('Alice') + done(a));
     const summary = aggregateUsage([a]);
-    expect((await f.poc.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(100);
+    expect((await f.tracking.refresh(summary, new Date(base + 30_000))).summary.allTime.tokens).toBe(100);
     await appendFile(f.log, auth('Bob', base + 10_500));
-    const revised = await f.poc.refresh(summary, new Date(base + 35_000));
+    const revised = await f.tracking.refresh(summary, new Date(base + 35_000));
     expect(revised.excluded).toBe(1);
     expect(revised.summary.allTime.tokens).toBe(0);
   });
@@ -948,25 +899,157 @@ describe('local POC ledger', () => {
     const b = record(f.usage, base + 20_000, 'second-request');
     await appendFile(f.log, done(a) + done(b));
     const now = new Date(base + 30_000);
-    expect((await f.poc.refresh(aggregateUsage([a, b]), now)).summary.allTime.githubCopilot.aiCredits).toBe(4);
+    expect((await f.tracking.refresh(aggregateUsage([a, b]), now)).summary.allTime.githubCopilot.aiCredits).toBe(4);
     const journalFile = join(f.storage, (await readdir(f.storage)).find((file) => file.endsWith('.jsonl'))!);
     const malformed = (await readFile(journalFile, 'utf8')).replace(/"aiCredits":2/g, `"aiCredits":${amount}`);
     await writeFile(journalFile, malformed);
     const start = await readFile(join(f.storage, 'start.json'), 'utf8');
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
 
-    await expect(restarted.refresh(aggregateUsage([]), now)).rejects.toThrow('Invalid account POC request journal');
-    await expect(restarted.refresh(aggregateUsage([]), now)).rejects.toThrow('Invalid account POC request journal');
+    await expect(restarted.refresh(aggregateUsage([]), now)).rejects.toThrow('Invalid account tracking request journal');
+    await expect(restarted.refresh(aggregateUsage([]), now)).rejects.toThrow('Invalid account tracking request journal');
     expect(await readFile(journalFile, 'utf8')).toBe(malformed);
     expect(await readFile(join(f.storage, 'start.json'), 'utf8')).toBe(start);
   });
 
-  it('keeps failing on corrupt persisted evidence and never resets the start date', async () => {
+});
+
+describe('replaced window logs', () => {
+  /** A second window with its own Alice sign-in and one billed request. */
+  async function twoWindows() {
     const f = await fixture();
-    await writeFile(join(f.storage, 'observer-abcdef.jsonl'), '{broken}\n');
-    await expect(f.poc.refresh(aggregateUsage([]))).rejects.toThrow();
-    await expect(f.poc.refresh(aggregateUsage([]))).rejects.toThrow();
-    expect(JSON.parse(await readFile(join(f.storage, 'start.json'), 'utf8')).startedAt).toBe(base);
+    const other = join(f.logRoot, '20260907T110000', 'window2', 'exthost', 'GitHub.copilot-chat');
+    await mkdir(other, { recursive: true });
+    const otherLog = join(other, 'GitHub Copilot Chat.log');
+    const otherUsage = join(f.root, 'debug-logs', 'other', 'main.jsonl');
+    await mkdir(join(f.root, 'debug-logs', 'other'), { recursive: true });
+    await writeFile(otherUsage, JSON.stringify({ type: 'session_start', ts: base + 25_000 }) + '\n');
+    const mine = record(f.usage);
+    const theirs = { ...record(otherUsage, base + 30_000, 'other-request'), chatId: 'other-chat', title: 'Other chat' };
+    await writeFile(otherLog, auth('Alice') + done(theirs));
+    await appendFile(f.log, done(mine));
+    const seen = new Date(base + 35_000);
+    const both = await f.tracking.refresh(aggregateUsage([mine, theirs], seen), seen);
+    expect(both).toMatchObject({ account: 'alice', excluded: 0, pending: 0 });
+    expect(both.summary.allTime.tokens).toBe(200);
+    return { ...f, other, otherLog, mine, theirs };
+  }
+
+  /** A request this window dispatches after its log was replaced. */
+  async function afterLoss(root: string, name: string, at: number) {
+    const usage = join(root, 'debug-logs', name, 'main.jsonl');
+    await mkdir(join(root, 'debug-logs', name), { recursive: true });
+    await writeFile(usage, JSON.stringify({ type: 'session_start', ts: at - 2_000 }) + '\n');
+    return { ...record(usage, at, `${name}-request`), chatId: `${name}-chat`, title: `${name} chat` };
+  }
+
+  it('stops crediting the previous account when a replacement could have erased a switch', async () => {
+    const f = await twoWindows();
+    const later = await afterLoss(f.root, 'later', base + 50_000);
+    // A sign-in as someone else, and everything before it, is erased. Only the
+    // completion of the request dispatched afterwards survives.
+    await writeFile(f.otherLog, done(later));
+    const now = new Date(base + 60_000);
+    const summary = aggregateUsage([f.mine, f.theirs, later], now);
+    const after = await f.tracking.refresh(summary, now);
+    expect(after.account).toBe('alice');
+    // Both requests evidenced before the loss keep their account; the one
+    // dispatched into the lost span does not join them.
+    expect(after.summary.allTime.tokens).toBe(200);
+    expect(after.excluded).toBe(1);
+    expect(after.summary.chats.map((chat) => chat.chatId)).not.toContain('later-chat');
+    // The lost span is recorded, so a restart cannot recover the old account.
+    const restarted = await new AccountTracking(f.storage, f.stream, [f.logRoot]).refresh(summary, now);
+    expect(restarted.summary.allTime.tokens).toBe(200);
+    expect(restarted.excluded).toBe(1);
+  });
+
+  it('still reports lost content after a failed ledger append', async () => {
+    const f = await twoWindows();
+    const later = await afterLoss(f.root, 'later', base + 50_000);
+    await writeFile(f.otherLog, done(later));
+    const now = new Date(base + 60_000);
+    const summary = aggregateUsage([f.mine, f.theirs, later], now);
+    vi.mocked(appendFile).mockRejectedValueOnce(new Error('Disk unavailable'));
+    await expect(f.tracking.refresh(summary, now)).rejects.toThrow('Disk unavailable');
+    // The record of what was already read must survive the rollback.
+    const after = await f.tracking.refresh(summary, now);
+    expect(after.summary.allTime.tokens).toBe(200);
+    expect(after.excluded).toBe(1);
+  });
+
+  it('rejects a request dispatched just after reading stopped', async () => {
+    const f = await twoWindows();
+    // Reading stopped at the other window's last completion, so the marker sits
+    // a matching tolerance later. A request dispatched between the two still
+    // ran after content could have gone missing.
+    const victim = await afterLoss(f.root, 'victim', base + 32_000);
+    await writeFile(f.otherLog, done(victim));
+    const now = new Date(base + 60_000);
+    const after = await f.tracking.refresh(aggregateUsage([f.mine, f.theirs, victim], now), now);
+    expect(after.account).toBe('alice');
+    expect(after.summary.chats.map((chat) => chat.chatId)).not.toContain('victim-chat');
+    expect(after.summary.allTime.tokens).toBe(200);
+    expect(after.excluded).toBe(1);
+  });
+
+  it('hides the account on the very refresh that finds the loss', async () => {
+    const f = await twoWindows();
+    // A newer line in this window, read before its log is replaced.
+    await appendFile(f.log, line(base + 36_000, 'request done: requestId: [noise] model deployment ID: []'));
+    await f.tracking.refresh(aggregateUsage([f.mine, f.theirs], new Date(base + 40_000)), new Date(base + 40_000));
+    // Found within a matching tolerance of that line, which is the busy case.
+    await writeFile(f.log, line(base + 37_000, 'Opening chat session'));
+    const now = new Date(base + 37_500);
+    const after = await f.tracking.refresh(aggregateUsage([f.mine, f.theirs], now), now);
+    expect(after.account).toBeUndefined();
+  });
+
+  it('ignores a rotated backup being overwritten once it was read to the end', async () => {
+    const f = await twoWindows();
+    // First rotation: the live log moves aside and a fresh one starts.
+    const rotated = await readFile(f.otherLog, 'utf8');
+    const backup = join(f.other, 'GitHub Copilot Chat.1.log');
+    await writeFile(backup, rotated);
+    const between = line(base + 40_000, 'After the first rotation');
+    await writeFile(f.otherLog, between);
+    const once = await f.tracking.refresh(aggregateUsage([f.mine, f.theirs], new Date(base + 45_000)), new Date(base + 45_000));
+    expect(once).toMatchObject({ account: 'alice', excluded: 0, pending: 0 });
+    // Second rotation with room for one backup only: the backup this window
+    // already read to its end is overwritten, which loses nothing unread.
+    await writeFile(backup, between);
+    await writeFile(f.otherLog, line(base + 50_000, 'After the second rotation'));
+    const now = new Date(base + 60_000);
+    const twice = await f.tracking.refresh(aggregateUsage([f.mine, f.theirs], now), now);
+    expect(twice).toMatchObject({ account: 'alice', excluded: 0, pending: 0 });
+    expect(twice.summary.allTime.tokens).toBe(200);
+    expect(twice.diagnostics).not.toContain('lost account history');
+  });
+
+  it('resumes attribution once a fresh token names the account again', async () => {
+    const f = await twoWindows();
+    const inSpan = await afterLoss(f.root, 'span', base + 35_000);
+    const later = await afterLoss(f.root, 'later', base + 50_000);
+    await writeFile(f.otherLog, done(inSpan) + auth('Alice', base + 45_000) + done(later));
+    const now = new Date(base + 60_000);
+    const after = await f.tracking.refresh(aggregateUsage([f.mine, f.theirs, inSpan, later], now), now);
+    expect(after.account).toBe('alice');
+    // The request dispatched into the lost span stays uncertain; the one
+    // dispatched after the new token is attributed again.
+    expect(after.excluded).toBe(1);
+    expect(after.summary.allTime.tokens).toBe(300);
+    expect(after.summary.chats.map((chat) => chat.chatId).sort()).toEqual(['chat', 'later-chat', 'other-chat']);
+  });
+
+  it('keeps other windows attributed when this window loses its own account lines', async () => {
+    const f = await twoWindows();
+    await writeFile(f.log, line(base + 50_000, 'Opening chat session'));
+    const now = new Date(base + 60_000);
+    const after = await f.tracking.refresh(aggregateUsage([f.mine, f.theirs], now), now);
+    // This window can no longer name its own account, so combined usage shows.
+    expect(after.account).toBeUndefined();
+    expect(after.summary.allTime.tokens).toBe(200);
+    expect(after.diagnostics).toContain('Times a window log lost account history since this window started: 1');
   });
 });
 
@@ -977,9 +1060,9 @@ describe('shared ledger', () => {
     const b = record(f.usage, base + 20_000, 'request-2');
     await appendFile(f.log, done(a) + done(b));
     const now = new Date(base + 40_000);
-    const second = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const second = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     const [first, other] = await Promise.all([
-      f.poc.refresh(aggregateUsage([a]), now), second.refresh(aggregateUsage([b]), now),
+      f.tracking.refresh(aggregateUsage([a]), now), second.refresh(aggregateUsage([b]), now),
     ]);
     // Whichever window appends second already sees the other's bill.
     expect(first.summary.allTime.tokens).toBeGreaterThanOrEqual(100);
@@ -988,7 +1071,7 @@ describe('shared ledger', () => {
     // The ledger is only ever appended to, never rewritten.
     expect(vi.mocked(writeFile).mock.calls.some(([file]) => String(file).startsWith(f.storage) && String(file).endsWith('.jsonl'))).toBe(false);
     await rm(f.usage);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     expect((await restarted.refresh(aggregateUsage([]), now)).summary.allTime.tokens).toBe(200);
     const lines = (await readFile(join(f.storage, 'ledger.jsonl'), 'utf8')).split('\n').filter(Boolean);
     expect(lines.filter((line) => JSON.parse(line).kind === 'bill')).toHaveLength(2);
@@ -1000,7 +1083,7 @@ describe('shared ledger', () => {
     await appendFile(f.log, done(a));
     const now = new Date(base + 30_000);
     const summary = aggregateUsage([a]);
-    const other = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const other = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     await other.refresh(aggregateUsage([]), now);
     // The other window saves the same bill after this window has read the
     // ledger but before it appends.
@@ -1014,38 +1097,15 @@ describe('shared ledger', () => {
       return fs.open(...args);
     });
     vi.mocked(appendFile).mockClear();
-    expect((await f.poc.refresh(summary, now)).summary.allTime.tokens).toBe(100);
+    expect((await f.tracking.refresh(summary, now)).summary.allTime.tokens).toBe(100);
     expect(raced).toBe(true);
     expect(vi.mocked(appendFile).mock.calls.filter(([file]) => String(file).endsWith('ledger.jsonl'))).toHaveLength(1);
     const lines = (await readFile(join(f.storage, 'ledger.jsonl'), 'utf8')).split('\n').filter(Boolean);
     expect(lines.filter((line) => JSON.parse(line).kind === 'bill')).toHaveLength(1);
     expect(lines.filter((line) => JSON.parse(line).kind === 'completion')).toHaveLength(1);
     vi.mocked(open).mockImplementation(fs.open);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     expect((await restarted.refresh(aggregateUsage([]), now)).summary.allTime.tokens).toBe(100);
-  });
-
-  it('absorbs older per-process journals into the first snapshot, torn tail included', async () => {
-    const f = await fixture();
-    const a = record(f.usage);
-    const b = record(f.usage, base + 20_000, 'request-2');
-    await appendFile(f.log, done(a) + done(b));
-    const now = new Date(base + 40_000);
-    const legacy = join(f.storage, 'observer-1234-0.jsonl');
-    const bill = { kind: 'bill', key: createHash('sha256').update(JSON.stringify([
-      resolve(a.filePath), a.timestamp.getTime(), a.debugRequest.spanId, a.debugRequest.responseId,
-      a.debugRequest.durationMs, a.model])).digest('hex'), record: a, sessionStart: base + 1_000 };
-    await writeFile(legacy, JSON.stringify(bill) + '\n{"kind":"bill","key":"partial');
-    await rm(f.usage);
-    expect((await f.poc.refresh(aggregateUsage([b]), now)).summary.allTime.tokens).toBe(200);
-    // The journal is never written to; the snapshot that absorbed it replaces it.
-    expect(vi.mocked(appendFile).mock.calls.some(([file]) => String(file) === legacy)).toBe(false);
-    expect((await f.poc.refresh(aggregateUsage([]), now)).summary.allTime.tokens).toBe(200);
-    const names = (await readdir(f.storage)).filter((name) => name.endsWith('.jsonl'));
-    expect(names).not.toContain('observer-1234-0.jsonl');
-    expect(names.filter((name) => name.startsWith('snapshot-'))).toHaveLength(1);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
-    expect((await restarted.refresh(aggregateUsage([]), now)).summary.allTime.tokens).toBe(200);
   });
 
   it('skips and counts a torn ledger line but keeps failing on an invalid entry', async () => {
@@ -1054,15 +1114,15 @@ describe('shared ledger', () => {
     const b = record(f.usage, base + 20_000, 'request-2');
     await appendFile(f.log, done(a) + done(b));
     const now = new Date(base + 40_000);
-    await f.poc.refresh(aggregateUsage([a]), now);
+    await f.tracking.refresh(aggregateUsage([a]), now);
     const ledger = join(f.storage, 'ledger.jsonl');
     // A window that died mid-append leaves a fragment; the next append starts a new line.
     await appendFile(ledger, '{"kind":"bill","key":"torn');
-    const view = await f.poc.refresh(aggregateUsage([b]), now);
+    const view = await f.tracking.refresh(aggregateUsage([b]), now);
     expect(view.summary.allTime.tokens).toBe(200);
     expect(view.diagnostics).not.toContain('Skipped unreadable');
     await rm(f.usage);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     const reloaded = await restarted.refresh(aggregateUsage([]), now);
     expect(reloaded.summary.allTime.tokens).toBe(200);
     expect(reloaded.diagnostics).toContain('Skipped unreadable ledger lines: 1');
@@ -1071,9 +1131,9 @@ describe('shared ledger', () => {
     const invalid = (await readFile(ledger, 'utf8')) + JSON.stringify({ kind: 'token', stream: 7, at: base }) + '\n';
     await writeFile(ledger, invalid);
     const start = await readFile(join(f.storage, 'start.json'), 'utf8');
-    const strict = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
-    await expect(strict.refresh(aggregateUsage([]), now)).rejects.toThrow('Invalid account POC evidence journal');
-    await expect(strict.refresh(aggregateUsage([]), now)).rejects.toThrow('Invalid account POC evidence journal');
+    const strict = new AccountTracking(f.storage, f.stream, [f.logRoot]);
+    await expect(strict.refresh(aggregateUsage([]), now)).rejects.toThrow('Invalid account tracking evidence journal');
+    await expect(strict.refresh(aggregateUsage([]), now)).rejects.toThrow('Invalid account tracking evidence journal');
     expect(await readFile(ledger, 'utf8')).toBe(invalid);
     expect(await readFile(join(f.storage, 'start.json'), 'utf8')).toBe(start);
   });
@@ -1084,7 +1144,7 @@ describe('shared ledger', () => {
     const requests = Array.from({ length: 3_000 }, (_, i) => record(f.usage, base + 10_000 + i, `request-${i}`));
     await appendFile(f.log, requests.map(done).join(''));
     vi.mocked(appendFile).mockClear();
-    await f.poc.refresh(aggregateUsage([]), now);
+    await f.tracking.refresh(aggregateUsage([]), now);
     const writes = vi.mocked(appendFile).mock.calls.map((call) => String(call[1]));
     expect(writes.reduce((total, text) => total + Buffer.byteLength(text), 0)).toBeGreaterThan(256 * 1024);
     expect(writes.length).toBeGreaterThan(1);
@@ -1095,7 +1155,7 @@ describe('shared ledger', () => {
     }
     const lines = (await readFile(join(f.storage, 'ledger.jsonl'), 'utf8')).split('\n').filter(Boolean);
     expect(lines.filter((line) => JSON.parse(line).kind === 'completion')).toHaveLength(3_000);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     expect((await restarted.refresh(aggregateUsage([]), now)).diagnostics).not.toContain('Skipped unreadable');
   });
 
@@ -1120,23 +1180,11 @@ describe('shared ledger', () => {
       }
     });
     const now = new Date(base + 30_000);
-    expect((await f.poc.refresh(aggregateUsage([row], now), now)).summary.allTime.tokens).toBe(100);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    expect((await f.tracking.refresh(aggregateUsage([row], now), now)).summary.allTime.tokens).toBe(100);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     expect((await restarted.refresh(aggregateUsage([], now), now)).summary.allTime.tokens).toBe(100);
   });
 
-  it('bounds legacy journal discovery without touching existing journals', async () => {
-    const f = await fixture();
-    const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
-    const legacy = join(f.storage, 'observer-abcdef.jsonl');
-    await writeFile(legacy, '{"kind":"bill","key":"partial');
-    const journals = Array.from({ length: 257 }, (_, i) => `observer-${i.toString(16)}.jsonl`);
-    vi.mocked(readdir).mockImplementationOnce(async () => journals as never);
-    await expect(f.poc.refresh(aggregateUsage([]), new Date(base + 30_000))).rejects.toThrow('too many observer journals');
-    expect(await readFile(legacy, 'utf8')).toBe('{"kind":"bill","key":"partial');
-    vi.mocked(readdir).mockImplementation(fs.readdir);
-    expect((await f.poc.refresh(aggregateUsage([]), new Date(base + 30_000))).summary.allTime.tokens).toBe(0);
-  });
 });
 
 describe('ledger rollover and freeze', () => {
@@ -1156,7 +1204,7 @@ describe('ledger rollover and freeze', () => {
     const b = record(f.usage, base + 20_000, 'request-2');
     await appendFile(f.log, done(a) + done(b));
     const soon = new Date(base + 30_000);
-    expect((await f.poc.refresh(aggregateUsage([a, b], soon), soon)).summary.allTime.tokens).toBe(200);
+    expect((await f.tracking.refresh(aggregateUsage([a, b], soon), soon)).summary.allTime.tokens).toBe(200);
     const later = new Date(base + 8 * DAY);
     const settled = new Date(later.getTime() + 11 * 60_000);
     return { ...f, a, b, later, settled };
@@ -1165,13 +1213,13 @@ describe('ledger rollover and freeze', () => {
   it('rolls the ledger aside, then freezes old requests into per-day rollups without their evidence', async () => {
     const f = await frozenFixture();
     // Old requests in the live ledger: it is renamed aside, never rewritten, and waits for in-flight appends.
-    const rolled = await f.poc.refresh(aggregateUsage([], f.later), f.later);
+    const rolled = await f.tracking.refresh(aggregateUsage([], f.later), f.later);
     expect(rolled.summary.allTime.tokens).toBe(200);
     let names = await files(f.storage);
     expect(names.some((name) => /^ledger-\d+-[\da-f-]+\.jsonl$/.test(name))).toBe(true);
     expect(names).not.toContain('ledger.jsonl');
     expect(names.some((name) => name.startsWith('snapshot-'))).toBe(false);
-    const frozen = await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    const frozen = await f.tracking.refresh(aggregateUsage([], f.settled), f.settled);
     expect(frozen.summary.allTime.tokens).toBe(200);
     expect(frozen.diagnostics).toContain('Attributed requests for this account: 2');
     expect(vi.mocked(writeFile).mock.calls.some(([file]) => String(file).startsWith(f.storage) && String(file).endsWith('.jsonl'))).toBe(false);
@@ -1181,7 +1229,7 @@ describe('ledger rollover and freeze', () => {
     expect(lines.filter((line) => ['bill', 'completion', 'request-summary'].includes(line.kind))).toHaveLength(0);
     expect(lines.filter((line) => line.kind === 'token')).toHaveLength(1);
     // The next refresh retires the absorbed file and serves the rollup.
-    const after = await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    const after = await f.tracking.refresh(aggregateUsage([], f.settled), f.settled);
     expect(after.summary.allTime.tokens).toBe(200);
     expect(after.summary.allTime.githubCopilot.aiCredits).toBe(4);
     expect(after.summary.chats).toHaveLength(1);
@@ -1192,7 +1240,7 @@ describe('ledger rollover and freeze', () => {
     expect(names.some((name) => name.startsWith('ledger'))).toBe(false);
     // A new window needs only the snapshot, including the auth history it kept.
     await rm(f.log);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     const view = await restarted.refresh(aggregateUsage([], f.settled), f.settled);
     expect(view.account).toBe('alice');
     expect(view.summary.allTime.tokens).toBe(200);
@@ -1209,18 +1257,18 @@ describe('ledger rollover and freeze', () => {
     const f = await fixture();
     const a = record(f.usage);
     await appendFile(f.log, done(a));
-    await f.poc.refresh(aggregateUsage([a]), new Date(base + 30_000));
+    await f.tracking.refresh(aggregateUsage([a]), new Date(base + 30_000));
     const later = new Date(base + 8 * DAY);
     vi.mocked(appendFile).mockClear();
     const renamed = { ...a, metadataOnly: true, titlePriority: TITLE_PRIORITY.custom,
       timestamp: new Date(base + 20_000), titleModifiedAt: base + 40_000, title: 'Renamed' };
-    const view = await f.poc.refresh(aggregateUsage([a, renamed], later), later);
+    const view = await f.tracking.refresh(aggregateUsage([a, renamed], later), later);
     expect(view.summary.chats[0].title).toBe('Renamed');
     expect(view.summary.allTime.tokens).toBe(100);
     // A request first seen this late may already sit inside a rollup, so it is not saved.
     const missed = record(f.usage, base + 50_000, 'missed');
     await appendFile(f.log, done(missed));
-    const ignored = await f.poc.refresh(aggregateUsage([a, missed], later), later);
+    const ignored = await f.tracking.refresh(aggregateUsage([a, missed], later), later);
     expect(ignored.summary.allTime.tokens).toBe(100);
     expect(ignored.pending).toBe(0);
     expect(vi.mocked(appendFile).mock.calls.filter(([file]) => String(file).startsWith(f.storage))).toHaveLength(0);
@@ -1228,10 +1276,10 @@ describe('ledger rollover and freeze', () => {
 
   it('rebuilds other windows from the snapshot, retires absorbed files, and salvages late appends', async () => {
     const f = await frozenFixture();
-    const other = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
-    await f.poc.refresh(aggregateUsage([], f.later), f.later);
+    const other = new AccountTracking(f.storage, f.stream, [f.logRoot]);
+    await f.tracking.refresh(aggregateUsage([], f.later), f.later);
     expect((await other.refresh(aggregateUsage([], f.later), f.later)).summary.allTime.tokens).toBe(200);
-    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    await f.tracking.refresh(aggregateUsage([], f.settled), f.settled);
     // A window whose append was in flight during the roll lands a whole line, then dies mid-write.
     const [rolledName] = (await files(f.storage)).filter((name) => name.startsWith('ledger-'));
     const late = record(f.usage, f.settled.getTime() - 10_000, 'late');
@@ -1243,8 +1291,8 @@ describe('ledger rollover and freeze', () => {
     expect(view.summary.chats[0].records).toHaveLength(2);
     expect(await files(f.storage)).not.toContain(rolledName);
     expect(await readFile(join(f.storage, 'ledger.jsonl'), 'utf8')).toContain(lateLine);
-    expect((await f.poc.refresh(aggregateUsage([], f.settled), f.settled)).summary.allTime.tokens).toBe(300);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    expect((await f.tracking.refresh(aggregateUsage([], f.settled), f.settled)).summary.allTime.tokens).toBe(300);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     expect((await restarted.refresh(aggregateUsage([], f.settled), f.settled)).summary.allTime.tokens).toBe(300);
   });
 
@@ -1253,18 +1301,18 @@ describe('ledger rollover and freeze', () => {
     const row = record(f.usage);
     await appendFile(f.log, done(row));
     const now = new Date(base + 6 * DAY);
-    const view = await f.poc.refresh(aggregateUsage([row], now), now);
+    const view = await f.tracking.refresh(aggregateUsage([row], now), now);
     expect(view.summary.allTime.tokens).toBe(100);
     expect(view.diagnostics).toContain('Attributed requests for this account: 1');
     expect(await files(f.storage)).toEqual(['ledger.jsonl']);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     expect((await restarted.refresh(aggregateUsage([], now), now)).summary.allTime.tokens).toBe(100);
   });
 
   it('keeps one snapshot when two windows freeze the same rolled ledger', async () => {
     const f = await frozenFixture();
-    const other = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
-    await f.poc.refresh(aggregateUsage([], f.later), f.later);
+    const other = new AccountTracking(f.storage, f.stream, [f.logRoot]);
+    await f.tracking.refresh(aggregateUsage([], f.later), f.later);
     await other.refresh(aggregateUsage([], f.later), f.later);
     const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
     let raced = false;
@@ -1276,33 +1324,33 @@ describe('ledger rollover and freeze', () => {
       }
       return fs.open(...args);
     });
-    expect((await f.poc.refresh(aggregateUsage([], f.settled), f.settled)).summary.allTime.tokens).toBe(200);
+    expect((await f.tracking.refresh(aggregateUsage([], f.settled), f.settled)).summary.allTime.tokens).toBe(200);
     expect(raced).toBe(true);
     vi.mocked(open).mockImplementation(fs.open);
     expect((await files(f.storage)).filter((name) => name.startsWith('snapshot-'))).toHaveLength(1);
     const later = new Date(f.settled.getTime() + 2_000);
-    for (const window of [f.poc, other]) {
+    for (const window of [f.tracking, other]) {
       expect((await window.refresh(aggregateUsage([], later), later)).summary.allTime.tokens).toBe(200);
     }
     const names = await files(f.storage);
     expect(names.filter((name) => name.startsWith('snapshot-'))).toHaveLength(1);
     expect(names.some((name) => name.startsWith('ledger'))).toBe(false);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     expect((await restarted.refresh(aggregateUsage([], later), later)).summary.allTime.tokens).toBe(200);
   });
 
   it('deduplicates a frozen request while preserving a distinct late old request', async () => {
     const f = await frozenFixture();
-    await f.poc.refresh(aggregateUsage([], f.later), f.later);
+    await f.tracking.refresh(aggregateUsage([], f.later), f.later);
     const [rolledName] = (await files(f.storage)).filter((name) => name.startsWith('ledger-'));
-    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    await f.tracking.refresh(aggregateUsage([], f.settled), f.settled);
     const late = record(f.usage, base + 25_000, 'late-old');
     const lateEntries = [f.a, late].flatMap((row) => [
       { kind: 'bill', key: savedKey(row), record: row, sessionStart: base + 1_000 },
       ...parseAccountEvidence(done(row), f.stream),
     ]);
     await appendFile(join(f.storage, rolledName), lateEntries.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     for (let poll = 0; poll < 3; poll++) {
       const now = new Date(f.settled.getTime() + poll * 11 * 60_000);
       const view = await restarted.refresh(aggregateUsage([], now), now);
@@ -1310,13 +1358,13 @@ describe('ledger rollover and freeze', () => {
       expect(view.diagnostics).toContain('Attributed requests for this account: 3');
     }
     const now = new Date(f.settled.getTime() + 33 * 60_000);
-    expect((await new AccountUsagePoc(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([], now), now)).summary.allTime.tokens).toBe(300);
+    expect((await new AccountTracking(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([], now), now)).summary.allTime.tokens).toBe(300);
   });
 
   it('does not replace a newer complete snapshot with a paused stale publisher', async () => {
     const f = await frozenFixture();
-    const other = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
-    await f.poc.refresh(aggregateUsage([], f.later), f.later);
+    const other = new AccountTracking(f.storage, f.stream, [f.logRoot]);
+    await f.tracking.refresh(aggregateUsage([], f.later), f.later);
     const [rolledName] = (await files(f.storage)).filter((name) => name.startsWith('ledger-'));
     const late = record(f.usage, base + 25_000, 'late-old');
     const fs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
@@ -1334,83 +1382,34 @@ describe('ledger rollover and freeze', () => {
       }
       return fs.open(...args);
     });
-    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    await f.tracking.refresh(aggregateUsage([], f.settled), f.settled);
     expect(raced).toBe(true);
     vi.mocked(open).mockImplementation(fs.open);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     expect((await restarted.refresh(aggregateUsage([], f.settled), f.settled)).summary.allTime.tokens).toBe(300);
     expect((await files(f.storage)).filter((name) => name.startsWith('snapshot-'))).toHaveLength(1);
   });
 
-  it('preserves legacy snapshot totals and saved bills when upgrading request identity tracking', async () => {
-    const f = await frozenFixture();
-    await f.poc.refresh(aggregateUsage([], f.later), f.later);
-    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
-    const [name] = (await files(f.storage)).filter((name) => name.startsWith('snapshot-'));
-    const lines = await snapshotLines(f.storage);
-    const known = record(f.usage, base + 25_000, 'legacy-known');
-    const legacy = [{ kind: 'snapshot', version: 1, at: f.settled.getTime(), absorbed: lines[0].absorbed },
-      ...lines.slice(1).filter((entry) => entry.kind !== 'frozen-keys'),
-      { kind: 'bill', key: savedKey(known), record: known, sessionStart: base + 1_000 },
-      ...parseAccountEvidence(done(known), f.stream)];
-    await writeFile(join(f.storage, name), legacy.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
-    expect((await restarted.refresh(aggregateUsage([], f.settled), f.settled)).summary.allTime.tokens).toBe(300);
-    const duplicate = { kind: 'bill', key: savedKey(f.a), record: f.a, sessionStart: base + 1_000 };
-    await appendFile(join(f.storage, 'ledger.jsonl'), JSON.stringify(duplicate) + '\n');
-    expect((await restarted.refresh(aggregateUsage([], f.settled), f.settled)).summary.allTime.tokens).toBe(300);
-    const migratedAt = new Date(f.settled.getTime() + 11 * 60_000);
-    expect((await restarted.refresh(aggregateUsage([], migratedAt), migratedAt)).summary.allTime.tokens).toBe(300);
-    await restarted.refresh(aggregateUsage([], migratedAt), migratedAt);
-    expect((await snapshotLines(f.storage))[0]).toMatchObject({ version: 2, legacyBefore: expect.any(Number) });
-    expect((await new AccountUsagePoc(f.storage, f.stream, [f.logRoot]).refresh(aggregateUsage([], migratedAt), migratedAt)).summary.allTime.tokens).toBe(300);
-  });
-
-  it('does not resave four-day-old requests already compacted by a legacy snapshot', async () => {
-    const f = await frozenFixture();
-    await f.poc.refresh(aggregateUsage([], f.later), f.later);
-    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
-    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
-    const [name] = await files(f.storage);
-    const lines = await snapshotLines(f.storage);
-    // Recreate the snapshot the three-day writer would have saved on day four.
-    const now = new Date(base + 4 * DAY);
-    const legacy = [{ kind: 'snapshot', version: 1, at: now.getTime(), absorbed: [] },
-      ...lines.slice(1).filter((entry) => entry.kind !== 'frozen-keys')];
-    await writeFile(join(f.storage, name), legacy.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
-    const rescanned = aggregateUsage([f.a, f.b], now);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
-    vi.mocked(appendFile).mockClear();
-    expect((await restarted.refresh(rescanned, now)).summary.allTime.tokens).toBe(200);
-    const appended = vi.mocked(appendFile).mock.calls.filter(([file]) => String(file).startsWith(f.storage))
-      .flatMap(([, data]) => String(data).split('\n').filter(Boolean).map((line) => JSON.parse(line)));
-    expect(appended.filter((entry) => entry.kind === 'bill')).toHaveLength(0);
-    const duplicate = { kind: 'bill', key: savedKey(f.a), record: f.a, sessionStart: base + 1_000 };
-    await appendFile(join(f.storage, 'ledger.jsonl'), JSON.stringify(duplicate) + '\n');
-    expect((await restarted.refresh(rescanned, now)).summary.allTime.tokens).toBe(200);
-    expect((await new AccountUsagePoc(f.storage, f.stream, [f.logRoot]).refresh(rescanned, now)).summary.allTime.tokens).toBe(200);
-  });
-
   it('keeps a frozen chat following renames without touching its totals', async () => {
     const f = await frozenFixture();
-    await f.poc.refresh(aggregateUsage([], f.later), f.later);
-    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
-    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    await f.tracking.refresh(aggregateUsage([], f.later), f.later);
+    await f.tracking.refresh(aggregateUsage([], f.settled), f.settled);
+    await f.tracking.refresh(aggregateUsage([], f.settled), f.settled);
     const now = new Date(f.settled.getTime() + 2_000);
     const renamed = { ...f.a, metadataOnly: true, titlePriority: TITLE_PRIORITY.custom,
       timestamp: new Date(base + 20_000), titleModifiedAt: now.getTime(), title: 'Frozen rename' };
     vi.mocked(appendFile).mockClear();
-    const view = await f.poc.refresh(aggregateUsage([], now), now, [renamed]);
+    const view = await f.tracking.refresh(aggregateUsage([], now), now, [renamed]);
     expect(view.summary.chats[0].title).toBe('Frozen rename');
     expect(view.summary.allTime.tokens).toBe(200);
     expect(appendFile).toHaveBeenCalledTimes(1);
     const lines = (await readFile(join(f.storage, 'ledger.jsonl'), 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line));
     expect(lines).toEqual([expect.objectContaining({ kind: 'rollup', requests: 2 })]);
     // Copilot bumping the chat file without a new label writes nothing more.
-    const bumped = await f.poc.refresh(aggregateUsage([], now), now, [{ ...renamed, titleModifiedAt: now.getTime() + 1 }]);
+    const bumped = await f.tracking.refresh(aggregateUsage([], now), now, [{ ...renamed, titleModifiedAt: now.getTime() + 1 }]);
     expect(bumped.summary.chats[0].title).toBe('Frozen rename');
     expect(appendFile).toHaveBeenCalledTimes(1);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     const saved = await restarted.refresh(aggregateUsage([], now), now);
     expect(saved.summary.chats[0].title).toBe('Frozen rename');
     expect(saved.summary.allTime.tokens).toBe(200);
@@ -1419,9 +1418,9 @@ describe('ledger rollover and freeze', () => {
 
   it('batches snapshot bills aging out between polls without changing their totals', async () => {
     const f = await frozenFixture();
-    await f.poc.refresh(aggregateUsage([], f.later), f.later);
-    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
-    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    await f.tracking.refresh(aggregateUsage([], f.later), f.later);
+    await f.tracking.refresh(aggregateUsage([], f.settled), f.settled);
+    await f.tracking.refresh(aggregateUsage([], f.settled), f.settled);
     const [name] = (await files(f.storage)).filter((file) => file.startsWith('snapshot-'));
     const path = join(f.storage, name);
     const lines = await snapshotLines(f.storage);
@@ -1433,7 +1432,7 @@ describe('ledger rollover and freeze', () => {
     lines[0].lines = lines.length - 1;
     const saved = lines.map((entry) => JSON.stringify(entry)).join('\n') + '\n';
     await writeFile(path, saved);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     for (const elapsed of [0, 2_000, 4_000, 6_000]) {
       const now = new Date(f.settled.getTime() + elapsed);
       expect((await restarted.refresh(aggregateUsage([], now), now)).summary.allTime.tokens).toBe(500);
@@ -1443,16 +1442,16 @@ describe('ledger rollover and freeze', () => {
     const batchedAt = new Date(f.settled.getTime() + 10 * 60_000);
     expect((await restarted.refresh(aggregateUsage([], batchedAt), batchedAt)).summary.allTime.tokens).toBe(500);
     expect((await files(f.storage)).filter((file) => file.startsWith('snapshot-'))).toHaveLength(2);
-    const nextWindow = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+    const nextWindow = new AccountTracking(f.storage, f.stream, [f.logRoot]);
     expect((await nextWindow.refresh(aggregateUsage([], batchedAt), batchedAt)).summary.allTime.tokens).toBe(500);
     expect((await snapshotLines(f.storage)).filter((entry) => entry.kind === 'bill')).toHaveLength(0);
   });
 
   it('merges frozen and live usage the same way one aggregate would', async () => {
     const f = await frozenFixture();
-    await f.poc.refresh(aggregateUsage([], f.later), f.later);
-    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
-    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    await f.tracking.refresh(aggregateUsage([], f.later), f.later);
+    await f.tracking.refresh(aggregateUsage([], f.settled), f.settled);
+    await f.tracking.refresh(aggregateUsage([], f.settled), f.settled);
     const now = new Date(f.settled.getTime() + 60_000);
     const continued = record(f.usage, now.getTime() - 30_000, 'continued');
     const otherUsage = join(f.root, 'debug-logs', 'other', 'main.jsonl');
@@ -1462,7 +1461,7 @@ describe('ledger rollover and freeze', () => {
       tokens: { input: 200, output: 100, cachedInput: 0, cacheWriteInput: 0, total: 300, source: 'recorded' as const },
       billing: { aiCredits: 5, source: 'copilot-debug-log' as const } };
     await appendFile(f.log, done(continued) + done(fresh));
-    const view = await f.poc.refresh(aggregateUsage([continued, fresh], now), now);
+    const view = await f.tracking.refresh(aggregateUsage([continued, fresh], now), now);
     const rollup: UsageRecord = { chatId: 'chat', title: 'A chat', model: 'model', timestamp: f.b.timestamp, filePath: f.usage,
       tokens: { input: 160, output: 40, cachedInput: 20, cacheWriteInput: 0, total: 200, source: 'recorded' },
       billing: { aiCredits: 4, source: 'copilot-debug-log' } };
@@ -1484,8 +1483,8 @@ describe('ledger rollover and freeze', () => {
   it.each(['malformed', 'truncated', 'missing line', 'empty', 'blank lines', 'headerless'] as const)(
     'rejects a %s snapshot on every refresh without retiring its source ledger', async (damage) => {
       const f = await frozenFixture();
-      await f.poc.refresh(aggregateUsage([], f.later), f.later);
-      await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+      await f.tracking.refresh(aggregateUsage([], f.later), f.later);
+      await f.tracking.refresh(aggregateUsage([], f.settled), f.settled);
       const names = await files(f.storage);
       const source = join(f.storage, names.find((name) => name.startsWith('ledger-'))!);
       const sourceBytes = await readFile(source);
@@ -1498,9 +1497,9 @@ describe('ledger rollover and freeze', () => {
         : damage === 'truncated' ? original.slice(0, -3)
         : lines.map((line) => line.includes('"kind":"rollup"') ? '{"kind":"rollup",' : line).join('\n') + '\n';
       await writeFile(path, corrupt);
-      const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+      const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
       for (let attempt = 0; attempt < 2; attempt++) {
-        await expect(restarted.refresh(aggregateUsage([], f.settled), f.settled)).rejects.toThrow('Invalid account POC snapshot');
+        await expect(restarted.refresh(aggregateUsage([], f.settled), f.settled)).rejects.toThrow('Invalid account tracking snapshot');
         expect(await readFile(source)).toEqual(sourceBytes);
         expect(await readFile(path, 'utf8')).toBe(corrupt);
       }
@@ -1510,8 +1509,8 @@ describe('ledger rollover and freeze', () => {
   it.each(['start.json', 'ledger.jsonl', '../outside.jsonl', 'snapshot-1-abc.jsonl'])(
     'rejects snapshot permission to retire %s', async (name) => {
       const f = await frozenFixture();
-      await f.poc.refresh(aggregateUsage([], f.later), f.later);
-      await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+      await f.tracking.refresh(aggregateUsage([], f.later), f.later);
+      await f.tracking.refresh(aggregateUsage([], f.settled), f.settled);
       const snapshot = (await files(f.storage)).find((file) => file.startsWith('snapshot-'))!;
       const path = join(f.storage, snapshot);
       const lines = await snapshotLines(f.storage);
@@ -1519,9 +1518,9 @@ describe('ledger rollover and freeze', () => {
       await writeFile(path, lines.map((entry) => JSON.stringify(entry)).join('\n') + '\n');
       const start = await readFile(join(f.storage, 'start.json'));
       const names = await readdir(f.storage);
-      const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
+      const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
       for (let attempt = 0; attempt < 2; attempt++) {
-        await expect(restarted.refresh(aggregateUsage([], f.settled), f.settled)).rejects.toThrow('Invalid account POC snapshot');
+        await expect(restarted.refresh(aggregateUsage([], f.settled), f.settled)).rejects.toThrow('Invalid account tracking snapshot');
         expect(await readdir(f.storage)).toEqual(names);
         expect(await readFile(join(f.storage, 'start.json'))).toEqual(start);
       }
@@ -1530,16 +1529,16 @@ describe('ledger rollover and freeze', () => {
 
   it('keeps failing on a corrupt rollup without touching the snapshot', async () => {
     const f = await frozenFixture();
-    await f.poc.refresh(aggregateUsage([], f.later), f.later);
-    await f.poc.refresh(aggregateUsage([], f.settled), f.settled);
+    await f.tracking.refresh(aggregateUsage([], f.later), f.later);
+    await f.tracking.refresh(aggregateUsage([], f.settled), f.settled);
     const [name] = (await files(f.storage)).filter((file) => file.startsWith('snapshot-'));
     const path = join(f.storage, name);
     const corrupt = (await readFile(path, 'utf8')).replace('"aiCredits":4', '"aiCredits":"4"');
     expect(corrupt).toContain('"aiCredits":"4"');
     await writeFile(path, corrupt);
-    const restarted = new AccountUsagePoc(f.storage, f.stream, [f.logRoot]);
-    await expect(restarted.refresh(aggregateUsage([], f.settled), f.settled)).rejects.toThrow('Invalid account POC request journal');
-    await expect(restarted.refresh(aggregateUsage([], f.settled), f.settled)).rejects.toThrow('Invalid account POC request journal');
+    const restarted = new AccountTracking(f.storage, f.stream, [f.logRoot]);
+    await expect(restarted.refresh(aggregateUsage([], f.settled), f.settled)).rejects.toThrow('Invalid account tracking request journal');
+    await expect(restarted.refresh(aggregateUsage([], f.settled), f.settled)).rejects.toThrow('Invalid account tracking request journal');
     expect(await readFile(path, 'utf8')).toBe(corrupt);
   });
 });
