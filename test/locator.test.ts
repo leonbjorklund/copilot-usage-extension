@@ -1,30 +1,35 @@
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('node:os', async (importOriginal) => ({
+  ...await importOriginal<typeof import('node:os')>(),
+  homedir: vi.fn(),
+}));
 
 import { locateCopilotDataPaths } from '../src/core/locator';
 
 describe('locateCopilotDataPaths', () => {
   const roots: string[] = [];
-  const originalAppData = process.env.APPDATA;
 
   afterEach(async () => {
-    process.env.APPDATA = originalAppData;
+    vi.unstubAllEnvs();
     await Promise.all(roots.map((root) => rm(root, { recursive: true, force: true })));
     roots.length = 0;
   });
 
-  it('includes VS Code global and workspace storage roots', async () => {
+  it.each(['Code', 'Code - Insiders'])('includes %s storage roots across platforms', async (editor) => {
     const appData = await mkdtemp(join(tmpdir(), 'copilot-usage-appdata-'));
     roots.push(appData);
-    process.env.APPDATA = appData;
+    vi.stubEnv('APPDATA', appData);
+    const home = join(appData, 'home');
+    vi.mocked(homedir).mockReturnValue(home);
 
-    const globalStorage = join(appData, 'Code', 'User', 'globalStorage');
-    const workspaceStorage = join(appData, 'Code', 'User', 'workspaceStorage');
-    await mkdir(globalStorage, { recursive: true });
-    await mkdir(workspaceStorage, { recursive: true });
+    const storageRoots = [appData, join(home, '.config'), join(home, 'Library', 'Application Support')]
+      .flatMap(base => ['globalStorage', 'workspaceStorage'].map(storage => join(base, editor, 'User', storage)));
+    await Promise.all(storageRoots.map(root => mkdir(root, { recursive: true })));
 
-    await expect(locateCopilotDataPaths('')).resolves.toEqual([globalStorage, workspaceStorage]);
+    await expect(locateCopilotDataPaths('')).resolves.toEqual(storageRoots);
   });
 });
