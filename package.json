@@ -16,7 +16,7 @@
     "watch": "node esbuild.js --watch",
     "test": "vitest run --dir test --passWithNoTests",
     "package": "vsce package --no-dependencies",
-    "install:local": "vsce package --no-dependencies --out copilot-usage-extension.vsix && code --install-extension copilot-usage-extension.vsix --force && code --new-window ."
+    "install:local": "node scripts/install-local.js"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",

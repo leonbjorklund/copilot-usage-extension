@@ -12,6 +12,17 @@ Dollar amounts are estimates using [GitHub's rate](https://docs.github.com/en/co
 
 <img src="https://github.com/leonbjorklund/copilot-usage-extension/raw/main/docs/activity-bar-treeview.png?v=3" width="400" alt="Usage tree view" />
 
+## Install from source
+
+Requires Node.js, npm, and VS Code 1.120 or newer. Make sure `code`, `code-insiders`, or both are on PATH.
+
+```sh
+npm ci
+npm run install:local
+```
+
+The installer runs tests and builds one VSIX, then installs it into every detected editor and opens a new window in each. If one editor fails, it still tries the other and reports failure. Existing windows may need `Developer: Reload Window` to load the updated extension.
+
 ## Reference
 
 Commands:
