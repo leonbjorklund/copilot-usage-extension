@@ -2,27 +2,29 @@
   "name": "copilot-usage-extension",
   "displayName": "Copilot Token Cost",
   "description": "Local Copilot token usage and AI Credit billing cost.",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "publisher": "leonbjorklund",
   "license": "MIT",
   "scripts": {
-    "clean": "node -e \"const fs=require('node:fs'); for (const dir of ['dist','out']) fs.rmSync(dir,{recursive:true,force:true});\"",
+    "clean": "node -e \"const fs=require('node:fs'); fs.rmSync('dist',{recursive:true,force:true});\"",
     "check-types": "tsc --noEmit -p ./",
     "compile": "npm run check-types && node esbuild.js",
+    "prepreview": "npm test",
+    "preview": "npm run compile && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/preview.ps1",
     "compile:production": "npm run check-types && node esbuild.js --production",
-    "vscode:prepublish": "npm run compile:production",
+    "vscode:prepublish": "npm test && npm run compile:production",
     "watch": "node esbuild.js --watch",
-    "test": "vitest run --passWithNoTests",
+    "test": "vitest run --dir test --passWithNoTests",
     "package": "vsce package --no-dependencies",
     "install:local": "vsce package --no-dependencies --out copilot-usage-extension.vsix && code --install-extension copilot-usage-extension.vsix --force && code --new-window ."
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
     "@types/vscode": "^1.120.0",
-    "@vscode/vsce": "^3.9.1",
+    "@vscode/vsce": "^4.0.0",
     "esbuild": "^0.28.0",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.7"
+    "vitest": "^4.1.11"
   },
   "repository": {
     "type": "git",

@@ -5,8 +5,15 @@
       "label": "npm: compile",
       "type": "npm",
       "script": "compile",
+      "dependsOn": "npm: test",
       "group": "build",
       "problemMatcher": "$tsc"
+    },
+    {
+      "label": "npm: test",
+      "type": "npm",
+      "script": "test",
+      "problemMatcher": []
     }
   ]
 }

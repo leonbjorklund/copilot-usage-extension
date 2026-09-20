@@ -14,6 +14,21 @@ export interface UsageBilling {
   source: 'copilot-debug-log';
 }
 
+/**
+ * How much a record's title is worth as the chat's label. The normalizer stamps
+ * it; the aggregator picks the highest, and ties on a prompt go to the earliest
+ * turn while every other tie goes to the latest.
+ */
+export const TITLE_PRIORITY = {
+  custom: 5,
+  generated: 4,
+  prompt: 2,
+  record: 1,
+  generic: 0,
+  /** A subagent or title run is never the chat's label, whatever it calls itself. */
+  childRun: -1,
+} as const;
+
 export interface UsageRecord {
   chatId: string;
   title: string;
@@ -25,6 +40,12 @@ export interface UsageRecord {
   hiddenFromExplorer?: boolean;
   metadataOnly?: boolean;
   titlePriority?: number;
+  /** Source time of a retained chat title, separate from the billed request time. */
+  titleTimestamp?: Date;
+  /** Metadata file revision, orders custom titles and breaks other non-prompt timestamp ties. */
+  titleModifiedAt?: number;
+  /** Correlation evidence for account attribution. */
+  debugRequest?: { responseId: string; spanId: string; durationMs: number };
 }
 
 export interface ExtensionConfig {
@@ -41,6 +62,9 @@ export interface UsageTotal {
 export interface ChatUsageSummary {
   chatId: string;
   title: string;
+  titlePriority?: number;
+  titleTimestamp?: Date;
+  titleModifiedAt?: number;
   model: string;
   timestamp: Date;
   tokens: number;
@@ -83,6 +107,8 @@ export interface UsageDiagnostics {
 export interface UsageServiceResult {
   summary: UsageSummary;
   diagnostics: UsageDiagnostics;
+  /** Title sources for scanned or saved billed chats, without contributing usage. */
+  titleMetadata?: UsageRecord[];
 }
 
 export interface CopilotCostEstimate {

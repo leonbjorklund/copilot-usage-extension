@@ -4,3 +4,5 @@ dist/
 .worktrees/
 *.vsix
 TODO
+.claude/worktrees/
+/scripts/preview.ps1

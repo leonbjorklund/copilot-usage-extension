@@ -1,3 +1,4 @@
+import { TITLE_PRIORITY } from './types';
 import type {
   ChatUsageSummary,
   CopilotCostEstimate,
@@ -11,7 +12,15 @@ interface TitleCandidate {
   title: string;
   priority: number;
   timestamp: Date;
+  modifiedAt?: number;
+  filePath: string;
 }
+
+/**
+ * GitHub's usage-based billing docs price one AI Credit at $0.01. This is a
+ * display estimate, not the billed amount.
+ */
+const USD_PER_AI_CREDIT = 0.01;
 
 export function aggregateUsage(records: UsageRecord[], now = new Date()): UsageSummary {
   const today = emptyTotal();
@@ -101,6 +110,9 @@ function buildChatSummaries(
       const chat: ChatUsageSummary = {
         chatId: record.chatId,
         title,
+        titlePriority: titleCandidates.get(record.chatId)?.priority,
+        titleTimestamp: titleCandidates.get(record.chatId)?.timestamp,
+        titleModifiedAt: titleCandidates.get(record.chatId)?.modifiedAt,
         model: record.model,
         timestamp: record.timestamp,
         tokens: record.tokens.total,
@@ -131,8 +143,20 @@ function compareChatsByCost(left: ChatUsageSummary, right: ChatUsageSummary): nu
   );
 }
 
+export interface ModelUsage {
+  chatIds: Set<string>;
+  tokens: number;
+  githubCopilot: CopilotCostEstimate;
+}
+
 function buildTopModels(records: UsageRecord[]): ModelUsageSummary[] {
-  const models = new Map<string, { chatIds: Set<string>; tokens: number; githubCopilot: CopilotCostEstimate }>();
+  return rankModelUsage([...collectModelUsage(records)].map(([model, usage]) =>
+    [model, { sessions: usage.chatIds.size, tokens: usage.tokens, githubCopilot: usage.githubCopilot }]));
+}
+
+/** Per-model totals with the chats behind them, in first-seen order. */
+export function collectModelUsage(records: UsageRecord[]): Map<string, ModelUsage> {
+  const models = new Map<string, ModelUsage>();
 
   for (const record of records) {
     if (
@@ -156,15 +180,34 @@ function buildTopModels(records: UsageRecord[]): ModelUsageSummary[] {
     addCost(model.githubCopilot, estimateRecordCost(record));
   }
 
-  return Array.from(models.entries())
+  return models;
+}
+
+/** The three models used in the most chats, ties in the given order. */
+export function rankModelUsage(
+  models: Iterable<[string, { sessions: number; tokens: number; githubCopilot: CopilotCostEstimate }]>,
+): ModelUsageSummary[] {
+  return Array.from(models)
     .map(([model, usage]) => ({
       model,
-      sessions: usage.chatIds.size,
+      sessions: usage.sessions,
       tokens: usage.tokens,
       githubCopilot: usage.githubCopilot,
     }))
-    .sort((left, right) => right.tokens - left.tokens)
+    .sort((left, right) => right.sessions - left.sessions)
     .slice(0, 3);
+}
+
+export function mergeUsageTotals(left: UsageTotal, right: UsageTotal): UsageTotal {
+  const total = { tokens: left.tokens + right.tokens, githubCopilot: { ...left.githubCopilot } };
+  addCost(total.githubCopilot, right.githubCopilot);
+  return total;
+}
+
+export function mergeCostEstimates(left: CopilotCostEstimate, right: CopilotCostEstimate): CopilotCostEstimate {
+  const total = { ...left };
+  addCost(total, right);
+  return total;
 }
 
 function emptyTotal(): UsageTotal {
@@ -186,7 +229,7 @@ function estimateRecordCost(record: UsageRecord): CopilotCostEstimate {
   const aiCredits = record.billing?.aiCredits ?? 0;
   return {
     available: aiCredits > 0,
-    usd: roundUsd(aiCredits * 0.01),
+    usd: roundUsd(aiCredits * USD_PER_AI_CREDIT),
     aiCredits,
   };
 }
@@ -213,8 +256,10 @@ function roundUsd(value: number): number {
 function collectTitleCandidate(candidates: Map<string, TitleCandidate>, record: UsageRecord): void {
   const candidate = {
     title: record.title,
-    priority: record.titlePriority ?? 1,
-    timestamp: record.timestamp,
+    priority: record.titlePriority ?? TITLE_PRIORITY.record,
+    timestamp: record.titleTimestamp ?? record.timestamp,
+    modifiedAt: record.titleModifiedAt,
+    filePath: record.filePath,
   };
   const existing = candidates.get(record.chatId);
 
@@ -228,25 +273,43 @@ function isBetterTitleCandidate(candidate: TitleCandidate, existing: TitleCandid
     return candidate.priority > existing.priority;
   }
 
-  if (candidate.priority === 2) {
+  if (candidate.priority === TITLE_PRIORITY.prompt) {
     return candidate.timestamp < existing.timestamp;
   }
 
+  if (candidate.priority === TITLE_PRIORITY.custom &&
+    candidate.modifiedAt !== undefined && existing.modifiedAt !== undefined) {
+    // Chat snapshots retain creationDate; rename deltas may have no timestamp.
+    // Their file revision and row order describe which custom title is current.
+    if (candidate.modifiedAt !== existing.modifiedAt) return candidate.modifiedAt > existing.modifiedAt;
+    if (candidate.filePath === existing.filePath) return true;
+  }
+
+  if (candidate.timestamp.getTime() === existing.timestamp.getTime()) {
+    // A rebuilt JSONL file gives every row the same revision. Preserve its
+    // later title row, as incremental appends do, without ordering other files.
+    if (candidate.modifiedAt !== undefined && candidate.modifiedAt === existing.modifiedAt &&
+      candidate.filePath === existing.filePath) return true;
+    return (candidate.modifiedAt ?? 0) > (existing.modifiedAt ?? 0);
+  }
   return candidate.timestamp > existing.timestamp;
 }
 
 function resolveTitle(record: UsageRecord, candidate: TitleCandidate | undefined): string {
+  if (candidate?.priority === TITLE_PRIORITY.childRun) return record.chatId;
   const title = candidate?.title ?? record.title;
-  if (isGenericTitle(title)) {
-    return record.chatId || title;
-  }
-
-  return title;
+  return isGenericTitle(title) ? record.chatId || title : title;
 }
 
 function isGenericTitle(title: string): boolean {
   const normalized = title.trim().toLowerCase();
-  return normalized === '' || normalized === 'panel/editagent' || normalized === 'copilot debug request';
+  return (
+    normalized === '' ||
+    normalized === 'panel/editagent' ||
+    normalized === 'copilot debug request' ||
+    // Internal request names such as `tool/runSubagent-Explore`.
+    normalized.startsWith('tool/')
+  );
 }
 
 function isSameLocalDay(left: Date, right: Date): boolean {

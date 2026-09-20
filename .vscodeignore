@@ -4,7 +4,6 @@ src/**
 test/**
 scripts/**
 *.ts
-vitest.config.ts
 tsconfig.json
 node_modules/**
 out/**
@@ -14,3 +13,6 @@ AGENTS.md
 .gitignore
 TODO
 *.vsix
+.claude/**
+desktop.ini
+analysis/**

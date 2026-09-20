@@ -1,15 +1,12 @@
 import { basename, dirname } from 'node:path';
 
-import type { TokenSource, TokenUsage, UsageRecord } from './types';
+import { TITLE_PRIORITY, type UsageRecord } from './types';
 import type { RawUsageItem } from './parser';
 
 type RecordValue = Record<string, unknown>;
 
-const TITLE_PRIORITY_GENERATED = 4;
-const TITLE_PRIORITY_CUSTOM = 5;
-const TITLE_PRIORITY_PROMPT = 2;
-const TITLE_PRIORITY_RECORD = 1;
-const TITLE_PRIORITY_GENERIC = 0;
+const DEBUG_LOG_FOLDER_NAME = 'debug-logs';
+const DEBUG_LOG_MAIN_FILE_NAME = 'main.jsonl';
 
 function isRecord(value: unknown): value is RecordValue {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -77,39 +74,6 @@ function readTimestamp(record: RecordValue): Date {
   return new Date(0);
 }
 
-function readTimestampFromRecords(records: Array<RecordValue | undefined>): Date {
-  for (const record of records) {
-    if (!record) {
-      continue;
-    }
-
-    const timestamp = readTimestamp(record);
-    if (timestamp.getTime() !== 0) {
-      return timestamp;
-    }
-  }
-
-  return new Date(0);
-}
-
-function buildTokenUsage(
-  input: number,
-  output: number,
-  cachedInput = 0,
-  cacheWriteInput = 0,
-  source: TokenSource,
-  total?: number,
-): TokenUsage {
-  return {
-    input,
-    cachedInput,
-    output,
-    cacheWriteInput,
-    total: total ?? input + output,
-    source,
-  };
-}
-
 function subtractCachedTokens(
   input: number,
   output: number,
@@ -172,6 +136,33 @@ function parentDebugSessionIdFromTitleFile(filePath: string): string | undefined
   return parent.length > 0 ? parent : undefined;
 }
 
+/**
+ * Copilot writes every log for one chat into `debug-logs/<sessionId>/`. The
+ * folder name is the chat session id; `sid` inside a child log is the id of the
+ * child run (a subagent call id, or the title request id), not the chat.
+ */
+export function debugSessionIdFromFilePath(filePath: string): string | undefined {
+  const folder = dirname(filePath);
+  if (basename(dirname(folder)).toLowerCase() !== DEBUG_LOG_FOLDER_NAME) {
+    return undefined;
+  }
+
+  const sessionId = basename(folder);
+  return sessionId.length > 0 ? sessionId : undefined;
+}
+
+/**
+ * Anything beside `main.jsonl` in a session folder is a child run: a subagent,
+ * a search subagent, or title generation. Subagent spend belongs to the chat,
+ * but a child run's `debugName` must never become the chat's label.
+ */
+export function isChildDebugLogFile(filePath: string): boolean {
+  return (
+    debugSessionIdFromFilePath(filePath) !== undefined &&
+    basename(filePath).toLowerCase() !== DEBUG_LOG_MAIN_FILE_NAME
+  );
+}
+
 function parseAssistantResponseTitle(response: string): string | undefined {
   try {
     const parsed = JSON.parse(response) as unknown;
@@ -202,16 +193,6 @@ function parseAssistantResponseTitle(response: string): string | undefined {
   return undefined;
 }
 
-function buildUsageRecord(
-  item: RawUsageItem,
-  values: Omit<UsageRecord, 'filePath'>,
-): UsageRecord {
-  return {
-    ...values,
-    filePath: item.filePath,
-  };
-}
-
 function buildTitleMetadataRecord(
   item: RawUsageItem,
   chatId: string,
@@ -219,15 +200,16 @@ function buildTitleMetadataRecord(
   timestamp: Date,
   titlePriority: number,
 ): UsageRecord {
-  return buildUsageRecord(item, {
+  return {
     chatId,
     title,
     timestamp,
     model: 'unknown',
     metadataOnly: true,
     titlePriority,
-    tokens: buildTokenUsage(0, 0, 0, 0, 'missing'),
-  });
+    tokens: { input: 0, output: 0, cachedInput: 0, cacheWriteInput: 0, total: 0, source: 'missing' },
+    filePath: item.filePath,
+  };
 }
 
 function normalizeCopilotGeneratedTitleRecord(item: RawUsageItem, value: RecordValue): UsageRecord[] {
@@ -243,7 +225,7 @@ function normalizeCopilotGeneratedTitleRecord(item: RawUsageItem, value: RecordV
     return [];
   }
 
-  return [buildTitleMetadataRecord(item, chatId, title, readTimestamp(value), TITLE_PRIORITY_GENERATED)];
+  return [buildTitleMetadataRecord(item, chatId, title, readTimestamp(value), TITLE_PRIORITY.generated)];
 }
 
 function normalizeCopilotChatSessionTitleRecord(item: RawUsageItem, value: RecordValue): UsageRecord[] {
@@ -252,15 +234,9 @@ function normalizeCopilotChatSessionTitleRecord(item: RawUsageItem, value: Recor
     const title = session ? readString(session, ['customTitle']) : undefined;
     const chatId = session ? readString(session, ['sessionId']) : undefined;
     if (title !== undefined && chatId !== undefined) {
-      return [
-        buildTitleMetadataRecord(
-          item,
-          chatId,
-          title,
-          readTimestampFromRecords([session, value]),
-          TITLE_PRIORITY_CUSTOM,
-        ),
-      ];
+      const timestamp = session && readTimestamp(session).getTime() !== 0
+        ? readTimestamp(session) : readTimestamp(value);
+      return [buildTitleMetadataRecord(item, chatId, title, timestamp, TITLE_PRIORITY.custom)];
     }
   }
 
@@ -268,7 +244,7 @@ function normalizeCopilotChatSessionTitleRecord(item: RawUsageItem, value: Recor
     const chatId = chatIdFromFilePath(item.filePath);
     const title = typeof value.v === 'string' ? compactTitle(value.v) : undefined;
     if (chatId !== undefined && title !== undefined) {
-      return [buildTitleMetadataRecord(item, chatId, title, readTimestamp(value), TITLE_PRIORITY_CUSTOM)];
+      return [buildTitleMetadataRecord(item, chatId, title, readTimestamp(value), TITLE_PRIORITY.custom)];
     }
   }
 
@@ -276,19 +252,24 @@ function normalizeCopilotChatSessionTitleRecord(item: RawUsageItem, value: Recor
 }
 
 function normalizeCopilotTranscriptUserMessage(item: RawUsageItem, value: RecordValue): UsageRecord[] {
-  if (value.type !== 'user.message') {
+  // `user_message` with `attrs.content` is the current debug-log shape;
+  // `user.message` with `data.content` is the older transcript shape.
+  if (value.type !== 'user_message' && value.type !== 'user.message') {
     return [];
   }
 
-  const data = readNestedRecord(value, 'data');
-  const content = data ? readString(data, ['content']) : undefined;
+  const payload = readNestedRecord(value, 'attrs') ?? readNestedRecord(value, 'data');
+  const content = payload ? readString(payload, ['content']) : undefined;
   const title = content ? compactTitle(content) : undefined;
-  const chatId = chatIdFromFilePath(item.filePath);
+  // A prompt inside a child log belongs to the subagent, not to the chat.
+  const chatId = isChildDebugLogFile(item.filePath)
+    ? undefined
+    : debugSessionIdFromFilePath(item.filePath) ?? chatIdFromFilePath(item.filePath);
   if (chatId === undefined || title === undefined) {
     return [];
   }
 
-  return [buildTitleMetadataRecord(item, chatId, title, readTimestamp(value), TITLE_PRIORITY_PROMPT)];
+  return [buildTitleMetadataRecord(item, chatId, title, readTimestamp(value), TITLE_PRIORITY.prompt)];
 }
 
 function normalizeCopilotDebugLogRecord(item: RawUsageItem, value: RecordValue): UsageRecord[] {
@@ -321,23 +302,36 @@ function normalizeCopilotDebugLogRecord(item: RawUsageItem, value: RecordValue):
   const tokens = subtractCachedTokens(input ?? 0, output ?? 0, cachedInput);
   const timestamp = readTimestamp(value);
 
+  // Prefer the session folder so subagent and title runs bill to their chat
+  // instead of appearing as separate sessions keyed by their own `sid`.
   const chatId =
+    debugSessionIdFromFilePath(item.filePath) ??
     readString(value, ['sid', 'sessionId']) ??
     readString(attrs, ['sessionId', 'responseId']) ??
     `${item.filePath}:${timestamp.toISOString()}`;
   const debugName = readString(attrs, ['debugName']);
+  const childRun = isChildDebugLogFile(item.filePath);
 
   return [
-    buildUsageRecord(item, {
+    {
       chatId,
       title: debugName ?? 'Copilot debug request',
       timestamp,
       model: readString(attrs, ['model']) ?? 'unknown',
       hiddenFromExplorer: isTitleGenerationName(debugName),
-      titlePriority: isGenericDebugName(debugName) ? TITLE_PRIORITY_GENERIC : TITLE_PRIORITY_RECORD,
-      tokens: buildTokenUsage(tokens.input, tokens.output, cachedInput, cacheWriteInput, 'recorded', tokens.total),
+      titlePriority: childRun
+        ? TITLE_PRIORITY.childRun
+        : isGenericDebugName(debugName)
+          ? TITLE_PRIORITY.generic
+          : TITLE_PRIORITY.record,
+      tokens: { ...tokens, cachedInput, cacheWriteInput, source: 'recorded' },
       billing,
-    }),
+      ...(typeof attrs.responseId === 'string' && typeof value.spanId === 'string' &&
+        typeof value.dur === 'number' && Number.isFinite(value.dur) && value.dur >= 0
+        ? { debugRequest: { responseId: attrs.responseId, spanId: value.spanId, durationMs: value.dur } }
+        : {}),
+      filePath: item.filePath,
+    },
   ];
 }
 
@@ -362,10 +356,5 @@ export function normalizeRawUsage(item: RawUsageItem): UsageRecord[] {
     return transcriptTitleRecords;
   }
 
-  const debugLogRecords = normalizeCopilotDebugLogRecord(item, value);
-  if (debugLogRecords.length > 0) {
-    return debugLogRecords;
-  }
-
-  return [];
+  return normalizeCopilotDebugLogRecord(item, value);
 }

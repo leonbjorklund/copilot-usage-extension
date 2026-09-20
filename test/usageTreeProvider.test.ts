@@ -37,7 +37,32 @@ import * as vscode from 'vscode';
 import { differenceInLocalCalendarDays, UsageTreeProvider } from '../src/ui/usageTreeProvider';
 import type { ChatUsageSummary, CopilotCostEstimate, UsageRecord, UsageSummary, UsageTotal } from '../src/core/types';
 
+
 describe('UsageTreeProvider', () => {
+  it('keeps confirmed sessions visible while reporting a log read failure', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setSummary(createSummary(), 'Cannot read Copilot account log.');
+    const rows = (await provider.getChildren())!;
+    expect(rows.some((row) => row.kind === 'bucket')).toBe(true);
+    const problem = rows.find((row) => row.kind === 'error')!;
+    const item = provider.getTreeItem(problem);
+    expect(item.label).toBe('Scan failed');
+    expect(item.iconPath).toMatchObject({ id: 'error' });
+    expect(item.tooltip).toBe('Cannot read Copilot account log.');
+  });
+
+  it('clears a scan error after a successful summary', async () => {
+    const provider = new UsageTreeProvider();
+    provider.setProblem('Cannot read logs.');
+    const rows = (await provider.getChildren())!;
+    const item = provider.getTreeItem(rows[0]);
+    expect(item.label).toBe('Scan failed');
+    expect(item.iconPath).toMatchObject({ id: 'error' });
+    provider.setSummary(createSummary([]));
+    expect(provider.getTreeItem((await provider.getChildren())![0]).label).toBe('No Copilot usage found');
+    provider.setProblem('Cannot read logs.');
+    expect(provider.getTreeItem((await provider.getChildren())![0]).label).toBe('Scan failed');
+  });
   it('returns no tree rows when Copilot file logging is disabled so the welcome view renders', async () => {
     const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
     provider.setSetupNeeded();
@@ -281,6 +306,135 @@ describe('UsageTreeProvider', () => {
     expect(bucketItem.tooltip).not.toContain('Cost:');
     expect(chatItem.description).toBe('09:30 | gpt-4.1 | 150');
     expect(chatItem.tooltip).not.toContain('Cost:');
+  });
+
+  it('shows the server quota as a flat row above the date buckets', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setSummary(createSummary());
+    provider.setQuotaState({
+      kind: 'quota',
+      account: 'octocat',
+      observedAt: Date.parse('2026-09-16T00:00:00Z'),
+      quota: {
+        entitlement: 60_000,
+        percentRemaining: 72.4,
+        unlimited: false, hasQuota: true,
+      },
+    });
+
+    const rootChildren = (await provider.getChildren()) ?? [];
+
+    expect(rootChildren).toHaveLength(3);
+    const item = provider.getTreeItem(rootChildren[0]);
+    expect(item.label).toBe('16\u00a0560 / 60\u00a0000 credits (27.6% / 100%)');
+    expect(item.description).toBe('Account: octocat');
+    expect(item.collapsibleState).toBe(vscode.TreeItemCollapsibleState.None);
+    expect(item.tooltip).toContain("Used credits are calculated from Copilot's reported percentage");
+    expect(item.tooltip).toContain('rounded to whole credits');
+    expect(item.tooltip).toContain('Account: octocat');
+    expect(item.command).toBeUndefined();
+    expect(provider.getTreeItem(rootChildren[1]).label).toBe('Today');
+  });
+
+  it('shows quota without an account line when the account is unverified', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setSummary(createSummary());
+    provider.setQuotaState({ kind: 'quota', observedAt: Date.parse('2026-09-16T00:00:00Z'),
+      quota: { entitlement: 60_000, percentRemaining: 72.4, unlimited: false, hasQuota: true } });
+
+    const item = provider.getTreeItem(((await provider.getChildren()) ?? [])[0]);
+    expect(item.label).toBe('16 560 / 60 000 credits (27.6% / 100%)');
+    expect(item.description).toBeUndefined();
+    expect(item.tooltip).toContain(`${item.label}\n\nUsed credits are calculated from Copilot's reported percentage`);
+    expect(item.tooltip).not.toContain('Account');
+  });
+
+  it('shows an unlimited plan without a tooltip', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setSummary(createSummary());
+    const resetDate = new Date(2026, 9, 1);
+    provider.setQuotaState({
+      kind: 'quota',
+      account: 'octocat',
+      observedAt: Date.parse('2026-09-16T00:00:00Z'),
+      quota: {
+        entitlement: Number.POSITIVE_INFINITY,
+        percentRemaining: 100,
+        unlimited: true, hasQuota: true,
+        resetDate,
+      },
+    });
+
+    const item = provider.getTreeItem(((await provider.getChildren()) ?? [])[0]);
+
+    expect(item.label).toBe('Unlimited Copilot quota');
+    expect(item.description).toBe('Account: octocat');
+    expect(item.tooltip).toBeUndefined();
+  });
+
+  it('shows a waiting row without a tooltip or authorization action', async () => {
+    const provider = new UsageTreeProvider();
+    provider.setSummary(createSummary());
+    provider.setQuotaState({ kind: 'waiting' });
+
+    const item = provider.getTreeItem(((await provider.getChildren()) ?? [])[0]);
+    expect(item.label).toBe('Waiting for Copilot quota');
+    expect(item.tooltip).toBeUndefined();
+    expect(item.command).toBeUndefined();
+  });
+
+  it('hides unverifiable quota while keeping local sessions and restoring verified quota', async () => {
+    const provider = new UsageTreeProvider();
+    provider.setSummary(createSummary());
+    provider.setQuotaState({ kind: 'waiting', reason: 'Account evidence was lost.' });
+    const rows = (await provider.getChildren())!;
+    expect(rows.some(row => row.kind === 'quota')).toBe(false);
+    expect(rows.some(row => row.kind === 'bucket')).toBe(true);
+    provider.setQuotaState({ kind: 'quota', account: 'alice', observedAt: Date.now(),
+      quota: { entitlement: 1500, percentRemaining: 60, unlimited: false, hasQuota: true } });
+    expect((await provider.getChildren())![0].kind).toBe('quota');
+  });
+
+  it('keeps the quota row when Copilot logging is off and offers setup below it', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setSetupNeeded();
+    provider.setQuotaState({ kind: 'waiting' });
+
+    const rootChildren = (await provider.getChildren()) ?? [];
+
+    expect(rootChildren).toHaveLength(2);
+    expect(provider.getTreeItem(rootChildren[0]).label).toBe('Waiting for Copilot quota');
+    const setup = provider.getTreeItem(rootChildren[1]);
+    expect(setup.label).toBe('Enable Copilot logs to see token use');
+    expect(setup.command).toMatchObject({
+      command: 'copilotUsage.openCopilotLoggingSetting',
+    });
+  });
+
+  it('explains a failed scan instead of drawing an empty tree', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setProblem('profile folder is locked');
+
+    const rootChildren = (await provider.getChildren()) ?? [];
+
+    expect(rootChildren).toHaveLength(1);
+    const item = provider.getTreeItem(rootChildren[0]);
+    expect(item.label).toBe('Scan failed');
+    expect(item.tooltip).toBe('profile folder is locked');
+
+    provider.setSummary(createSummary());
+    const afterScan = (await provider.getChildren()) ?? [];
+    expect(afterScan.map((node) => node.kind)).not.toContain('error');
+  });
+
+  it('draws no quota row while the state is idle', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    provider.setSummary(createSummary());
+
+    expect((await provider.getChildren()) ?? []).toHaveLength(2);
+
+    provider.setQuotaState({ kind: 'idle' });
+    expect((await provider.getChildren()) ?? []).toHaveLength(2);
   });
 
 });

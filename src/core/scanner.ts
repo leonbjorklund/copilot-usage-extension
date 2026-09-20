@@ -29,7 +29,7 @@ const IGNORED_USAGE_CACHE_FILE_NAMES = new Set(['settingembeddings.json', 'comma
 export async function scanUsageFiles(roots: string[], options: ScanOptions): Promise<ScanResult> {
   const files: string[] = [];
   const watchFolders = new Set<string>();
-  const diagnostics = createDiagnostics();
+  const diagnostics = createScanDiagnostics();
   const broadRoots = new Set(uniqueResolvedPaths(options.broadRootPaths ?? []));
   const includeFilesOutsideUsageFolders = options.includeFilesOutsideUsageFolders ?? true;
 
@@ -102,7 +102,7 @@ export async function scanUsageFiles(roots: string[], options: ScanOptions): Pro
   return { files, watchFolders: Array.from(watchFolders), diagnostics };
 }
 
-function createDiagnostics(): ScanDiagnostics {
+export function createScanDiagnostics(): ScanDiagnostics {
   return {
     scannedFiles: 0,
     skippedFolders: 0,

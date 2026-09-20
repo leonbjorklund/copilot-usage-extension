@@ -1,21 +1,27 @@
 ## GitHub Copilot Tokens and AI Credit Cost
 
-Lightweight Copilot usage viewer for token count and AI credit cost from Copilot log files. Runs locally. Requires `github.copilot.chat.agentDebugLog.fileLogging.enabled`.
+Lightweight Copilot usage viewer for token count and AI credit cost from Copilot log files. Runs locally. Shows monthly credit use and estimated monthly pace. Requires `github.copilot.chat.agentDebugLog.fileLogging.enabled`.
 
-Dollar amounts use GitHub's [Copilot usage-based billing docs](https://docs.github.com/en/copilot/concepts/billing/usage-based-billing-for-individuals): 1 AI Credit = $0.01 USD. They are not final billed cost and exclude plans, pooled credits, discounts, taxes, and adjustments.
-
-> Only sessions with AI Credits are counted. Older logs that predate usage-based billing are ignored.
+Dollar amounts are estimates using [GitHub's rate](https://docs.github.com/en/copilot/concepts/billing/usage-based-billing-for-individuals) of $0.01 USD per AI Credit.
 
 #### Status Bar
 
-<img src="https://github.com/leonbjorklund/copilot-usage-extension/raw/main/docs/statusbar-tooltip.png?v=2" width="400" alt="Status bar tooltip" />
+<img src="https://github.com/leonbjorklund/copilot-usage-extension/raw/main/docs/statusbar-tooltip.png?v=3" width="400" alt="Status bar tooltip" />
 
 #### Tree View
 
-<img src="https://github.com/leonbjorklund/copilot-usage-extension/raw/main/docs/activity-bar-treeview.png?v=2" width="400" alt="Usage tree view" />
+<img src="https://github.com/leonbjorklund/copilot-usage-extension/raw/main/docs/activity-bar-treeview.png?v=3" width="400" alt="Usage tree view" />
 
 ## Reference
 
+Commands:
+
 - `Copilot Token Cost: Refresh` — re-scans log files and updates totals
 - `Copilot Token Cost: Show Scan Diagnostics` — shows details about skipped or unreadable files
+- `Open Source Log` — opens the log file a session was read from
+- `Sort Sessions by Cost` — orders the session list by AI Credit cost
+- `Sort Sessions by Time` — orders the session list by most recent
+
+Settings:
+
 - `copilotUsage.dataPath` — extra local folder to scan for Copilot usage data (absolute path)
