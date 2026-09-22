@@ -34,6 +34,7 @@ vi.mock('vscode', () => {
 
 import * as vscode from 'vscode';
 
+import { aggregateUsage } from '../src/core/aggregator';
 import { differenceInLocalCalendarDays, UsageTreeProvider } from '../src/ui/usageTreeProvider';
 import type { ChatUsageSummary, CopilotCostEstimate, UsageRecord, UsageSummary, UsageTotal } from '../src/core/types';
 
@@ -226,6 +227,56 @@ describe('UsageTreeProvider', () => {
     expect(bucketItem.label).toBe('Yesterday');
     expect(bucketItem.description).toBe('1 session | 175 (1.2$)');
     expect(bucketItem.collapsibleState).toBe(vscode.TreeItemCollapsibleState.Collapsed);
+  });
+
+  it('splits a chat across day buckets with the same title and only that bucket usage', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    const billed = (timestamp: Date, tokens: number, aiCredits: number, model = 'gpt-4.1'): UsageRecord => ({
+      chatId: 'late-night',
+      title: 'Late night work',
+      timestamp,
+      model,
+      tokens: { input: tokens, cachedInput: 0, output: 0, cacheWriteInput: 0, total: tokens, source: 'recorded' },
+      billing: { aiCredits, source: 'copilot-debug-log' },
+      filePath: 'usage.jsonl',
+    });
+    const summary = aggregateUsage([
+      billed(new Date(2026, 4, 24, 10, 0), 10, 1),
+      billed(new Date(2026, 4, 25, 10, 0), 20, 2),
+      billed(new Date(2026, 4, 27, 23, 30), 300, 30, 'claude-sonnet-4'),
+      billed(new Date(2026, 4, 28, 0, 30), 4_000, 400),
+    ], new Date(2026, 4, 28, 12, 0));
+    provider.setSummary(summary);
+
+    const buckets = (await provider.getChildren()) ?? [];
+    const rows = await Promise.all(buckets.map(async (bucket) => {
+      const [chat] = (await provider.getChildren(bucket)) ?? [];
+      return [provider.getTreeItem(bucket).description, provider.getTreeItem(chat).label, provider.getTreeItem(chat).description];
+    }));
+
+    expect(rows).toEqual([
+      ['1 session | 4k (4$)', 'Late night work', '00:30 | gpt-4.1 | 4k (4$)'],
+      ['1 session | 300 (0.3$)', 'Late night work', '23:30 | claude-sonnet-4 | 300 (0.3$)'],
+      ['1 session | 30 (0.03$)', 'Late night work', '2026-05-25 10:00 | gpt-4.1 | 30 (0.03$)'],
+    ]);
+  });
+
+  it('rounds a bucket cost like the status bar day total', async () => {
+    const provider = new UsageTreeProvider(() => new Date(2026, 4, 28, 12, 0));
+    const summary = aggregateUsage([72, 251, 192].map((aiCredits, index): UsageRecord => ({
+      chatId: `chat-${index}`,
+      title: `Chat ${index}`,
+      timestamp: new Date(2026, 4, 28, 9, index),
+      model: 'gpt-4.1',
+      tokens: { input: 1, cachedInput: 0, output: 0, cacheWriteInput: 0, total: 1, source: 'recorded' },
+      billing: { aiCredits, source: 'copilot-debug-log' },
+      filePath: 'usage.jsonl',
+    })), new Date(2026, 4, 28, 12, 0));
+    provider.setSummary(summary);
+
+    const [today] = (await provider.getChildren()) ?? [];
+    expect(summary.today.githubCopilot.usd).toBe(5.15);
+    expect(provider.getTreeItem(today).description).toBe('3 sessions | 3 (5.2$)');
   });
 
   it('renders token-only rows without cost text', async () => {

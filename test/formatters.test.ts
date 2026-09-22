@@ -25,6 +25,19 @@ describe('monthly credit presentation', () => {
       .toBe('0 / 60\u00a0000 credits (0% / 100%)');
   });
 
+  it('shows the allowance first and the larger spend second past 100%', () => {
+    const over = { ...monthlyQuota, entitlement: 1000, percentRemaining: 0, overage: 300 };
+    expect(formatQuotaLabel(over)).toBe('1\u00a0000 / 1\u00a0300 credits (100% / 130%)');
+    expect(formatQuotaLabel(over, 'percentage-first')).toBe('100% / 130%  (1\u00a0000 / 1\u00a0300 credits)');
+    expect(formatPeriodPercentage(over)).toBe('100/130%');
+    expect(formatQuotaLabel({ ...over, entitlement: 60_000, overage: 1 }))
+      .toBe('60\u00a0000 / 60\u00a0001 credits (100% / 100%)');
+    expect(formatQuotaLabel({ ...over, entitlement: 1500.6, overage: 0.4 }))
+      .toBe('1\u00a0501 / 1\u00a0501 credits (100% / 100%)');
+    const observedAt = Date.parse('2026-09-16T00:00:00Z');
+    expect(formatQuotaPace(over, observedAt, observedAt)).toBe('8.67% / day · 260% monthly pace');
+  });
+
   it('keeps zero and unlimited allowance meaningful without numerical projection', () => {
     const observedAt = Date.parse('2026-09-16T00:00:00Z');
     for (const [patch, label] of [

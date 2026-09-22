@@ -1,9 +1,11 @@
 import * as vscode from "vscode";
 
+import { estimateRecordCost, mergeCostEstimates } from "../core/aggregator";
 import type {
   ChatUsageSummary,
   CopilotCostEstimate,
   UsageDiagnostics,
+  UsageRecord,
   UsageSummary,
 } from "../core/types";
 import type { QuotaState } from "../core/quotaService";
@@ -231,12 +233,18 @@ function buildBuckets(
     { id: "older", label: "Older", chats: [], tokens: 0, githubCopilot: emptyCostEstimate() },
   ];
 
+  const bucketFor = (date: Date) => {
+    const dayDiff = differenceInLocalCalendarDays(date, baseDate);
+    return dayDiff === 0 ? buckets[0] : dayDiff === 1 ? buckets[1] : buckets[2];
+  };
+
   for (const chat of summary.chats) {
-    const dayDiff = differenceInLocalCalendarDays(chat.timestamp, baseDate);
-    const bucket = dayDiff === 0 ? buckets[0] : dayDiff === 1 ? buckets[1] : buckets[2];
-    bucket.chats.push(chat);
-    bucket.tokens += chat.tokens;
-    addCost(bucket.githubCopilot, chat.githubCopilot);
+    // A chat that crosses midnight shows once per bucket, with only that bucket's requests.
+    for (const [bucket, part] of splitChatByBucket(chat, bucketFor)) {
+      bucket.chats.push(part);
+      bucket.tokens += part.tokens;
+      bucket.githubCopilot = mergeCostEstimates(bucket.githubCopilot, part.githubCopilot);
+    }
   }
 
   for (const bucket of buckets) {
@@ -244,6 +252,36 @@ function buildBuckets(
   }
 
   return buckets.filter((bucket) => bucket.chats.length > 0);
+}
+
+function splitChatByBucket(
+  chat: ChatUsageSummary,
+  bucketFor: (date: Date) => UsageBucket,
+): Map<UsageBucket, ChatUsageSummary> {
+  const groups = new Map<UsageBucket, UsageRecord[]>();
+  for (const record of chat.records) {
+    const bucket = bucketFor(record.timestamp);
+    const group = groups.get(bucket);
+    if (group) group.push(record);
+    else groups.set(bucket, [record]);
+  }
+  if (groups.size <= 1) {
+    return new Map([[bucketFor(chat.timestamp), chat]]);
+  }
+
+  const parts = new Map<UsageBucket, ChatUsageSummary>();
+  for (const [bucket, records] of groups) {
+    // Records are newest first, so the first one sets the part's time and model.
+    parts.set(bucket, {
+      ...chat,
+      model: records[0].model,
+      timestamp: records[0].timestamp,
+      tokens: records.reduce((sum, record) => sum + record.tokens.total, 0),
+      githubCopilot: records.map(estimateRecordCost).reduce(mergeCostEstimates, emptyCostEstimate()),
+      records,
+    });
+  }
+  return parts;
 }
 
 function comparerForSortMode(
@@ -270,12 +308,6 @@ function emptyCostEstimate(): CopilotCostEstimate {
     usd: 0,
     aiCredits: 0,
   };
-}
-
-function addCost(target: CopilotCostEstimate, addition: CopilotCostEstimate): void {
-  target.usd += addition.usd;
-  target.aiCredits += addition.aiCredits;
-  target.available ||= addition.available;
 }
 
 function formatTokensWithCost(tokens: number, cost: CopilotCostEstimate): string {

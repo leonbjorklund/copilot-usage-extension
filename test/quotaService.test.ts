@@ -292,6 +292,33 @@ describe('quota observations for the daily history', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+  it('announces growing overage at 0% without writing overage to history', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'quota-log-test-'));
+    const folder = join(root, 'GitHub.copilot-chat');
+    await mkdir(folder);
+    const recorded: QuotaObservation[] = [];
+    let announced = 0;
+    const service = new CopilotQuotaService(join(root, 'extension'), {
+      record: async (observations) => { recorded.push(...observations); },
+    });
+    service.onDidChange(() => announced++);
+    const over = (additionalUsageUsed: number) => quotaLine('processQuotaHeaders', { ...data, percentRemaining: 0, additionalUsageUsed });
+    try {
+      await writeFile(join(folder, 'GitHub Copilot Chat.log'), auth() + over(300));
+      await service.refreshNow();
+      await appendFile(join(folder, 'GitHub Copilot Chat.log'), over(400));
+      await service.refreshNow();
+      expect(announced).toBe(2);
+      expect(service.getState()).toMatchObject({ kind: 'quota', quota: { percentRemaining: 0, overage: 400 } });
+      expect(recorded).toEqual([
+        { account: 'alice', at: now, percentRemaining: 0, resetDate: '2026-10-01T00:00:00.000Z' },
+        { account: 'alice', at: now, percentRemaining: 0, resetDate: '2026-10-01T00:00:00.000Z' },
+      ]);
+    } finally {
+      service.dispose();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('log replacement and continuity', () => {

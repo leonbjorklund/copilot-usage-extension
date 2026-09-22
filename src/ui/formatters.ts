@@ -1,26 +1,28 @@
-import { formatUsedPercentage, type CopilotQuota } from '../core/quota';
+import { formatUsedPercentage, toDecimal, type CopilotQuota } from '../core/quota';
 
 export const CREDIT_USAGE_EXPLANATION =
-  'Used credits are calculated from Copilot\'s reported percentage and rounded to whole credits for display.';
+  'Used credits are calculated from Copilot\'s reported percentage and overage, then rounded to whole credits for display.';
 
 export function formatQuotaLabel(quota: CopilotQuota, order: 'credits-first' | 'percentage-first' = 'credits-first'): string {
   if (quota.unlimited) return quota.hasQuota ? 'Unlimited Copilot quota' : 'Copilot allowance exhausted';
   if (quota.entitlement === 0) return quota.hasQuota ? 'No Copilot credit allowance' : 'Copilot allowance exhausted';
-  const usedPercentage = formatUsedPercentage(quota);
-  const percentage = `${usedPercentage}% / 100%`;
-  const credits = `${formatCredits(quota.entitlement, usedPercentage)} / ${formatCredits(quota.entitlement)} credits`;
+  const used = formatCredits(quota.entitlement, formatUsedPercentage({ ...quota, overage: 0 }), quota.overage);
+  const allowance = formatCredits(quota.entitlement);
+  // Past the allowance, the allowance comes first and the larger spend second.
+  const [percentage, credits] = quota.overage
+    ? [`100% / ${formatUsedPercentage(quota)}%`, `${allowance} / ${used} credits`]
+    : [`${formatUsedPercentage(quota)}% / 100%`, `${used} / ${allowance} credits`];
   return order === 'percentage-first' ? `${percentage}  (${credits})` : `${credits} (${percentage})`;
 }
 
 /** Round the decimal calculation, without floating-point drift at half-credit boundaries. */
-function formatCredits(allowance: number, percentage = '100'): string {
-  const [coefficient, exponent = '0'] = allowance.toString().split('e');
-  const [whole, fraction = ''] = coefficient.split('.');
-  const places = Math.max(0, fraction.length - Number(exponent));
-  const units = BigInt(whole + fraction) * 10n ** BigInt(places + Number(exponent) - fraction.length);
+function formatCredits(allowance: number, percentage = '100', overage = 0): string {
+  const [units, places] = toDecimal(allowance);
+  const [overageUnits, overagePlaces] = toDecimal(overage);
   const [percentWhole, percentFraction = ''] = percentage.split('.');
-  const numerator = units * BigInt(percentWhole + percentFraction);
-  const denominator = 100n * 10n ** BigInt(places + percentFraction.length);
+  const denominator = 100n * 10n ** BigInt(places + percentFraction.length + overagePlaces);
+  const numerator = units * BigInt(percentWhole + percentFraction) * 10n ** BigInt(overagePlaces)
+    + overageUnits * denominator / 10n ** BigInt(overagePlaces);
   if (numerator > 0 && numerator < denominator) return '<1';
   return ((numerator + denominator / 2n) / denominator).toLocaleString('en-US').replaceAll(',', '\u00a0');
 }
@@ -56,7 +58,7 @@ export function formatPeriodPercentage(quota: CopilotQuota | undefined): string 
     return undefined;
   }
 
-  return `${formatUsedPercentage(quota)}/100%`;
+  return quota.overage ? `100/${formatUsedPercentage(quota)}%` : `${formatUsedPercentage(quota)}/100%`;
 }
 
 export function formatTokens(tokens: number): string {

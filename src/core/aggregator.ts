@@ -225,7 +225,7 @@ function emptyCostEstimate(): CopilotCostEstimate {
   };
 }
 
-function estimateRecordCost(record: UsageRecord): CopilotCostEstimate {
+export function estimateRecordCost(record: UsageRecord): CopilotCostEstimate {
   const aiCredits = record.billing?.aiCredits ?? 0;
   return {
     available: aiCredits > 0,
