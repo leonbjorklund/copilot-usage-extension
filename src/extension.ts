@@ -1,697 +1,118 @@
-import { stat } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
-import { homedir } from "node:os";
+import { readFile, rm } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { basename, dirname, join } from 'node:path';
 
-import * as vscode from "vscode";
+import * as vscode from 'vscode';
 
-import { aggregateUsage } from "./core/aggregator";
 import {
-  COPILOT_FILE_LOGGING_SETTING,
-  isCopilotFileLoggingEnabled,
-  readConfig,
-} from "./core/config";
-import { locateCopilotDataPaths } from "./core/locator";
-import type { CopilotQuota } from "./core/quota";
-import { dailyUsage, QuotaHistory, type DailyUsage } from "./core/quotaHistory";
-import { enableQuotaLogging } from "./core/quotaLogging";
-import { CopilotQuotaService, type QuotaState } from "./core/quotaService";
-import { isSameOrInsidePath, pathContainsUsageFolder } from "./core/scanner";
-import type {
-  CopilotCostEstimate,
-  ExtensionConfig,
-  UsageDiagnostics,
-  UsageRecord,
-  UsageSummary,
-} from "./core/types";
-import { UsageIndex } from "./core/usageIndex";
-import { AccountTracking, type AccountTrackingView } from "./core/accountTracking";
-import { formatPeriodPercentage, formatQuotaLabel, formatQuotaPace, formatTokens, formatUsd } from "./ui/formatters";
-import { DARK_PALETTE, formatDailyUsageGraphRows, LIGHT_PALETTE } from "./ui/usageGraph";
-import {
-  formatDiagnostics,
-  UsageTreeProvider,
-  type UsageNode,
-  type UsageTreeSortMode,
-} from "./ui/usageTreeProvider";
+  addReadings, assignAccounts, currentAccount, loadRecords, readLogs, statusText, type LogState,
+} from './quota';
 
-const STATUS_BAR_DISPLAY = {
-  loadingText: "Loading sessions...",
-  failedText: "Scan Failed",
-  setupNeededText: "Enable Copilot logs to see token use",
-  tooltip: "Click to open Copilot usage.",
-  separator: " | ",
-};
-const SETUP_NEEDED_CONTEXT = "copilotUsage.setupNeeded";
-const SORT_MODE_CONTEXT = "copilotUsage.sortMode";
-const SORT_MODE_STORAGE_KEY = "copilotUsage.sortMode";
-
-const USAGE_WATCH_GLOB =
-  "**/{github.copilot-chat,GitHub.copilot-chat,debug-logs,transcripts,chatSessions,chatsessions,emptyWindowChatSessions,emptywindowchatsessions}/**";
-const CUSTOM_DATA_PATH_WATCH_GLOB = "**/*.{json,jsonl}";
-const GITHUB_COPILOT_USAGE_BASED_BILLING_URL =
-  "https://docs.github.com/en/copilot/concepts/billing/usage-based-billing-for-individuals";
-const TOOLTIP_INFO = `<a href="${GITHUB_COPILOT_USAGE_BASED_BILLING_URL}" title="USD is estimated from AI Credits using GitHub Copilot usage-based billing">$(info)</a>`;
-
-interface SourceLogPick extends vscode.QuickPickItem {
-  filePath: string;
-}
-
-interface SourceLog {
-  filePath: string;
-  timestamp: Date;
-}
-
-function formatSessionCount(count: number): string {
-  return `${count} ${count === 1 ? "session" : "sessions"}`;
-}
-
-export function formatStatusBarTooltip(
-  summary: UsageSummary, quotaState: QuotaState = { kind: "waiting" }, now = Date.now(), history?: DailyUsage[],
-): vscode.MarkdownString {
-  const summaryItems = [
-    formatTooltipSummaryItem("Today", summary.today),
-    formatTooltipSummaryItem("Month", summary.month),
-    formatTooltipSummaryItem("All time", summary.allTime),
-  ];
-  const lines = [
-    ...formatTooltipTable([
-      `<tr><td align="left">${summaryItems.join(" &nbsp;|&nbsp; ")}</td><td align="right">${TOOLTIP_INFO}</td></tr>`,
-    ]),
-    "", "---", "",
-  ];
-
-  const topModelRows = summary.topModels.map((model, index) =>
-    formatTopModelTableRow(
-      index,
-      model.model,
-      model.sessions,
-      formatTokensWithCost(model.tokens, model.githubCopilot),
-    ),
-  );
-  lines.push(...formatTopModelsTooltipRows(topModelRows));
-
-  lines.push("", "---", "", ...formatHighestTodayTooltipRows(summary));
-  const monthlyCreditRows = formatMonthlyCreditTooltipRows(quotaState, now, history);
-  if (monthlyCreditRows.length) lines.push("", "---", "", ...monthlyCreditRows);
-
-  const tooltip = new vscode.MarkdownString(lines.join("\n"), true);
-  tooltip.supportHtml = true;
-  return tooltip;
-}
-
-function formatMonthlyCreditTooltipRows(state: QuotaState, now: number, history?: DailyUsage[]): string[] {
-  if (state.kind === "waiting" && state.reason) return [];
-  const label = state.kind === "quota" ? formatQuotaLabel(state.quota, 'percentage-first') : "Waiting for Copilot quota";
-  const pace = state.kind === "quota" ? formatQuotaPace(state.quota, state.observedAt, now) : undefined;
-  const usage = escapeHtml(label).replaceAll(" ", "&nbsp;");
-  const row = pace
-    ? `<tr><td>${usage}</td><td align="right">&nbsp;&nbsp;${escapeHtml(pace).replaceAll(" ", "&nbsp;")}</td></tr>`
-    : `<tr><td colspan="2">${usage}</td></tr>`;
-  return formatTooltipTable([
-    '<tr><td colspan="2"><strong>Monthly Credits</strong></td></tr>',
-    row,
-    ...(history ? formatDailyUsageGraphRows(history, graphPalette()) : []),
-  ]);
-}
-
-function graphPalette() {
-  const kind = vscode.window.activeColorTheme.kind;
-  return kind === vscode.ColorThemeKind.Light || kind === vscode.ColorThemeKind.HighContrastLight ? LIGHT_PALETTE : DARK_PALETTE;
-}
-
-function formatTooltipSummaryItem(label: string, total: UsageSummary["today"]): string {
-  if (label === "Today" && total.tokens === 0 && total.githubCopilot.aiCredits === 0) {
-    return "<strong>Today:</strong> No session";
-  }
-  const cost = total.githubCopilot.available && total.githubCopilot.aiCredits > 0
-    ? ` (${escapeHtml(formatUsd(total.githubCopilot.usd))})` : "";
-  return `<strong>${label}:</strong> ${formatTokens(total.tokens)}${cost}`;
-}
-
-function formatTokensWithCost(tokens: number, costEstimate: CopilotCostEstimate): string {
-  const cost = costEstimate.available && costEstimate.aiCredits > 0 ? formatUsd(costEstimate.usd) : undefined;
-  return `${formatTokens(tokens)}${cost ? ` (${cost})` : ""}`;
-}
-
-function formatTopModelTableRow(
-  index: number,
-  model: string,
-  sessions: number,
-  value: string,
-): string {
-  return `<tr><td>${index + 1}. ${escapeHtml(model)}</td><td align="right">${formatSessionCount(sessions)} · ${escapeHtml(value)}</td></tr>`;
-}
-
-function formatTopModelsTooltipRows(rows: string[]): string[] {
-  return formatTooltipTable([
-    '<tr><td colspan="2"><strong>Model use</strong></td></tr>',
-    ...(rows.length > 0 ? rows : ['<tr><td colspan="2">No sessions yet.</td></tr>']),
-  ]);
-}
-
-function formatTooltipTable(rows: string[]): string[] {
-  return ['<table width="100%">', ...rows, "</table>"];
-}
-
-function formatHighestTodayTooltipRows(summary: UsageSummary): string[] {
-  const highlights = [summary.mostExpensiveSessionToday, summary.highestSessionToday]
-    .filter((chat): chat is NonNullable<typeof chat> => chat !== undefined)
-    .filter((chat, index, chats) => chats.findIndex((other) => other.chatId === chat.chatId) === index);
-  return formatTooltipTable([
-    '<tr><td colspan="2"><strong>Top sessions today</strong></td></tr>',
-    ...(highlights.length > 0 ? highlights.map(formatTodayHighlightTableRow)
-      : ['<tr><td colspan="2">No sessions today</td></tr>']),
-  ]);
-}
-
-function formatTodayHighlightTableRow(
-  chat: NonNullable<UsageSummary["highestSessionToday"]>,
-): string {
-  return `<tr><td>${escapeHtml(chat.title)} <span style="color:var(--vscode-descriptionForeground);">${escapeHtml(chat.model)}</span></td><td align="right">${escapeHtml(formatTokensWithCost(chat.tokens, chat.githubCopilot))}</td></tr>`;
-}
-
-function escapeHtml(value: string): string {
-  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
-export function formatStatusBarSummary(summary: UsageSummary, quota?: CopilotQuota): string {
-  const cost = summary.today.githubCopilot.available && summary.today.githubCopilot.aiCredits > 0
-    ? formatUsd(summary.today.githubCopilot.usd) : undefined;
-  const today = summary.today.tokens === 0 && summary.today.githubCopilot.aiCredits === 0 ? "No sessions today" : cost
-    ? [formatTokens(summary.today.tokens), cost].join(STATUS_BAR_DISPLAY.separator)
-    : formatTokens(summary.today.tokens);
-  const period = formatPeriodPercentage(quota);
-  return `${today}${period ? ` • ${period}` : ""}`;
-}
-
-function setStatusBarLoading(statusBar: vscode.StatusBarItem): void {
-  statusBar.text = STATUS_BAR_DISPLAY.loadingText;
-  statusBar.tooltip = STATUS_BAR_DISPLAY.tooltip;
-  statusBar.command = "copilotUsage.openView";
-}
-
-function setStatusBarFailed(statusBar: vscode.StatusBarItem, message: string): void {
-  statusBar.text = STATUS_BAR_DISPLAY.failedText;
-  statusBar.tooltip = message;
-  statusBar.command = "copilotUsage.openView";
-}
-
-function setStatusBarSetupNeeded(statusBar: vscode.StatusBarItem): void {
-  statusBar.text = STATUS_BAR_DISPLAY.setupNeededText;
-  statusBar.tooltip = undefined;
-  statusBar.command = "copilotUsage.openCopilotLoggingSetting";
-}
+const RECORDS_KEY = 'records';
+const POLL_MS = 2_000;
 
 export function activate(context: vscode.ExtensionContext): void {
-  const accountTrackingEnabled = context.extensionMode === vscode.ExtensionMode.Development ||
-    context.extensionMode === vscode.ExtensionMode.Production;
-  const now = () => new Date();
-  const initialSortMode = readPersistedSortMode(context);
-  const treeProvider = new UsageTreeProvider(now, initialSortMode);
-  const statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
-  const usageIndex = new UsageIndex();
-  const scanCacheDirectory = join(context.globalStorageUri.fsPath, 'scan-cache');
-  const quotaHistory = new QuotaHistory(join(context.globalStorageUri.fsPath, 'quota-history.jsonl'));
-  const quotaService = new CopilotQuotaService(context.logUri.fsPath, quotaHistory);
-  const quotaLogging = enableQuotaLogging();
-  const accountTracking = accountTrackingEnabled ? new AccountTracking(
-    join(context.globalStorageUri.fsPath, 'account-tracking'),
-    join(dirname(context.logUri.fsPath), 'GitHub.copilot-chat'),
-    [dirname(dirname(dirname(dirname(context.logUri.fsPath)))),
-      ...['Code', 'Code - Insiders'].flatMap((editor) => [
-        join(process.env.APPDATA ?? join(homedir(), 'AppData', 'Roaming'), editor, 'logs'),
-        join(homedir(), '.config', editor, 'logs'),
-        join(homedir(), 'Library', 'Application Support', editor, 'logs'),
-      ])],
-  ) : undefined;
-  let trackingView: AccountTrackingView | undefined;
-  let accountTrackingError: string | undefined;
-  let rawSummary: UsageSummary | undefined;
-  let trackingTimer: ReturnType<typeof setTimeout> | undefined;
+  void removeOldData(context);
+
+  // Every window reads every window's Copilot Chat log of this VS Code session.
+  // logUri is <logs>/<session>/window<N>/exthost/<extension id>.
+  const windowFolder = dirname(dirname(context.logUri.fsPath));
+  const windowName = basename(windowFolder);
+  const session = dirname(windowFolder);
+  const logs: LogState = { windows: new Map(), logins: [] };
+  let records = loadRecords(context.globalState.get(RECORDS_KEY));
+  // A reload keeps appending to the same log, so only lines since this extension host started
+  // show the level of this window's Copilot Chat channel.
+  const hostStart = Date.now() - process.uptime() * 1000;
+  const ownLogWritten = () => {
+    const own = logs.windows.get(windowName);
+    return own !== undefined && own.size > 0 && (own.modified ?? 0) >= hostStart;
+  };
+
+  // The window that switched Copilot Chat to Trace needs no restart, even before its next Trace line.
+  let switched = false;
+
+  // Copilot's own item sits right of the language mode (100.1); this lands directly right of it.
+  const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100.05);
+  const render = () => {
+    const needsRestart = !switched && ownLogWritten() && (logs.windows.get(windowName)!.traceAt ?? 0) < hostStart;
+    const text = statusText(records, Date.now(), needsRestart);
+    if (item.text !== text) item.text = text;
+  };
+  render();
+  item.show();
+
+  let traceChecked = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   let disposed = false;
-  let latestDiagnostics: UsageDiagnostics | undefined;
-  let readySummary: UsageSummary | undefined;
-  let showingCachedUsage = false;
-  let currentConfig: ExtensionConfig = readConfig();
-  let generation = 0;
-  const watcherDisposablesByFolder = new Map<string, vscode.Disposable[]>();
-  let eventTimer: ReturnType<typeof setTimeout> | undefined;
-  let eventGeneration = 0;
-  let updateChain = Promise.resolve();
-  const changedPaths = new Set<string>();
-  const deletedPaths = new Set<string>();
-
-  setStatusBarLoading(statusBar);
-  statusBar.show();
-  void setSortModeContext(initialSortMode);
-
-  function runRefresh(restoreCached = false): Promise<void> {
-    const refreshGeneration = ++generation;
-    // Rebuilds, file events, and polling mutate the same index. Never overlap.
-    updateChain = updateChain.then(() => rebuildUsage(refreshGeneration, restoreCached));
-    return updateChain;
-  }
-
-  async function rebuildUsage(refreshGeneration: number, restoreCached: boolean): Promise<void> {
-    if (disposed || refreshGeneration !== generation) return;
-    readySummary = undefined;
-    showingCachedUsage = false;
-    // Quota uses the output log independently of session file logging.
-    void quotaService.refreshNow();
+  const poll = async () => {
     try {
-      if (!isCopilotFileLoggingEnabled()) {
-        treeProvider.setSetupNeeded();
-        void setSetupNeededContext(true);
-        setStatusBarSetupNeeded(statusBar);
-        disposeWatchers();
-        return;
+      const found = await readLogs(session, logs);
+      // A Copilot Chat channel created after the switch would start at the old level, so wait until
+      // this extension host's channel has written to the log.
+      if (!traceChecked && ownLogWritten()) {
+        traceChecked = true;
+        void enableTrace().then((ran) => { switched = ran; });
       }
-
-      void setSetupNeededContext(false);
-      currentConfig = readConfig();
-      const config = currentConfig;
-      if (!restoreCached) setStatusBarLoading(statusBar);
-
-      const roots = await locateCopilotDataPaths(config.dataPath);
-      if (disposed || refreshGeneration !== generation) return;
-      const options = { roots, config, now: now(), retainedChatIds: accountTracking?.getRetainedChatIds() };
-      // The cache is disposable. Failure must fall back to the normal scan.
-      const cached = restoreCached
-        ? await usageIndex.restore(options, scanCacheDirectory).catch(() => undefined) : undefined;
-      if (disposed || refreshGeneration !== generation) return;
-      if (cached) {
-        await showCachedResult(cached, refreshGeneration);
-        if (disposed || refreshGeneration !== generation) return;
-      }
-      const result = cached
-        ? await usageIndex.poll({ config, now: now(), retainedChatIds: accountTracking?.getRetainedChatIds() })
-        : await usageIndex.rebuild(options);
-      if (disposed || refreshGeneration !== generation) return;
-
-      await acceptResult(result, refreshGeneration);
-      if (disposed || refreshGeneration !== generation) return;
-      syncWatchers(usageIndex.getWatchFolders());
-    } catch (error) {
-      if (!disposed && refreshGeneration === generation) {
-        reportScanFailure(error);
-      }
-    }
-  }
-
-  function reportScanFailure(error: unknown): void {
-    readySummary = undefined;
-    showingCachedUsage = false;
-    const message = error instanceof Error ? error.message : String(error);
-    setStatusBarFailed(statusBar, message);
-    treeProvider.setProblem(message);
-  }
-
-  async function openSourceLog(node: UsageNode | undefined): Promise<void> {
-    if (node?.kind !== "chat") {
-      return;
-    }
-
-    const sourceLogs = buildSourceLogPicks(node);
-    if (sourceLogs.length === 0) {
-      await vscode.window.showInformationMessage("No source log available for this session.");
-      return;
-    }
-
-    if (sourceLogs.length === 1) {
-      await vscode.commands.executeCommand("vscode.open", vscode.Uri.file(sourceLogs[0].filePath));
-      return;
-    }
-
-    const selected = await vscode.window.showQuickPick(sourceLogs, {
-      placeHolder: "Open source log",
-    });
-    if (selected) {
-      await vscode.commands.executeCommand("vscode.open", vscode.Uri.file(selected.filePath));
-    }
-  }
-
-  function applyResult(result: { summary: UsageSummary; diagnostics: UsageDiagnostics }): void {
-    latestDiagnostics = result.diagnostics;
-    readySummary = result.summary;
-    treeProvider.setSummary(result.summary, accountTrackingError ?? trackingView?.problem);
-    const quotaState = matchingQuotaState();
-    const matchingQuota = quotaState.kind === "quota" ? quotaState.quota : undefined;
-    treeProvider.setQuotaState(quotaState);
-    statusBar.text = formatStatusBarSummary(result.summary, matchingQuota);
-    statusBar.command = "copilotUsage.openView";
-    updateStatusBarTooltip(result.summary, quotaState);
-  }
-
-  function matchingQuotaState(): QuotaState {
-    const state = quotaService.getState();
-    return state.kind === "quota" && state.account && trackingView?.account && state.account.toLowerCase() !== trackingView.account
-      ? { kind: "waiting" } : state;
-  }
-
-  function updateStatusBarTooltip(summary: UsageSummary, quotaState = matchingQuotaState()): void {
-    // The graph follows the account whose quota is shown, or the ledger's account while quota waits.
-    const account = quotaState.kind === "quota" ? quotaState.account : trackingView?.account;
-    const history = account ? dailyUsage(quotaHistory.get(account), now().getTime()) : undefined;
-    const tooltip = formatStatusBarTooltip(summary, quotaState, now().getTime(), history);
-    if (showingCachedUsage) {
-      tooltip.appendMarkdown("\n\nShowing saved sessions. Checking for changes.");
-    }
-    // Every assignment redraws an open hover, so an unchanged tooltip stays put.
-    const current = statusBar.tooltip;
-    if (typeof current === "object" && current.value === tooltip.value) return;
-    statusBar.tooltip = tooltip;
-  }
-
-  async function showCachedResult(
-    cached: { summary: UsageSummary; diagnostics: UsageDiagnostics }, cachedGeneration: number,
-  ): Promise<void> {
-    let summary = cached.summary;
-    if (accountTracking) {
-      let retained: AccountTrackingView;
-      try {
-        // Never feed unverified cached requests or titles into the durable ledger.
-        // It already retains newer billed usage; only older usage needs the cache.
-        const timestamp = now();
-        retained = await accountTracking.refresh(aggregateUsage([], timestamp), timestamp);
-      } catch {
-        // A reconciled scan can still use the existing account-error fallback.
-        return;
-      }
-      if (disposed || cachedGeneration !== generation) return;
-      const historical = cached.summary.chats.flatMap((chat) => chat.records
-        .filter((record) => record.timestamp < retained.startedAt)
-        .map((record) => ({ ...record, title: chat.title, titlePriority: chat.titlePriority ?? record.titlePriority,
-          titleTimestamp: chat.titleTimestamp, titleModifiedAt: chat.titleModifiedAt })));
-      summary = aggregateUsage([
-        ...historical, ...retained.summary.chats.flatMap((chat) => chat.records),
-      ], now());
-      trackingView = retained;
-      accountTrackingError = undefined;
-    }
-    if (disposed || cachedGeneration !== generation) return;
-    showingCachedUsage = true;
-    applyResult({ ...cached, summary });
-  }
-
-  async function acceptResult(result: { summary: UsageSummary; diagnostics: UsageDiagnostics; titleMetadata?: UsageRecord[] }, acceptedGeneration: number): Promise<void> {
-    if (disposed || acceptedGeneration !== generation) return;
-    let nextTrackingView: AccountTrackingView | undefined;
-    let trackingError: string | undefined;
-    try {
-      nextTrackingView = await accountTracking?.refresh(result.summary, now(), result.titleMetadata);
-    } catch (error) {
-      // Account storage must not block a successful local usage scan. Preserve
-      // the storage error for recovery without resetting or rewriting data.
-      trackingError = error instanceof Error ? error.message : String(error);
-    }
-    if (disposed || acceptedGeneration !== generation) return;
-    rawSummary = result.summary;
-    trackingView = nextTrackingView;
-    accountTrackingError = trackingError;
-    showingCachedUsage = false;
-    applyResult({ ...result, summary: trackingView?.summary ?? result.summary });
-    // Save during normal operation, not only on shutdown. Cache write failures
-    // must not hide successful usage or change the durable account ledger.
-    await usageIndex.save(scanCacheDirectory).catch(() => undefined);
-  }
-
-  function scheduleTrackingPoll(): void {
-    if (!accountTracking || disposed) return;
-    trackingTimer = setTimeout(() => {
-      trackingTimer = undefined;
-      const pollGeneration = generation;
-      updateChain = updateChain.then(async () => {
-        if (disposed || pollGeneration !== generation || !rawSummary || !isCopilotFileLoggingEnabled()) return;
-        const result = await usageIndex.poll({ config: currentConfig, now: now(), retainedChatIds: accountTracking.getRetainedChatIds() });
-        await acceptResult(result, pollGeneration);
-        if (disposed || pollGeneration !== generation) return;
-        syncWatchers(usageIndex.getWatchFolders());
-      }).catch((error: unknown) => {
-        if (!disposed && pollGeneration === generation) reportScanFailure(error);
-      }).finally(scheduleTrackingPoll);
-    }, 2_000);
-  }
-
-  function setSetupNeededContext(value: boolean): Thenable<unknown> {
-    return vscode.commands.executeCommand("setContext", SETUP_NEEDED_CONTEXT, value);
-  }
-
-  function setSortModeContext(value: UsageTreeSortMode): Thenable<unknown> {
-    return vscode.commands.executeCommand("setContext", SORT_MODE_CONTEXT, value);
-  }
-
-  async function setSortMode(value: UsageTreeSortMode): Promise<void> {
-    treeProvider.setSortMode(value);
-    await context.globalState.update(SORT_MODE_STORAGE_KEY, value);
-    await setSortModeContext(value);
-  }
-
-  function syncWatchers(folders: string[]): void {
-    const desiredFolders = new Set(folders);
-    for (const folder of watcherDisposablesByFolder.keys()) {
-      if (!desiredFolders.has(folder)) {
-        disposeFolderWatchers(folder);
-      }
-    }
-
-    for (const folder of folders) {
-      if (watcherDisposablesByFolder.has(folder)) {
-        continue;
-      }
-
-      watcherDisposablesByFolder.set(folder, registerUsageWatcher(folder));
-    }
-  }
-
-  function disposeWatchers(): void {
-    for (const folder of watcherDisposablesByFolder.keys()) {
-      disposeFolderWatchers(folder);
-    }
-  }
-
-  function disposeFolderWatchers(folder: string): void {
-    const disposables = watcherDisposablesByFolder.get(folder);
-    if (!disposables) {
-      return;
-    }
-
-    for (const disposable of disposables) {
-      disposable.dispose();
-    }
-    watcherDisposablesByFolder.delete(folder);
-  }
-
-  function registerUsageWatcher(folder: string): vscode.Disposable[] {
-    const watcher = vscode.workspace.createFileSystemWatcher(
-      new vscode.RelativePattern(vscode.Uri.file(folder), watchGlobForFolder(folder)),
-    );
-    return [
-      watcher,
-      watcher.onDidChange((uri) => scheduleFileUpdate(uri.fsPath)),
-      watcher.onDidCreate((uri) => {
-        void scheduleCreatedPath(uri.fsPath);
-      }),
-      watcher.onDidDelete((uri) => scheduleDelete(uri.fsPath)),
-    ];
-  }
-
-  function watchGlobForFolder(folder: string): string {
-    return isCustomDataWatchFolder(folder) ? CUSTOM_DATA_PATH_WATCH_GLOB : USAGE_WATCH_GLOB;
-  }
-
-  function isCustomDataWatchFolder(folder: string): boolean {
-    const dataPath = currentConfig.dataPath.trim();
-    return dataPath.length > 0 && isSameOrInsidePath(folder, dataPath);
-  }
-
-  async function scheduleCreatedPath(path: string): Promise<void> {
-    const createdGeneration = generation;
-    try {
-      const fileStat = await stat(path);
-      if (disposed || createdGeneration !== generation) return;
-      if (fileStat.isDirectory()) {
-        syncWatchers([...usageIndex.getWatchFolders(), path]);
-        scheduleFileUpdate(path, true);
-      } else {
-        scheduleFileUpdate(path);
+      const next = addReadings(records, assignAccounts(found, logs.logins, currentAccount(records)), Date.now());
+      if (JSON.stringify(next) !== JSON.stringify(records)) {
+        records = next;
+        await context.globalState.update(RECORDS_KEY, records);
       }
     } catch {
-      return;
+      // The next poll tries again; the numbers shown stay.
     }
-  }
+    if (disposed) return;
+    timer = setTimeout(poll, POLL_MS);
+    render();
+  };
+  void poll();
 
-  function scheduleFileUpdate(filePath: string, force = false): void {
-    if (!force && !shouldProcessFileEvent(filePath)) {
-      return;
-    }
-
-    changedPaths.add(filePath);
-    deletedPaths.delete(filePath);
-    scheduleEventFlush();
-  }
-
-  function shouldProcessFileEvent(filePath: string): boolean {
-    const dataPath = currentConfig.dataPath.trim();
-    return (
-      pathContainsUsageFolder(filePath) ||
-      (dataPath.length > 0 && isSameOrInsidePath(filePath, dataPath))
-    );
-  }
-
-  function scheduleDelete(path: string): void {
-    deletedPaths.add(path);
-    changedPaths.delete(path);
-    scheduleEventFlush();
-  }
-
-  function scheduleEventFlush(): void {
-    eventGeneration = generation;
-    if (eventTimer) {
-      clearTimeout(eventTimer);
-    }
-
-    eventTimer = setTimeout(() => {
-      eventTimer = undefined;
-      const pathsToUpdate = Array.from(changedPaths);
-      const pathsToDelete = Array.from(deletedPaths);
-      changedPaths.clear();
-      deletedPaths.clear();
-      const flushGeneration = eventGeneration;
-      updateChain = updateChain
-        .then(() => processFileEvents(pathsToUpdate, pathsToDelete, flushGeneration))
-        .catch((error: unknown) => {
-          if (!disposed && flushGeneration === generation) reportScanFailure(error);
-        });
-    }, 100);
-  }
-
-  async function processFileEvents(
-    pathsToUpdate: string[],
-    pathsToDelete: string[],
-    flushGeneration: number,
-  ): Promise<void> {
-    if (disposed || flushGeneration !== generation) {
-      return;
-    }
-
-    const config = currentConfig;
-    const result = await usageIndex.applyChanges({
-      pathsToDelete,
-      pathsToUpdate,
-      config,
-      now: now(),
-      retainedChatIds: accountTracking?.getRetainedChatIds(),
-    });
-
-    if (flushGeneration !== generation) {
-      return;
-    }
-
-    await acceptResult(result, flushGeneration);
-    if (disposed || flushGeneration !== generation) return;
-    syncWatchers(usageIndex.getWatchFolders());
-  }
-
-  const tooltipTimer = setInterval(() => {
-    // Other windows append to the shared history; pick up their day values before redrawing.
-    void quotaHistory.record([]).then(() => {
-      if (!disposed && readySummary) updateStatusBarTooltip(readySummary);
-    });
-  }, 60_000);
-
-  context.subscriptions.push(
-    statusBar,
-    // Unregister the view before the provider tears its event emitter down.
-    vscode.window.registerTreeDataProvider("copilotUsage.views.usage", treeProvider),
-    treeProvider,
-    quotaService,
-    quotaService.onDidChange(() => {
-      if (readySummary && latestDiagnostics) {
-        applyResult({ summary: readySummary, diagnostics: latestDiagnostics });
-      } else {
-        // Quota remains useful when logging is off or the scan cannot run.
-        treeProvider.setQuotaState(matchingQuotaState());
-      }
-    }),
-    vscode.commands.registerCommand("copilotUsage.refresh", () => runRefresh()),
-    vscode.commands.registerCommand("copilotUsage.openView", () =>
-      vscode.commands.executeCommand("copilotUsage.views.usage.focus"),
-    ),
-    vscode.commands.registerCommand("copilotUsage.openSourceLog", (node?: UsageNode) =>
-      openSourceLog(node),
-    ),
-    vscode.commands.registerCommand("copilotUsage.sortSessionsByCost", () => setSortMode("cost")),
-    vscode.commands.registerCommand("copilotUsage.sortSessionsByTime", () => setSortMode("time")),
-    vscode.commands.registerCommand("copilotUsage.openCopilotLoggingSetting", () =>
-      vscode.commands.executeCommand(
-        "workbench.action.openSettings",
-        `@id:${COPILOT_FILE_LOGGING_SETTING}`,
-      ),
-    ),
-    vscode.commands.registerCommand("copilotUsage.showDiagnostics", async () => {
-      const quota = quotaService.getState();
-      return vscode.window.showInformationMessage(
-        (latestDiagnostics
-          ? formatDiagnostics(latestDiagnostics) + (trackingView ? `\n\n${trackingView.diagnostics}` : '') +
-            (accountTrackingError ? `\n\nAccount tracking: ${accountTrackingError}` : '')
-          : "No Copilot usage scan has completed yet.") + `\n\n${(await quotaLogging).reason}` +
-          (quotaHistory.problem ? `\n\n${quotaHistory.problem}` : '') +
-          (quota.kind === 'waiting' && quota.reason ? `\n\n${quota.reason}` : ''),
-        { modal: true },
-      );
-    }),
-    vscode.window.onDidChangeActiveColorTheme(() => {
-      if (readySummary) updateStatusBarTooltip(readySummary);
-    }),
-    vscode.workspace.onDidChangeConfiguration((event) => {
-      if (
-        !event.affectsConfiguration("copilotUsage") &&
-        !event.affectsConfiguration(COPILOT_FILE_LOGGING_SETTING)
-      ) {
-        return;
-      }
-
-      void runRefresh();
-    }),
-    new vscode.Disposable(() => {
-      disposed = true;
-      clearInterval(tooltipTimer);
-      if (trackingTimer) clearTimeout(trackingTimer);
-      disposeWatchers();
-      if (eventTimer) {
-        clearTimeout(eventTimer);
-      }
-    }),
-  );
-
-  void runRefresh(true);
-  scheduleTrackingPoll();
-}
-
-function readPersistedSortMode(context: vscode.ExtensionContext): UsageTreeSortMode {
-  return context.globalState.get<string>(SORT_MODE_STORAGE_KEY, "time") === "cost" ? "cost" : "time";
-}
-
-function buildSourceLogPicks(node: Extract<UsageNode, { kind: "chat" }>): SourceLogPick[] {
-  const logsByPath = new Map<string, SourceLog>();
-
-  for (const record of node.chat.records) {
-    const existing = logsByPath.get(record.filePath);
-    if (existing && existing.timestamp >= record.timestamp) {
-      continue;
-    }
-
-    logsByPath.set(record.filePath, {
-      filePath: record.filePath,
-      timestamp: record.timestamp,
-    });
-  }
-
-  return Array.from(logsByPath.values()).sort(
-    (left, right) => right.timestamp.getTime() - left.timestamp.getTime(),
-  ).map((log) => ({
-    label: basename(log.filePath),
-    description: log.filePath,
-    filePath: log.filePath,
+  context.subscriptions.push(item, new vscode.Disposable(() => {
+    disposed = true;
+    clearTimeout(timer);
   }));
+}
+
+/** The old build's history and caches. Old windows still running recreate them until they reload. */
+async function removeOldData(context: vscode.ExtensionContext): Promise<void> {
+  const storage = context.globalStorageUri.fsPath;
+  await Promise.all(['account-tracking', 'account-poc', 'quota-history.jsonl', 'scan-cache'].map((name) =>
+    rm(join(storage, name), { recursive: true, force: true }).catch(() => undefined)));
+  if (context.globalState.get('copilotUsage.sortMode') !== undefined) {
+    await context.globalState.update('copilotUsage.sortMode', undefined);
+  }
+}
+
+/**
+ * Copilot Chat logs quota only at Trace. VS Code saves the default in argv.json, which every window
+ * reads at VS Code's next start, and switches this window's running Copilot Chat channel at once.
+ * An existing Copilot entry is Trace already or the user's own choice, so it stays. Resolves to
+ * whether it switched.
+ */
+export async function enableTrace(): Promise<boolean> {
+  try {
+    const portable = process.env.VSCODE_PORTABLE;
+    const argv = portable ? join(portable, 'argv.json') : join(homedir(),
+      JSON.parse(await readFile(join(vscode.env.appRoot, 'product.json'), 'utf8')).dataFolderName, 'argv.json');
+    if (hasCopilotLogLevel(await readFile(argv, 'utf8').catch(() => ''))) return false;
+    await vscode.commands.executeCommand('workbench.action.setDefaultLogLevel', vscode.LogLevel.Trace, 'github.copilot-chat');
+    return true;
+  } catch {
+    // Copilot Chat keeps its level.
+    return false;
+  }
+}
+
+/** argv.json has a `github.copilot-chat` log-level entry. argv.json allows comments. */
+export function hasCopilotLogLevel(argv: string): boolean {
+  for (const [token] of argv.matchAll(/\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:[^"\\\n]|\\.)*"/g)) {
+    if (!token.startsWith('"')) continue;
+    try {
+      if (/^github\.copilot-chat[:=]./i.test(JSON.parse(token))) return true;
+    } catch {
+      // A malformed string is not an entry.
+    }
+  }
+  return false;
 }

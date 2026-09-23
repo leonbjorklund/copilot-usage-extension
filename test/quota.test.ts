@@ -1,51 +1,433 @@
-import { describe, expect, it } from 'vitest';
-import { formatUsedPercentage, parseCopilotQuota } from '../src/core/quota';
+import { appendFile, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-const payload = { quota: 1500, unlimited: false, hasQuota: true, percentRemaining: 63.4,
-  additionalUsageUsed: 0, additionalUsageEnabled: false, resetDate: '2026-10-01T00:00:00.000Z' };
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-describe('Copilot logged quota', () => {
-  it('retains server allowance and rounded percentage without reconstructing exact credits', () => {
-    const quota = parseCopilotQuota(payload)!;
-    expect(quota.entitlement).toBe(1500);
-    expect(quota.percentRemaining).toBe(63.4);
-    expect(formatUsedPercentage(quota)).toBe('36.6');
-    expect(quota).not.toHaveProperty('remaining');
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return { ...actual, stat: vi.fn(actual.stat), open: vi.fn(actual.open) };
+});
+
+import * as fsPromises from 'node:fs/promises';
+
+import {
+  addReadings, assignAccounts, currentAccount, formatNumber, loadRecords, monthUsed, readLogs, statusText, todayUsed,
+  toReading, type Found, type LogState, type Reading, type Records,
+} from '../src/quota';
+
+const RESET = '2026-10-01T00:00:00.000Z';
+const payload = { quota: 80000, unlimited: false, hasQuota: true, percentRemaining: 26.5, additionalUsageUsed: 0,
+  additionalUsageEnabled: true, resetDate: RESET };
+
+/** Local time, as Copilot Chat stamps its log lines. */
+function time(day: number, hour: number, minute = 0, second = 0, ms = 0, month = 9): number {
+  return new Date(2026, month - 1, day, hour, minute, second, ms).getTime();
+}
+
+function stamp(at: number): string {
+  const date = new Date(at);
+  const pad = (value: number, width = 2) => String(value).padStart(width, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ` +
+    `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`;
+}
+
+const quotaLine = (at: number, percentRemaining: number, method = 'processQuotaHeaders') =>
+  `${stamp(at)} [trace] [ChatQuota] ${method}: ${JSON.stringify({ ...payload, percentRemaining })}\r\n`;
+const tokenLine = (at: number, login: string) => `${stamp(at)} [info] Got Copilot token for ${login}\r\n`;
+// Windows are listed in directory order, which differs between platforms.
+const byTime = (found: Found[]) => [...found].sort((a, b) => a.reading.at - b.reading.at);
+
+function reading(at: number, percentRemaining: number, extra: Partial<Reading> = {}): Reading {
+  return { at, quota: 80000, percentRemaining, resetDate: RESET, unlimited: false, ...extra };
+}
+
+describe('quota payloads', () => {
+  it('keeps the allowance, percentage, reset date and unlimited flag', () => {
+    expect(toReading(5, payload)).toEqual({ at: 5, quota: 80000, percentRemaining: 26.5, resetDate: RESET, unlimited: false });
+    expect(toReading(5, { ...payload, quota: -1 })?.unlimited).toBe(true);
+    expect(toReading(5, { ...payload, quota: -1, unlimited: true })?.unlimited).toBe(true);
+    expect(toReading(5, { ...payload, unlimited: true })?.unlimited).toBe(true);
   });
-  it('keeps exhausted and unlimited snapshots', () => {
-    expect(parseCopilotQuota({ ...payload, quota: 0, percentRemaining: 0, hasQuota: false })?.entitlement).toBe(0);
-    expect(parseCopilotQuota({ ...payload, quota: -1, unlimited: true })?.unlimited).toBe(true);
-    expect(parseCopilotQuota({ ...payload, quota: -1, unlimited: true, hasQuota: false })?.hasQuota).toBe(false);
+
+  it('counts spending past the allowance only while no allowance remains', () => {
+    expect(toReading(5, { ...payload, percentRemaining: 0, additionalUsageUsed: 2560 })?.additionalUsageUsed).toBe(2560);
+    expect(toReading(5, { ...payload, percentRemaining: 0.1, additionalUsageUsed: 300 })).not.toHaveProperty('additionalUsageUsed');
+    for (const additionalUsageUsed of [0, -1, null, '3', Infinity]) {
+      const kept = toReading(5, { ...payload, percentRemaining: 0, additionalUsageUsed });
+      expect(kept).toBeDefined();
+      expect(kept).not.toHaveProperty('additionalUsageUsed');
+    }
   });
+
+  it('keeps a reading whose reset date is unusable, without the date', () => {
+    for (const resetDate of [null, 'soon', 5, undefined]) {
+      const kept = toReading(5, { ...payload, resetDate });
+      expect(kept?.percentRemaining).toBe(26.5);
+      expect(kept).not.toHaveProperty('resetDate');
+    }
+  });
+
   it.each([
-    [63.45, '36.55'],
-    [99.96, '0.04'],
-    [99.99999999999999, '0.00000000000001'],
-    [1e-7, '99.9999999'],
-    [100, '0'],
-  ])('preserves the percentage precision of %s remaining', (percentRemaining, used) => {
-    const quota = parseCopilotQuota({ ...payload, percentRemaining })!;
-    expect(formatUsedPercentage(quota)).toBe(used);
+    ['nothing', undefined], ['null', null], ['an array', []], ['text', 'text'],
+    ['a text quota', { ...payload, quota: '80000' }], ['a quota below -1', { ...payload, quota: -2 }],
+    ['an infinite quota', { ...payload, quota: Infinity }], ['101% remaining', { ...payload, percentRemaining: 101 }],
+    ['-1% remaining', { ...payload, percentRemaining: -1 }], ['NaN remaining', { ...payload, percentRemaining: NaN }],
+    ['no percentage', { ...payload, percentRemaining: undefined }], ['a text unlimited flag', { ...payload, unlimited: 'false' }],
+  ])('rejects %s', (_name, value) => {
+    expect(toReading(5, value)).toBeUndefined();
   });
-  it('adds credits spent past the allowance to the used percentage', () => {
-    const quota = parseCopilotQuota({ ...payload, quota: 1000, percentRemaining: 0, additionalUsageUsed: 300 })!;
-    expect(quota.overage).toBe(300);
-    expect(formatUsedPercentage(quota)).toBe('130');
-    expect(formatUsedPercentage({ ...quota, entitlement: 60_000, overage: 1234 })).toBe('102.1');
-    expect(formatUsedPercentage({ ...quota, overage: 10_000 })).toBe('1100');
-    expect(formatUsedPercentage({ ...quota, entitlement: 300, overage: 32.55 })).toBe('110.9');
-    expect(formatUsedPercentage({ ...quota, entitlement: 1, overage: 1e21 })).toBe('100000000000000000000100');
+
+  it('rejects a missing or invalid time', () => {
+    expect(toReading(undefined, payload)).toBeUndefined();
+    expect(toReading('soon', payload)).toBeUndefined();
+    expect(toReading(NaN, payload)).toBeUndefined();
   });
-  it.each([0, null, -1, '3'])('keeps the percentage and ignores overage %j', additionalUsageUsed => {
-    const quota = parseCopilotQuota({ ...payload, percentRemaining: 0, additionalUsageUsed })!;
-    expect(quota).not.toHaveProperty('overage');
-    expect(formatUsedPercentage(quota)).toBe('100');
+});
+
+describe('reading the session logs', () => {
+  const roots: string[] = [];
+  afterEach(async () => {
+    await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
   });
-  it('ignores overage while allowance remains', () => {
-    expect(parseCopilotQuota({ ...payload, additionalUsageUsed: 300 })).not.toHaveProperty('overage');
+
+  async function session(): Promise<string> {
+    const root = await mkdtemp(join(tmpdir(), 'copilot-credits-'));
+    roots.push(root);
+    return root;
+  }
+
+  async function log(root: string, window: string, text: string, file = 'GitHub Copilot Chat.log'): Promise<string> {
+    const folder = join(root, window, 'exthost', 'GitHub.copilot-chat');
+    await mkdir(folder, { recursive: true });
+    await writeFile(join(folder, file), text);
+    return join(folder, file);
+  }
+
+  const newState = (): LogState => ({ windows: new Map(), logins: [] });
+
+  it('reads every window and names each reading after its window\'s latest account line', async () => {
+    const root = await session();
+    await log(root, 'window1', [
+      `${stamp(time(23, 9))} [info] Logged in as leon-work\r\n`,
+      tokenLine(time(23, 9, 0, 1), 'leon-work'),
+      quotaLine(time(23, 9, 5), 26.6, 'processUserInfoQuotaSnapshot'),
+      `${stamp(time(23, 9, 6))} [debug] [ChatQuota] a different line\r\n`,
+      `${stamp(time(23, 9, 7))} [trace] [ChatQuota] refreshQuota: fetched up-to-date quota data\r\n`,
+      '  continuation of a multi-line message: Got Copilot token for someone-else\r\n',
+      `  ${stamp(time(23, 9, 8))} [info] Got Copilot token for quoted-in-a-message\r\n`,
+      `${stamp(time(23, 9, 9))} [trace] [ChatQuota] processQuotaHeaders: {"quota":"x"}\r\n`,
+      quotaLine(time(23, 10), 26.5),
+    ].join(''));
+    await log(root, 'window2', tokenLine(time(23, 9, 10), 'leon') + quotaLine(time(23, 9, 15), 26.6, 'processQuotaSnapshots'));
+    // The hooks channel shares the folder and is not Copilot Chat's log.
+    await log(root, 'window2', tokenLine(time(23, 9, 20), 'hooks'), 'GitHub Copilot Chat Hooks.log');
+    await mkdir(join(root, 'window3', 'exthost'), { recursive: true });
+    await writeFile(join(root, 'main.log'), tokenLine(time(23, 9), 'main'));
+
+    const state = newState();
+    expect(byTime(await readLogs(root, state))).toEqual([
+      { login: 'leon-work', reading: reading(time(23, 9, 5), 26.6) },
+      { login: 'leon', reading: reading(time(23, 9, 15), 26.6) },
+      { login: 'leon-work', reading: reading(time(23, 10), 26.5) },
+    ]);
+    expect([...state.logins].sort((a, b) => a.at - b.at))
+      .toEqual([{ at: time(23, 9, 0, 1), login: 'leon-work' }, { at: time(23, 9, 10), login: 'leon' }]);
   });
-  it.each([null, [], {}, { ...payload, percentRemaining: 101 }, { ...payload, quota: '1500' },
-    { ...payload, resetDate: 'bad' }])('rejects unsupported values %j', value => {
-    expect(parseCopilotQuota(value)).toBeUndefined();
+
+  it('reads only what a log gained, and waits for a line to end', async () => {
+    const root = await session();
+    const file = await log(root, 'window1', tokenLine(time(23, 9), 'leon-work') + quotaLine(time(23, 9, 1), 26.6));
+    const state = newState();
+    expect(await readLogs(root, state)).toHaveLength(1);
+    expect(await readLogs(root, state)).toEqual([]);
+    const half = quotaLine(time(23, 10), 26.5);
+    await appendFile(file, half.slice(0, 40));
+    expect(await readLogs(root, state)).toEqual([]);
+    await appendFile(file, half.slice(40) + quotaLine(time(23, 11), 26.4));
+    expect(await readLogs(root, state)).toEqual([
+      { login: 'leon-work', reading: reading(time(23, 10), 26.5) },
+      { login: 'leon-work', reading: reading(time(23, 11), 26.4) },
+    ]);
+  });
+
+  it('reads a log again from its start after it was emptied, keeping the window\'s account', async () => {
+    const root = await session();
+    const file = await log(root, 'window1', tokenLine(time(23, 9), 'leon-work') + quotaLine(time(23, 9, 1), 26.6));
+    const state = newState();
+    await readLogs(root, state);
+    await writeFile(file, quotaLine(time(23, 12), 26.3));
+    expect(await readLogs(root, state)).toEqual([{ login: 'leon-work', reading: reading(time(23, 12), 26.3) }]);
+  });
+
+  it('reads rotated copies first, oldest first, when it first sees a window', async () => {
+    const root = await session();
+    await log(root, 'window1', tokenLine(time(23, 8), 'leon-old') + quotaLine(time(23, 8, 5), 27), 'GitHub Copilot Chat.2.log');
+    await log(root, 'window1', tokenLine(time(23, 9), 'leon-work'), 'GitHub Copilot Chat.1.log');
+    await log(root, 'window1', quotaLine(time(23, 10), 26.5));
+    const state = newState();
+    expect(await readLogs(root, state)).toEqual([
+      { login: 'leon-old', reading: reading(time(23, 8, 5), 27) },
+      { login: 'leon-work', reading: reading(time(23, 10), 26.5) },
+    ]);
+    expect(await readLogs(root, state)).toEqual([]);
+  });
+
+  it('marks anonymous or unreadable accounts as none, and lowercases logins', async () => {
+    const root = await session();
+    const names = ['devDeviceId', 'DevDeviceID', '<unknown>', 'Leon Björklund', 'leon-', '', 'Leon_ACME'];
+    for (const [index, name] of names.entries()) {
+      // Each window names another account first, so a skipped line would leave that account in place.
+      await log(root, `window${index + 1}`,
+        tokenLine(time(23, 8), 'leon') + tokenLine(time(23, 9), name) + quotaLine(time(23, 9, index + 1), 26.6));
+    }
+    await log(root, 'window8', quotaLine(time(23, 9, 8), 26.6));
+    const found = byTime(await readLogs(root, newState()));
+    expect(found.map((entry) => entry.login)).toEqual([null, null, null, null, null, null, 'leon_acme', undefined]);
+  });
+
+  it('dates lines in local time and skips payloads that are not JSON', async () => {
+    const root = await session();
+    await log(root, 'window1', `${tokenLine(time(23, 9), 'leon-work')}${stamp(time(23, 9, 1))} [trace] [ChatQuota] processQuotaHeaders: {oops\n` +
+      quotaLine(time(23, 23, 59, 59, 999), 26.5).replace('\r\n', '\n'));
+    expect(await readLogs(root, newState())).toEqual([{ login: 'leon-work', reading: reading(time(23, 23, 59, 59, 999), 26.5) }]);
+  });
+
+  it('keeps each window\'s latest Trace line time and the log\'s modification time', async () => {
+    const root = await session();
+    const first = await log(root, 'window1', `${stamp(time(23, 9))} [info] Logged in as leon-work, not [trace]\r\n` +
+      `  ${stamp(time(23, 9, 1))} [trace] inside a multi-line message\r\n`);
+    const second = await log(root, 'window2', `${stamp(time(23, 9))} [trace] started\r\n` +
+      `${stamp(time(23, 9, 2))} [trace] detail\r\n${stamp(time(23, 9, 3))} [info] later\r\n`);
+    const state = newState();
+    await readLogs(root, state);
+    expect(state.windows.get('window1')?.traceAt).toBeUndefined();
+    expect(state.windows.get('window2')?.traceAt).toBe(time(23, 9, 2));
+    expect(state.windows.get('window2')?.modified).toBe((await stat(second)).mtimeMs);
+    await appendFile(first, `${stamp(time(23, 10))} [trace] now\r\n`);
+    await readLogs(root, state);
+    expect(state.windows.get('window1')?.traceAt).toBe(time(23, 10));
+    expect(state.windows.get('window1')?.modified).toBe((await stat(first)).mtimeMs);
+    await appendFile(second, `${stamp(time(23, 11))} [info] no Trace line in this read\r\n`);
+    await readLogs(root, state);
+    expect(state.windows.get('window2')?.traceAt).toBe(time(23, 9, 2));
+  });
+
+  it('stops at the end of a log that shrank while being read, and closes every file', async () => {
+    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    const root = await session();
+    const file = await log(root, 'window1', tokenLine(time(23, 9), 'leon-work') + quotaLine(time(23, 9, 1), 26.6));
+    const real = await actual.stat(file);
+    let open = 0;
+    vi.mocked(fsPromises.stat).mockResolvedValueOnce({ ...real, size: real.size + 100 } as Awaited<ReturnType<typeof actual.stat>>);
+    vi.mocked(fsPromises.open).mockImplementation(async (...args: Parameters<typeof actual.open>) => {
+      const handle = await actual.open(...args);
+      open++;
+      const close = handle.close.bind(handle);
+      handle.close = async () => { open--; return close(); };
+      return handle;
+    });
+    try {
+      expect(await readLogs(root, newState())).toEqual([{ login: 'leon-work', reading: reading(time(23, 9, 1), 26.6) }]);
+      expect(open).toBe(0);
+    } finally {
+      vi.mocked(fsPromises.open).mockImplementation(actual.open);
+    }
+  });
+
+  it('returns nothing for a missing session', async () => {
+    expect(await readLogs(join(await session(), 'gone'), newState())).toEqual([]);
+  });
+});
+
+describe('accounts', () => {
+  const logins = [{ at: time(23, 9), login: 'leon-work' }, { at: time(23, 12), login: 'leon' }, { at: time(23, 14), login: null }];
+
+  it('uses the window\'s account, and drops readings of no account', () => {
+    expect(assignAccounts([
+      { login: 'leon', reading: reading(time(23, 10), 26) },
+      { login: null, reading: reading(time(23, 10), 26) },
+    ], logins, 'saved')).toEqual([{ login: 'leon', reading: reading(time(23, 10), 26) }]);
+  });
+
+  it('falls back to the latest account line of any window before the reading, then the saved account', () => {
+    const lost = (at: number) => ({ reading: reading(at, 26) });
+    expect(assignAccounts([lost(time(23, 11)), lost(time(23, 12)), lost(time(23, 15)), lost(time(23, 8))], logins, 'saved'))
+      .toEqual([
+        { login: 'leon-work', reading: reading(time(23, 11), 26) },
+        { login: 'leon', reading: reading(time(23, 12), 26) },
+        { login: 'saved', reading: reading(time(23, 8), 26) },
+      ]);
+    expect(assignAccounts([lost(time(23, 8))], [], undefined)).toEqual([]);
+  });
+
+  it('takes the latest account line by time, whatever order the windows were read in', () => {
+    const outOfOrder = [{ at: time(23, 12), login: 'leon' }, { at: time(23, 9), login: 'leon-work' }];
+    expect(assignAccounts([{ reading: reading(time(23, 13), 26) }], outOfOrder, 'saved'))
+      .toEqual([{ login: 'leon', reading: reading(time(23, 13), 26) }]);
+  });
+
+  it('shows the account Copilot reported for last', () => {
+    expect(currentAccount({})).toBeUndefined();
+    expect(currentAccount({ a: [reading(time(23, 9), 20), reading(time(23, 11), 19)], b: [reading(time(23, 10), 50)] })).toBe('a');
+    expect(currentAccount({ a: [reading(time(23, 9), 20)], b: [reading(time(23, 10), 50)] })).toBe('b');
+  });
+});
+
+describe('saved record', () => {
+  const now = time(23, 12);
+
+  it('keeps each account\'s earliest reading and the last reading of each day', () => {
+    const records = addReadings({}, [
+      reading(time(21, 9), 30), reading(time(21, 18), 29), reading(time(22, 9), 28), reading(time(22, 23, 59), 27.5),
+      reading(time(23, 8), 27), reading(time(23, 11), 26.5),
+    ].map((entry) => ({ login: 'leon', reading: entry })), now);
+    expect(records.leon.map((entry) => entry.at)).toEqual([time(21, 9), time(21, 18), time(22, 23, 59), time(23, 11)]);
+  });
+
+  it('is unchanged when the same readings are added again', () => {
+    const added = [reading(time(22, 9), 28), reading(time(23, 8), 27), reading(time(23, 11), 26.5)]
+      .map((entry) => ({ login: 'leon', reading: entry }));
+    const records = addReadings({}, added, now);
+    expect(addReadings(records, added, now)).toEqual(records);
+    expect(addReadings(records, added.slice(1), now)).toEqual(records);
+  });
+
+  it('drops readings older than 35 days or stamped in the future, and accounts left empty', () => {
+    const records: Records = { old: [reading(time(18, 9, 0, 0, 0, 8), 50)], leon: [reading(time(19, 9, 0, 0, 0, 8), 40)] };
+    expect(addReadings(records, [{ login: 'leon', reading: reading(time(23, 13), 26) }], now)).toEqual({
+      leon: [reading(time(19, 9, 0, 0, 0, 8), 40)],
+    });
+  });
+
+  it('keeps accounts apart', () => {
+    const records = addReadings({}, [
+      { login: 'leon', reading: reading(time(23, 9), 26) },
+      { login: 'leon-work', reading: reading(time(23, 10), 60) },
+    ], now);
+    expect(records).toEqual({ leon: [reading(time(23, 9), 26)], 'leon-work': [reading(time(23, 10), 60)] });
+  });
+
+  it('loads saved readings and drops anything malformed', () => {
+    const records = addReadings({}, [
+      { login: 'leon', reading: reading(time(22, 9), 28) },
+      { login: 'leon', reading: reading(time(23, 9), 0, { additionalUsageUsed: 100 }) },
+    ], now);
+    expect(loadRecords(JSON.parse(JSON.stringify(records)))).toEqual(records);
+    expect(loadRecords(undefined)).toEqual({});
+    expect(loadRecords(null)).toEqual({});
+    expect(loadRecords('text')).toEqual({});
+    expect(loadRecords({ a: 'text', b: [null, 5, { at: 'soon', ...payload }], c: [] })).toEqual({});
+    expect(loadRecords({ a: [{ ...payload, at: 20 }, { ...payload, at: 10 }] }).a.map((entry) => entry.at)).toEqual([10, 20]);
+    expect(loadRecords(JSON.parse(`{"__proto__": [${JSON.stringify({ ...payload, at: 10 })}], "not valid": []}`))).toEqual({});
+    expect(loadRecords({ 'not valid': [{ ...payload, at: 10 }] })).toEqual({});
+  });
+
+  it('keeps a login that names an object property', () => {
+    const records = addReadings({}, [{ login: 'constructor', reading: reading(time(23, 9), 26) }], now);
+    expect(Object.keys(records)).toEqual(['constructor']);
+    expect(statusText(records, now)).toBe('0% • 74/100%');
+  });
+});
+
+describe('today and month', () => {
+  const now = time(23, 16);
+
+  it('reads today as the latest reading minus the last one before midnight', () => {
+    const readings = [reading(time(22, 9), 30), reading(time(22, 23), 26.6), reading(time(23, 10), 25), reading(time(23, 15), 23.5)];
+    expect(todayUsed(readings, now)).toBeCloseTo(3.1);
+    expect(monthUsed(readings, now)).toBeCloseTo(76.5);
+    expect(statusText({ leon: readings }, now)).toBe('3.1% • 76.5/100%');
+  });
+
+  it('counts a reading at midnight as today\'s', () => {
+    const readings = [reading(time(22, 23), 26.6), reading(time(23, 0), 25), reading(time(23, 15), 23.5)];
+    expect(statusText({ leon: readings }, now)).toBe('3.1% • 76.5/100%');
+  });
+
+  it('shows 0% today before Copilot reports today', () => {
+    expect(statusText({ leon: [reading(time(21, 9), 30), reading(time(22, 15), 23.5)] }, now)).toBe('0% • 76.5/100%');
+  });
+
+  it('folds days without a reading into today', () => {
+    const readings = [reading(time(20, 15), 35), reading(time(21, 15), 30), reading(time(23, 15), 23.5)];
+    expect(statusText({ leon: readings }, now)).toBe('6.5% • 76.5/100%');
+  });
+
+  it('counts from the first reading until an account has one before midnight', () => {
+    expect(statusText({ leon: [reading(time(23, 9), 26.6), reading(time(23, 15), 23.5)] }, now)).toBe('3.1% • 76.5/100%');
+    expect(statusText({ leon: [reading(time(23, 15), 23.5)] }, now)).toBe('0% • 76.5/100%');
+  });
+
+  it('shows spending past the allowance', () => {
+    const readings = [reading(time(22, 20), 1), reading(time(23, 15), 0, { additionalUsageUsed: 2560 })];
+    expect(statusText({ leon: readings }, now)).toBe('4.2% • 100/103.2%');
+    expect(statusText({ leon: [reading(time(22, 20), 0, { additionalUsageUsed: 800 }), readings[1]] }, now))
+      .toBe('2.2% • 100/103.2%');
+    expect(statusText({ leon: [reading(time(23, 15), 0)] }, now)).toBe('0% • 100/100%');
+  });
+
+  it('never shows a lower latest reading as negative', () => {
+    expect(statusText({ leon: [reading(time(22, 20), 23.5), reading(time(23, 15), 23.8)] }, now)).toBe('0% • 76.2/100%');
+  });
+
+  it('counts today from zero across the monthly reset', () => {
+    const readings = [reading(time(30, 10), 20), reading(time(1, 15, 0, 0, 0, 10), 98.5, { resetDate: '2026-11-01T00:00:00.000Z' })];
+    expect(statusText({ leon: readings }, time(1, 16, 0, 0, 0, 10))).toBe('1.5% • 1.5/100%');
+  });
+
+  it('shows zero once the reset passed and Copilot has not reported since', () => {
+    expect(statusText({ leon: [reading(time(29, 10), 30), reading(time(30, 10), 23.5)] }, time(2, 12, 0, 0, 0, 10)))
+      .toBe('0% • 0/100%');
+  });
+
+  it('shows zero today too once the reset passed and Copilot has not reported since', () => {
+    // A reset at local noon keeps the reset apart from local midnight in every time zone.
+    const resetDate = new Date(2026, 9, 1, 12).toISOString();
+    const readings = [reading(time(30, 23, 59), 30, { resetDate }), reading(time(1, 11, 59, 0, 0, 10), 28, { resetDate })];
+    expect(statusText({ leon: readings }, time(1, 12, 1, 0, 0, 10))).toBe('0% • 0/100%');
+  });
+
+  it('trusts a reading that still reports the old period after its reset date', () => {
+    const readings = [reading(time(30, 10), 23.5), reading(time(1, 15, 0, 0, 0, 10), 23.4)];
+    expect(statusText({ leon: readings }, time(1, 16, 0, 0, 0, 10))).toBe('0.1% • 76.6/100%');
+  });
+
+  it('does not take a changed reset date that has not passed for a reset', () => {
+    // Copilot invents a reset date a month ahead when the server sends none.
+    const readings = [reading(time(22, 20), 26.6, { resetDate: '2026-10-22T20:00:00.000Z' }),
+      reading(time(23, 15), 23.5, { resetDate: '2026-10-23T15:00:00.000Z' })];
+    expect(statusText({ leon: readings }, now)).toBe('3.1% • 76.5/100%');
+  });
+
+  it('reads a base without a reset date or allowance as the same period', () => {
+    const noReset = [reading(time(22, 20), 26.6, { resetDate: undefined }), reading(time(23, 15), 23.5)];
+    expect(statusText({ leon: noReset }, now)).toBe('3.1% • 76.5/100%');
+    const noAllowance = [reading(time(22, 20), 100, { quota: 0 }), reading(time(23, 15), 90)];
+    expect(statusText({ leon: noAllowance }, now)).toBe('10% • 10/100%');
+  });
+
+  it('shows the account Copilot reported for last', () => {
+    const records = { leon: [reading(time(22, 20), 51), reading(time(23, 15), 50)],
+      'leon-work': [reading(time(22, 20), 26.6), reading(time(23, 14), 23.5)] };
+    expect(statusText(records, now)).toBe('1% • 50/100%');
+  });
+
+  it('names unlimited and zero allowances and waits without a reading', () => {
+    expect(statusText({}, now)).toBe('Waiting for Copilot');
+    expect(statusText({}, now, true)).toBe('Restart to see Credit usage');
+    expect(statusText({ leon: [reading(time(22, 20), 26.6), reading(time(23, 15), 23.5)] }, now, true)).toBe('3.1% • 76.5/100%');
+    expect(statusText({ leon: [reading(time(23, 15), 100, { quota: -1, unlimited: true })] }, now)).toBe('Unlimited Copilot quota');
+    expect(statusText({ leon: [reading(time(23, 15), 100, { quota: 0, unlimited: true })] }, now)).toBe('Unlimited Copilot quota');
+    expect(statusText({ leon: [reading(time(23, 15), 0, { quota: 0 })] }, now)).toBe('No Copilot credit allowance');
+  });
+});
+
+describe('numbers', () => {
+  it.each([
+    [76.5, '76.5'], [76, '76'], [100 - 64.4, '35.6'], [76.5 - 73.4, '3.1'], [0.04, '0'], [0.05, '0.1'],
+    [103.2, '103.2'], [1100, '1\u00a0100'], [61200, '61\u00a0200'], [0, '0'],
+  ])('formats %s as %s', (value, text) => {
+    expect(formatNumber(value)).toBe(text);
   });
 });
