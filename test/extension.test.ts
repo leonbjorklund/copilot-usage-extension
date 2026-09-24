@@ -4,21 +4,24 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const { item, executeCommand, env } = vi.hoisted(() => {
+const { item, executeCommand, env, theme } = vi.hoisted(() => {
   let text = '';
+  let tooltip: unknown;
   return {
     item: {
-      /** Counts text assignments; each one redraws the status bar item. */
+      /** Counts text and tooltip assignments; each one sends the window an update. */
       sets: 0,
       get text() { return text; },
       set text(value: string) { text = value; this.sets++; },
-      tooltip: undefined as unknown,
+      get tooltip() { return tooltip; },
+      set tooltip(value: unknown) { tooltip = value; this.sets++; },
       command: undefined as unknown,
       show: vi.fn(),
       dispose: vi.fn(),
     },
     executeCommand: vi.fn(async (..._args: unknown[]) => undefined),
     env: { appRoot: '' },
+    theme: { kind: 2 },
   };
 });
 
@@ -29,7 +32,15 @@ vi.mock('vscode', () => ({
     constructor(private readonly callback: () => void) {}
     dispose() { this.callback(); }
   },
-  window: { createStatusBarItem: vi.fn(() => item) },
+  ColorThemeKind: { Light: 1, Dark: 2, HighContrast: 3, HighContrastLight: 4 },
+  MarkdownString: class {
+    supportHtml = false;
+    constructor(public value: string, public supportThemeIcons: boolean) {}
+  },
+  window: {
+    createStatusBarItem: vi.fn(() => item),
+    get activeColorTheme() { return { kind: theme.kind }; },
+  },
   commands: { executeCommand },
   env,
 }));
@@ -43,6 +54,7 @@ import * as fsPromises from 'node:fs/promises';
 import * as vscode from 'vscode';
 
 import { activate, enableTrace, hasCopilotLogLevel } from '../src/extension';
+import { DARK, hoverMarkdown, LIGHT } from '../src/hover';
 
 const RESET = '2026-10-01T00:00:00.000Z';
 const FAR_RESET = '2999-01-01T00:00:00.000Z';
@@ -56,7 +68,9 @@ afterEach(async () => {
   vi.unstubAllEnvs();
   vi.clearAllMocks();
   item.text = '';
+  item.tooltip = undefined;
   item.sets = 0;
+  theme.kind = 2;
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -127,23 +141,49 @@ const exists = (path: string) => access(path).then(() => true, () => false);
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe('status bar', () => {
-  it('shows the saved numbers at once, on the right, with no hover and no click', async () => {
+  it('shows the saved numbers and their hover at once, on the right, with no click', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date(2026, 8, 23, 16));
-    await start({ records: { leon: [
+    const records = { leon: [
       reading(new Date(2026, 8, 22, 23).getTime(), 26.6), reading(new Date(2026, 8, 23, 15).getTime(), 23.5),
-    ] } });
+    ] };
+    await start({ records });
     expect(item.text).toBe('3.1% • 76.5/100%');
     expect(vscode.window.createStatusBarItem).toHaveBeenCalledWith(vscode.StatusBarAlignment.Right, 100.05);
     expect(item.show).toHaveBeenCalled();
-    expect(item.tooltip).toBeUndefined();
+    expect(item.tooltip).toEqual({ value: hoverMarkdown(records, Date.now(), DARK), supportThemeIcons: true, supportHtml: true });
     expect(item.command).toBeUndefined();
   });
 
-  it('waits for Copilot on a fresh install', async () => {
+  it('draws the graph in light colors for light themes, and follows a theme change', WAIT, async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date(2026, 8, 23, 16));
+    const records = { leon: [reading(new Date(2026, 8, 23, 15).getTime(), 23.5)] };
+    const hover = () => (item.tooltip as { value: string }).value;
+    theme.kind = 4;
+    await start({ records });
+    expect(hover()).toBe(hoverMarkdown(records, Date.now(), LIGHT));
+    theme.kind = 3;
+    await vi.waitFor(() => expect(hover()).toBe(hoverMarkdown(records, Date.now(), DARK)), { timeout: 5000 });
+    theme.kind = 1;
+    await vi.waitFor(() => expect(hover()).toBe(hoverMarkdown(records, Date.now(), LIGHT)), { timeout: 5000 });
+  });
+
+  it('waits for Copilot on a fresh install, without a hover', async () => {
     await start();
     await pause(300);
     expect(item.text).toBe('Waiting for Copilot');
+    expect(item.tooltip).toBeUndefined();
+  });
+
+  it('removes the hover once every saved reading is older than 35 days', WAIT, async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date(2026, 8, 23, 16));
+    await start({ records: { leon: [reading(new Date(2026, 8, 23, 15).getTime(), 23.5)] } });
+    expect(item.tooltip).toBeDefined();
+    vi.setSystemTime(new Date(2026, 9, 30, 16));
+    await vi.waitFor(() => expect(item.text).toBe('Waiting for Copilot'), { timeout: 5000 });
+    expect(item.tooltip).toBeUndefined();
   });
 
   it("asks for a restart while this window's Copilot Chat channel writes no Trace lines", WAIT, async () => {

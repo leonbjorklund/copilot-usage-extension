@@ -4,6 +4,7 @@ import { basename, dirname, join } from 'node:path';
 
 import * as vscode from 'vscode';
 
+import { DARK, hoverMarkdown, LIGHT } from './hover';
 import {
   addReadings, assignAccounts, currentAccount, loadRecords, readLogs, statusText, type LogState,
 } from './quota';
@@ -35,9 +36,18 @@ export function activate(context: vscode.ExtensionContext): void {
   // Copilot's own item sits right of the language mode (100.1); this lands directly right of it.
   const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100.05);
   const render = () => {
+    const now = Date.now();
     const needsRestart = !switched && ownLogWritten() && (logs.windows.get(windowName)!.traceAt ?? 0) < hostStart;
-    const text = statusText(records, Date.now(), needsRestart);
+    const text = statusText(records, now, needsRestart);
     if (item.text !== text) item.text = text;
+    const kind = vscode.window.activeColorTheme.kind;
+    const light = kind === vscode.ColorThemeKind.Light || kind === vscode.ColorThemeKind.HighContrastLight;
+    const markdown = hoverMarkdown(records, now, light ? LIGHT : DARK);
+    // Each assignment sends the window an update, so only a changed hover is sent.
+    if ((item.tooltip as vscode.MarkdownString | undefined)?.value !== markdown) {
+      item.tooltip = markdown === undefined ? undefined
+        : Object.assign(new vscode.MarkdownString(markdown, true), { supportHtml: true });
+    }
   };
   render();
   item.show();

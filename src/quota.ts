@@ -13,7 +13,10 @@ export interface Reading {
   unlimited: boolean;
 }
 
-/** Per account: its earliest reading and the last reading of each local day, oldest first. */
+/**
+ * Per account, oldest first: its earliest reading, or the newest one older than 35 days, then the
+ * last reading of each local day.
+ */
 export type Records = { [login: string]: Reading[] };
 
 /**
@@ -171,7 +174,8 @@ function localDay(at: number, offset = 0): number {
 }
 
 /**
- * Keeps each account's earliest reading and the last reading of each local day, for 35 days.
+ * Keeps each account's earliest reading and the last reading of each local day, for 35 days,
+ * plus the newest older reading while newer ones remain, since the oldest day kept counts from it.
  * Readings stamped later than `now` are dropped, since they would stay the latest.
  */
 export function addReadings(records: Records, added: Array<{ login: string; reading: Reading }>, now: number): Records {
@@ -179,10 +183,12 @@ export function addReadings(records: Records, added: Array<{ login: string; read
   const next: Records = {};
   for (const login of new Set([...Object.keys(records), ...added.map((entry) => entry.login)])) {
     const saved = Object.hasOwn(records, login) ? records[login] : [];
-    const all = [...saved, ...added.filter((entry) => entry.login === login).map((entry) => entry.reading)]
-      .filter((reading) => reading.at >= cutoff && reading.at <= now)
+    const readings = [...saved, ...added.filter((entry) => entry.login === login).map((entry) => entry.reading)]
+      .filter((reading) => reading.at <= now)
       .sort((a, b) => a.at - b.at)
       .filter((reading, index, sorted) => index === 0 || reading.at !== sorted[index - 1].at);
+    const recent = readings.findIndex((reading) => reading.at >= cutoff);
+    const all = recent < 0 ? [] : readings.slice(Math.max(0, recent - 1));
     const kept = all.filter((reading, index) =>
       index === 0 || index === all.length - 1 || localDay(reading.at) !== localDay(all[index + 1].at));
     if (kept.length) next[login] = kept;
@@ -222,19 +228,48 @@ function newPeriod(earlier: Reading, later: Reading): boolean {
   return later.resetDate !== earlier.resetDate && later.at >= resetAt(earlier);
 }
 
+/**
+ * The local day's last reading minus the last one before that day, counting from zero across a
+ * reset; `undefined` before the account's first reading.
+ */
+function usedOn(readings: Reading[], day: number): number | undefined {
+  const latest = readings.filter((reading) => reading.at < localDay(day, 1)).at(-1);
+  if (!latest) return;
+  // Until an account has a reading before the day, the day counts from its first reading.
+  const base = readings.filter((reading) => reading.at < day).at(-1) ?? readings[0];
+  return Math.max(0, used(latest) - (newPeriod(base, latest) ? 0 : used(base)));
+}
+
 /** The latest reading minus the last one before local midnight, counting from zero across a reset. */
 export function todayUsed(readings: Reading[], now: number): number {
   const latest = readings.at(-1);
-  if (!latest || expired(latest, now)) return 0;
-  const midnight = localDay(now);
-  // Until an account has a reading before midnight, today counts from its first reading.
-  const base = readings.filter((reading) => reading.at < midnight).at(-1) ?? readings[0];
-  return Math.max(0, used(latest) - (newPeriod(base, latest) ? 0 : used(base)));
+  return !latest || expired(latest, now) ? 0 : usedOn(readings, localDay(now)) ?? 0;
+}
+
+/** Each of the last 30 local days, oldest first, with its use; today's matches `todayUsed`. */
+export function dailyUsed(readings: Reading[], now: number): Array<{ day: number; used?: number }> {
+  const today = localDay(now);
+  return Array.from({ length: 30 }, (_, index) => {
+    const day = localDay(now, index - 29);
+    return { day, used: day === today ? todayUsed(readings, now) : usedOn(readings, day) };
+  });
 }
 
 export function monthUsed(readings: Reading[], now: number): number {
   const latest = readings.at(-1);
   return !latest || expired(latest, now) ? 0 : used(latest);
+}
+
+/**
+ * The share used by the reset if the average use so far continues, projected from the reading's
+ * own time. Only a reset at the start of the next UTC month marks a known period.
+ */
+export function monthlyPace(reading: Reading, now: number): number | undefined {
+  const observed = new Date(reading.at);
+  const start = Date.UTC(observed.getUTCFullYear(), observed.getUTCMonth(), 1);
+  const end = Date.UTC(observed.getUTCFullYear(), observed.getUTCMonth() + 1, 1);
+  if (resetAt(reading) !== end || reading.at <= start || now >= end) return;
+  return used(reading) * (end - start) / (reading.at - start);
 }
 
 /** At most one decimal without a trailing zero, and a non-breaking space between thousands. */

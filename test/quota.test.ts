@@ -12,8 +12,8 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 import * as fsPromises from 'node:fs/promises';
 
 import {
-  addReadings, assignAccounts, currentAccount, formatNumber, loadRecords, monthUsed, readLogs, statusText, todayUsed,
-  toReading, type Found, type LogState, type Reading, type Records,
+  addReadings, assignAccounts, currentAccount, dailyUsed, formatNumber, loadRecords, monthlyPace, monthUsed, readLogs, statusText,
+  todayUsed, toReading, type Found, type LogState, type Reading, type Records,
 } from '../src/quota';
 
 const RESET = '2026-10-01T00:00:00.000Z';
@@ -300,6 +300,15 @@ describe('saved record', () => {
     });
   });
 
+  it('keeps the newest reading older than 35 days while newer ones remain, since the oldest day counts from it', () => {
+    const later = time(16, 12);
+    const added = [reading(time(5, 9, 0, 0, 0, 8), 95), reading(time(10, 9, 0, 0, 0, 8), 90), reading(time(21, 9, 0, 0, 0, 8), 80)]
+      .map((entry) => ({ login: 'leon', reading: entry }));
+    const records = addReadings({}, added, later);
+    expect(records.leon.map((entry) => entry.at)).toEqual([time(10, 9, 0, 0, 0, 8), time(21, 9, 0, 0, 0, 8)]);
+    expect(dailyUsed(records.leon, later).find((entry) => entry.day === time(21, 0, 0, 0, 0, 8))?.used).toBe(10);
+  });
+
   it('keeps accounts apart', () => {
     const records = addReadings({}, [
       { login: 'leon', reading: reading(time(23, 9), 26) },
@@ -343,6 +352,7 @@ describe('today and month', () => {
   it('counts a reading at midnight as today\'s', () => {
     const readings = [reading(time(22, 23), 26.6), reading(time(23, 0), 25), reading(time(23, 15), 23.5)];
     expect(statusText({ leon: readings }, now)).toBe('3.1% • 76.5/100%');
+    expect(dailyUsed(readings, now).slice(-2).map((entry) => entry.used)).toEqual([0, expect.closeTo(3.1)]);
   });
 
   it('shows 0% today before Copilot reports today', () => {
@@ -420,6 +430,44 @@ describe('today and month', () => {
     expect(statusText({ leon: [reading(time(23, 15), 100, { quota: -1, unlimited: true })] }, now)).toBe('Unlimited Copilot quota');
     expect(statusText({ leon: [reading(time(23, 15), 100, { quota: 0, unlimited: true })] }, now)).toBe('Unlimited Copilot quota');
     expect(statusText({ leon: [reading(time(23, 15), 0, { quota: 0 })] }, now)).toBe('No Copilot credit allowance');
+  });
+});
+
+describe('days', () => {
+  it('gives each of the last 30 days its last reading minus the one before, nothing before the first reading', () => {
+    const readings = [reading(time(20, 9), 40), reading(time(20, 18), 38), reading(time(22, 23), 30), reading(time(23, 15), 26)];
+    const days = dailyUsed(readings, time(23, 16));
+    expect(days).toHaveLength(30);
+    expect(days[0].day).toBe(time(25, 0, 0, 0, 0, 8));
+    expect(days.slice(25).map((entry) => [new Date(entry.day).getDate(), entry.used])).toEqual([
+      [19, undefined], [20, 2], [21, 0], [22, 8], [23, 4],
+    ]);
+  });
+
+  it('counts a day from zero across the monthly reset, and today as zero once the reset passed unreported', () => {
+    const resetDate = new Date(2026, 9, 1, 12).toISOString();
+    const readings = [reading(time(29, 20), 50, { resetDate }), reading(time(30, 20), 40, { resetDate }),
+      reading(time(1, 15, 0, 0, 0, 10), 97, { resetDate: '2026-11-01T00:00:00.000Z' })];
+    expect(dailyUsed(readings, time(1, 16, 0, 0, 0, 10)).slice(-2).map((entry) => entry.used)).toEqual([10, 3]);
+    const unreported = [reading(time(30, 20), 40, { resetDate }), reading(time(1, 11, 0, 0, 0, 10), 38, { resetDate })];
+    expect(dailyUsed(unreported, time(1, 16, 0, 0, 0, 10)).slice(-2).map((entry) => entry.used)).toEqual([0, 0]);
+  });
+});
+
+describe('monthly pace', () => {
+  const at = Date.UTC(2026, 8, 16);
+
+  it("projects the share used so far over the whole month, at the reading's time", () => {
+    // Half of September has passed, so 30% used projects to 60%.
+    expect(monthlyPace(reading(at, 70), Date.UTC(2026, 8, 20))).toBeCloseTo(60);
+    expect(monthlyPace(reading(at, 0, { additionalUsageUsed: 8000 }), at)).toBeCloseTo(220);
+  });
+
+  it("has no pace without a reset at the start of next UTC month, or outside the reading's month", () => {
+    expect(monthlyPace(reading(at, 70, { resetDate: undefined }), at)).toBeUndefined();
+    expect(monthlyPace(reading(at, 70, { resetDate: '2026-10-16T00:00:00.000Z' }), at)).toBeUndefined();
+    expect(monthlyPace(reading(Date.UTC(2026, 8, 1), 100), Date.UTC(2026, 8, 2))).toBeUndefined();
+    expect(monthlyPace(reading(at, 70), Date.UTC(2026, 9, 1))).toBeUndefined();
   });
 });
 
