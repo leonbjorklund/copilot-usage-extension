@@ -230,18 +230,22 @@ describe('saved tally', () => {
 });
 
 describe('top models', () => {
-  it('lists the 3 models with the most credits, their chats and share', () => {
+  it('lists the 5 models with the most credits, their chats and share', () => {
     const tally = emptyTally(now);
     const spend: Array<[string, string, number]> = [['a', 'opus', 60], ['b', 'opus', 20], ['a', 'astra', 12.6], ['c', 'luna', 1.4],
-      ['d', 'luna', 1], ['e', 'luna', 2], ['c', 'grok', 3]];
+      ['d', 'luna', 1], ['e', 'luna', 2], ['c', 'grok', 2], ['f', 'sonnet', 0.6], ['g', 'haiku', 0.4]];
     for (const [index, [chat, model, credits]] of spend.entries()) addRequest(tally, chat, request(model, credits, at(23, 10 + index)));
     expect(topModels(tally)).toEqual([
       { model: 'opus', chats: 2, share: 80 }, { model: 'astra', chats: 1, share: expect.closeTo(12.6) },
-      { model: 'luna', chats: 3, share: expect.closeTo(4.4) },
+      { model: 'luna', chats: 3, share: expect.closeTo(4.4) }, { model: 'grok', chats: 1, share: expect.closeTo(2) },
+      { model: 'sonnet', chats: 1, share: expect.closeTo(0.6) },
     ]);
   });
 
-  it('lists nothing before any request', () => {
+  it('lists only the models used, and nothing before any request', () => {
     expect(topModels(emptyTally(now))).toEqual([]);
+    const tally = emptyTally(now);
+    addRequest(tally, 'a', request('opus', 4));
+    expect(topModels(tally)).toEqual([{ model: 'opus', chats: 1, share: 100 }]);
   });
 });
