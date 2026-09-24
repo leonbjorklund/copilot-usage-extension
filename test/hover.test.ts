@@ -95,7 +95,7 @@ describe('model use', () => {
     '<tr><td colspan="2"><strong>Model use this month</strong></td></tr>',
     '<tr><td>1. claude-opus-5.5</td><td align="right">1\u00a0310 sessions · 94%</td></tr>',
     '<tr><td>2. gpt-6-luna</td><td align="right">1 session · 3%</td></tr>',
-    '<tr><td>3. &lt;b&gt;x&amp;y&lt;/b&gt;</td><td align="right">7 sessions · &lt;0.1%</td></tr>',
+    '<tr><td>3. &lt;b&gt;x&amp;y&lt;/b&gt;</td><td align="right">7 sessions · 0%</td></tr>',
     '</table>',
   ].join('\n');
 
@@ -138,11 +138,11 @@ describe('graph', () => {
     expect(svg(bars[21])).not.toContain('rx="1"');
   });
 
-  it('labels a tiny day past the allowance below 0.1%', () => {
+  it('still draws a tiny day past the allowance, labeled 0%', () => {
     const readings = [reading(time(22, 20), 0, { additionalUsageUsed: 2560 }), reading(time(23, 15), 0, { additionalUsageUsed: 2590 })];
     const bars = images(hoverMarkdown({ leon: readings }, now, DARK, [])!);
-    expect(bars[29]).toContain('title="23 Sep · &lt;0.1%"');
-    expect(hoverMarkdown({ leon: readings }, now, DARK, [])).toContain('<strong>Today:</strong> &lt;0.1%&nbsp;&nbsp;(30)');
+    expect(bars[29]).toContain('title="23 Sep · 0%"');
+    expect(hoverMarkdown({ leon: readings }, now, DARK, [])).toContain('<strong>Today:</strong> 0%&nbsp;&nbsp;(30)');
     expect(svg(bars[29])).toContain('height="24" rx="1"');
   });
 

@@ -57,7 +57,7 @@ function quota(login: string, readings: Reading[], now: number, palette: Palette
     : `${formatNumber(month)}% / 100%  (${credits(month)} / ${allowance} credits)`;
   const pace = monthlyPace(latest, now);
   return [
-    table([`<tr><td><strong>Today:</strong> ${nbsp(`${percent(today)}  (${credits(today)})`)}</td>` +
+    table([`<tr><td><strong>Today:</strong> ${nbsp(`${formatNumber(today)}%  (${credits(today)})`)}</td>` +
       `<td align="right">${account}</td></tr>`]),
     table([
       `<tr><td><strong>Month:</strong> ${nbsp(period)}</td><td align="right">&nbsp;&nbsp;` +
@@ -71,7 +71,7 @@ function modelTable(models: Array<{ model: string; chats: number; share: number 
   return table([
     '<tr><td colspan="2"><strong>Model use this month</strong></td></tr>',
     ...models.map(({ model, chats, share }, index) => `<tr><td>${index + 1}. ${escapeHtml(model)}</td>` +
-      `<td align="right">${formatNumber(chats)} ${chats === 1 ? 'session' : 'sessions'} · ${percent(share)}</td></tr>`),
+      `<td align="right">${formatNumber(chats)} ${chats === 1 ? 'session' : 'sessions'} · ${formatNumber(share)}%</td></tr>`),
   ]);
 }
 
@@ -97,7 +97,7 @@ function graphRows(days: Array<{ day: number; used?: number }>, palette: Palette
   const scale = Math.max(...days.map((day) => day.used ?? 0));
   const currentMonth = new Date(days.at(-1)!.day).getMonth();
   const images = days.map(({ day, used }) => {
-    const label = `${formatDate(day)} · ${used === undefined ? 'Not tracked' : percent(used)}`;
+    const label = `${formatDate(day)} · ${used === undefined ? 'Not tracked' : `${formatNumber(used)}%`}`;
     const height = used === undefined || used <= 0 ? 0
       : Math.max(1, Math.round((used / scale) ** HEIGHT_EXPONENT * BAR_AREA_HEIGHT));
     const color = new Date(day).getMonth() === currentMonth ? palette.bright : palette.dim;
@@ -108,11 +108,6 @@ function graphRows(days: Array<{ day: number; used?: number }>, palette: Palette
     `<tr><td colspan="2" align="center">${images}</td></tr>`,
     `<tr><td>${muted(formatDate(days[0].day))}</td><td align="right">${muted(formatDate(days.at(-1)!.day))}</td></tr>`,
   ];
-}
-
-/** A tiny positive day keeps its bar, so it must not read 0%. */
-function percent(used: number): string {
-  return used > 0 && used < 0.05 ? '&lt;0.1%' : `${formatNumber(used)}%`;
 }
 
 function formatDate(day: number): string {
