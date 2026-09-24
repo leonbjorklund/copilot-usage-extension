@@ -5,9 +5,8 @@
     "lib": [
       "ES2022"
     ],
-    "outDir": "out",
+    "noEmit": true,
     "rootDir": "src",
-    "sourceMap": true,
     "strict": true,
     "esModuleInterop": true,
     "types": [
@@ -19,7 +18,6 @@
     "src/**/*.ts"
   ],
   "exclude": [
-    "node_modules",
-    "out"
+    "node_modules"
   ]
 }

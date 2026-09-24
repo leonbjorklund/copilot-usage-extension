@@ -76,7 +76,7 @@ export function activate(context: vscode.ExtensionContext): void {
       // this extension host's channel has written to the log.
       if (!traceChecked && ownLogWritten()) {
         traceChecked = true;
-        void enableTrace().then((ran) => { switched = ran; });
+        switched = await enableTrace();
       }
       const next = addReadings(records, assignAccounts(found, logs.logins, currentAccount(records)), Date.now());
       if (JSON.stringify(next) !== JSON.stringify(records)) {

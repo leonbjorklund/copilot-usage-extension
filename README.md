@@ -32,6 +32,6 @@ Model use comes from Copilot's debug logs, which record each request's model and
 Copilot Credits turns both logs on without a prompt:
 
 - Copilot Chat's default log level becomes Trace. VS Code saves it in `argv.json`.
-- `github.copilot.chat.agentDebugLog.fileLogging.enabled` becomes true in your user settings.
+- `github.copilot.chat.agentDebugLog.fileLogging.enabled` becomes true in your user settings, which Settings Sync copies to your other machines.
 
 A value you already set yourself stays as you set it, so setting the debug log setting to false keeps it off. Uninstalling leaves both in place. To undo them after uninstalling, run **Preferences: Configure Runtime Arguments** and remove `github.copilot-chat=trace` from `log-level`, then remove the setting from your user settings.

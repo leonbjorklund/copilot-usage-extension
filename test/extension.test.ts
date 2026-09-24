@@ -380,6 +380,8 @@ describe('Trace setup', () => {
     await writeFile(log, line('[info] started'));
     await vi.waitFor(() => expect(executeCommand).toHaveBeenCalledExactlyOnceWith(
       'workbench.action.setDefaultLogLevel', 1, 'github.copilot-chat'), { timeout: 5000 });
+    // The window that switched shows no restart prompt, not even until its next poll.
+    await vi.waitFor(() => expect(item.text).toBe('Waiting for Copilot'), { timeout: 500 });
     await pause(2500);
     expect(executeCommand).toHaveBeenCalledOnce();
     expect(item.text).toBe('Waiting for Copilot');
