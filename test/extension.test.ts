@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-const { item, executeCommand, env, theme } = vi.hoisted(() => {
+const { item, executeCommand, env, theme, configuration } = vi.hoisted(() => {
   let text = '';
   let tooltip: unknown;
   return {
@@ -22,6 +22,10 @@ const { item, executeCommand, env, theme } = vi.hoisted(() => {
     executeCommand: vi.fn(async (..._args: unknown[]) => undefined),
     env: { appRoot: '' },
     theme: { kind: 2 },
+    configuration: {
+      inspect: vi.fn((_key: string): { globalValue?: boolean } | undefined => ({})),
+      update: vi.fn(async (..._args: unknown[]) => undefined),
+    },
   };
 });
 
@@ -42,6 +46,8 @@ vi.mock('vscode', () => ({
     get activeColorTheme() { return { kind: theme.kind }; },
   },
   commands: { executeCommand },
+  workspace: { getConfiguration: vi.fn(() => configuration) },
+  ConfigurationTarget: { Global: 1 },
   env,
 }));
 
@@ -53,7 +59,7 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 import * as fsPromises from 'node:fs/promises';
 import * as vscode from 'vscode';
 
-import { activate, enableTrace, hasCopilotLogLevel } from '../src/extension';
+import { activate, enableDebugLog, enableTrace, hasCopilotLogLevel } from '../src/extension';
 import { DARK, hoverMarkdown, LIGHT } from '../src/hover';
 
 const RESET = '2026-10-01T00:00:00.000Z';
@@ -89,10 +95,18 @@ interface Start {
   argv?: string;
   storage?: string;
   state?: { [key: string]: unknown };
+  /** Chats' debug logs, by their path under the VS Code user folder. */
+  debugLogs?: { [path: string]: string };
+  /** The profile folder under the VS Code user folder, like `profiles/builtin/agents`. */
+  profile?: string;
 }
 
 async function start(options: Start = {}) {
   const root = await folder();
+  for (const [path, text] of Object.entries(options.debugLogs ?? {})) {
+    await mkdir(join(root, 'User', path, '..'), { recursive: true });
+    await writeFile(join(root, 'User', path), text);
+  }
   const session = join(root, 'logs', '20260923T093308');
   const copilot = join(session, 'window1', 'exthost', 'GitHub.copilot-chat');
   const log = join(copilot, 'GitHub Copilot Chat.log');
@@ -106,7 +120,8 @@ async function start(options: Start = {}) {
   if (options.records) state.set('records', options.records);
   const context = {
     subscriptions: [] as Array<{ dispose(): void }>,
-    globalStorageUri: { fsPath: options.storage ?? join(root, 'globalStorage') },
+    globalStorageUri: { fsPath: options.storage ??
+      join(root, 'User', options.profile ?? '', 'globalStorage', 'leonbjorklund.copilot-usage-extension') },
     logUri: { fsPath: join(session, 'window1', 'exthost', 'leonbjorklund.copilot-usage-extension') },
     globalState: {
       get: (key: string) => state.get(key),
@@ -118,7 +133,7 @@ async function start(options: Start = {}) {
   };
   contexts.push(context);
   activate(context as unknown as vscode.ExtensionContext);
-  return { state, log, context };
+  return { state, log, context, root };
 }
 
 function reading(at: number, percentRemaining: number, resetDate = RESET) {
@@ -151,7 +166,7 @@ describe('status bar', () => {
     expect(item.text).toBe('3.1% • 76.5/100%');
     expect(vscode.window.createStatusBarItem).toHaveBeenCalledWith(vscode.StatusBarAlignment.Right, 100.05);
     expect(item.show).toHaveBeenCalled();
-    expect(item.tooltip).toEqual({ value: hoverMarkdown(records, Date.now(), DARK), supportThemeIcons: true, supportHtml: true });
+    expect(item.tooltip).toEqual({ value: hoverMarkdown(records, Date.now(), DARK, []), supportThemeIcons: true, supportHtml: true });
     expect(item.command).toBeUndefined();
   });
 
@@ -162,11 +177,11 @@ describe('status bar', () => {
     const hover = () => (item.tooltip as { value: string }).value;
     theme.kind = 4;
     await start({ records });
-    expect(hover()).toBe(hoverMarkdown(records, Date.now(), LIGHT));
+    expect(hover()).toBe(hoverMarkdown(records, Date.now(), LIGHT, []));
     theme.kind = 3;
-    await vi.waitFor(() => expect(hover()).toBe(hoverMarkdown(records, Date.now(), DARK)), { timeout: 5000 });
+    await vi.waitFor(() => expect(hover()).toBe(hoverMarkdown(records, Date.now(), DARK, [])), { timeout: 5000 });
     theme.kind = 1;
-    await vi.waitFor(() => expect(hover()).toBe(hoverMarkdown(records, Date.now(), LIGHT)), { timeout: 5000 });
+    await vi.waitFor(() => expect(hover()).toBe(hoverMarkdown(records, Date.now(), LIGHT, [])), { timeout: 5000 });
   });
 
   it('waits for Copilot on a fresh install, without a hover', async () => {
@@ -384,5 +399,65 @@ describe('Trace setup', () => {
     expect(hasCopilotLogLevel('{ "enable-proposed-api": ["GitHub.copilot-chat"] }')).toBe(false);
     expect(hasCopilotLogLevel('{ "log-level": ["github.copilot-chat="] }')).toBe(false);
     expect(hasCopilotLogLevel('')).toBe(false);
+  });
+});
+
+describe('model use', () => {
+  const request = (credits: number, model = 'claude-opus-5') => `${JSON.stringify({ ts: Date.now(), spanId: '0000000000000001',
+    type: 'llm_request', attrs: { model, copilotUsageNanoAiu: credits * 1e9 } })}\n`;
+  const hover = () => (item.tooltip as { value: string } | undefined)?.value ?? '';
+  const chat = (name: string) => join('workspaceStorage', 'abc', 'GitHub.copilot-chat', 'debug-logs', name, 'main.jsonl');
+
+  it("turns on Copilot's debug logs unless the user set that setting", async () => {
+    await enableDebugLog();
+    expect(vscode.workspace.getConfiguration).toHaveBeenCalledWith('github.copilot.chat');
+    expect(configuration.update).toHaveBeenCalledExactlyOnceWith('agentDebugLog.fileLogging.enabled', true, 1);
+    expect(configuration.inspect).toHaveBeenCalledWith('agentDebugLog.fileLogging.enabled');
+    for (const globalValue of [false, true]) {
+      configuration.update.mockClear();
+      configuration.inspect.mockReturnValueOnce({ globalValue });
+      await enableDebugLog();
+      expect(configuration.update).not.toHaveBeenCalled();
+    }
+    configuration.update.mockRejectedValueOnce(new Error('settings.json has errors'));
+    await expect(enableDebugLog()).resolves.toBeUndefined();
+  });
+
+  it('counts debug-log requests into a saved tally that a restart shows at once', WAIT, async () => {
+    const records = { leon: [reading(Date.now() - 1000, 23.5)] };
+    const first = await start({ records, debugLogs: { [chat('a')]: request(4) } });
+    expect(configuration.update).toHaveBeenCalledWith('agentDebugLog.fileLogging.enabled', true, 1);
+    const section = '<tr><td>1. claude-opus-5</td><td align="right">1 session · 100%</td></tr>';
+    await vi.waitFor(() => expect(hover()).toContain(section), { timeout: 5000 });
+    const saved = first.state.get('models');
+    for (const subscription of first.context.subscriptions) subscription.dispose();
+    item.tooltip = undefined;
+    await start({ records, state: { models: JSON.parse(JSON.stringify(saved)) } });
+    expect((item.tooltip as { value: string }).value).toContain(section);
+  });
+
+  it('finds every folder\'s chats from another profile, and that profile\'s chats without a folder', WAIT, async () => {
+    const profile = join('profiles', 'builtin', 'agents');
+    await start({ records: { leon: [reading(Date.now() - 1000, 23.5)] }, profile, debugLogs: {
+      [chat('a')]: request(4),
+      [join(profile, 'globalStorage', 'github.copilot-chat', 'debug-logs', 'b', 'main.jsonl')]: request(1, 'gpt-6-astra'),
+    } });
+    await vi.waitFor(() => expect(hover()).toContain('<tr><td>1. claude-opus-5</td><td align="right">1 session · 80%</td></tr>'),
+      { timeout: 5000 });
+    expect(hover()).toContain('<tr><td>2. gpt-6-astra</td><td align="right">1 session · 20%</td></tr>');
+  });
+
+  it('reads new debug-log lines every 10 seconds, and keeps polling after a failed save', { timeout: 30_000 }, async () => {
+    const { root, log, context } = await start({ logs: line('[info] Got Copilot token for leon-work') + quota(26.6),
+      debugLogs: { [chat('a')]: request(4) } });
+    context.globalState.update.mockImplementation(async (key: string) => {
+      if (key === 'models') throw new Error('storage closed');
+    });
+    await vi.waitFor(() => expect(hover()).toContain('1. claude-opus-5'), { timeout: 5000 });
+    await mkdir(join(root, 'User', chat('b'), '..'), { recursive: true });
+    await writeFile(join(root, 'User', chat('b')), request(4, 'gpt-6-astra'));
+    await appendFile(log, quota(26.5));
+    await vi.waitFor(() => expect(item.text).toBe('0.1% • 73.5/100%'), { timeout: 5000 });
+    await vi.waitFor(() => expect(hover()).toContain('2. gpt-6-astra'), { timeout: 15_000 });
   });
 });

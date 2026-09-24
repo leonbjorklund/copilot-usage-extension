@@ -22,7 +22,7 @@ describe('hover', () => {
       leon: [reading(time(20, 9), 60)],
       'leon-work': [reading(time(22, 23), 26.6), reading(time(23, 15), 23.5)],
     };
-    const markdown = hoverMarkdown(records, now, DARK)!;
+    const markdown = hoverMarkdown(records, now, DARK, [])!;
     const lines = markdown.split('\n');
     expect(lines.slice(0, 7)).toEqual([
       '<table width="100%">',
@@ -48,36 +48,65 @@ describe('hover', () => {
 
   it('shows spending past the allowance with the allowance first', () => {
     const markdown = hoverMarkdown({ leon: [reading(time(22, 20), 1), reading(time(23, 15), 0, { additionalUsageUsed: 2560 })] },
-      now, DARK)!;
+      now, DARK, [])!;
     expect(markdown).toContain('<strong>Today:</strong> 4.2%&nbsp;&nbsp;(3\u00a0360)');
     expect(markdown).toContain('<strong>Month:</strong> 100%&nbsp;/&nbsp;103.2%&nbsp;&nbsp;' +
       '(80\u00a0000&nbsp;/&nbsp;82\u00a0560&nbsp;credits)');
   });
 
   it('keeps the used share first until the allowance is spent', () => {
-    expect(hoverMarkdown({ leon: [reading(time(23, 15), 0.5)] }, now, DARK))
+    expect(hoverMarkdown({ leon: [reading(time(23, 15), 0.5)] }, now, DARK, []))
       .toContain('<strong>Month:</strong> 99.5%&nbsp;/&nbsp;100%&nbsp;&nbsp;');
   });
 
   it('shows the pace as unavailable without a reset at the start of next month', () => {
     for (const resetDate of [undefined, '2026-10-23T15:00:00.000Z']) {
-      expect(hoverMarkdown({ leon: [reading(time(23, 15), 23.5, { resetDate })] }, now, DARK))
+      expect(hoverMarkdown({ leon: [reading(time(23, 15), 23.5, { resetDate })] }, now, DARK, []))
         .toContain('<td align="right">&nbsp;&nbsp;Pace&nbsp;unavailable</td>');
     }
   });
 
   it('names unlimited and zero allowances next to the account, without numbers or graph', () => {
-    expect(hoverMarkdown({ leon: [reading(time(23, 15), 100, { quota: -1, unlimited: true })] }, now, DARK)).toBe(
+    expect(hoverMarkdown({ leon: [reading(time(23, 15), 100, { quota: -1, unlimited: true })] }, now, DARK, [])).toBe(
       `<table width="100%">\n<tr><td>Unlimited&nbsp;Copilot&nbsp;quota</td><td align="right">${muted('leon')}&nbsp;&nbsp;${info}` +
       '</td></tr>\n</table>');
-    expect(hoverMarkdown({ leon: [reading(time(23, 15), 0, { quota: 0 })] }, now, DARK))
+    expect(hoverMarkdown({ leon: [reading(time(23, 15), 0, { quota: 0 })] }, now, DARK, []))
       .toContain('<tr><td>No&nbsp;Copilot&nbsp;credit&nbsp;allowance</td>');
-    expect(hoverMarkdown({ leon: [reading(time(23, 15), 100, { quota: 300, unlimited: true })] }, now, DARK))
+    expect(hoverMarkdown({ leon: [reading(time(23, 15), 100, { quota: 300, unlimited: true })] }, now, DARK, []))
       .toContain('<tr><td>Unlimited&nbsp;Copilot&nbsp;quota</td>');
   });
 
-  it('has no hover before any reading', () => {
-    expect(hoverMarkdown({}, now, DARK)).toBeUndefined();
+  it('shows only model use before any reading, and nothing without either', () => {
+    expect(hoverMarkdown({}, now, DARK, [{ model: 'claude-opus-5', chats: 1, share: 100 }])).toBe('<table width="100%">\n' +
+      '<tr><td colspan="2"><strong>Model use this month</strong></td></tr>\n' +
+      '<tr><td>1. claude-opus-5</td><td align="right">1 session · 100%</td></tr>\n</table>');
+    expect(hoverMarkdown({}, now, DARK, [])).toBeUndefined();
+  });
+});
+
+describe('model use', () => {
+  const models = [{ model: 'claude-opus-5.5', chats: 1310, share: 94.04 }, { model: 'gpt-6-luna', chats: 1, share: 3 },
+    { model: '<b>x&y</b>', chats: 7, share: 0.01 }];
+  const section = [
+    '',
+    '---',
+    '',
+    '<table width="100%">',
+    '<tr><td colspan="2"><strong>Model use this month</strong></td></tr>',
+    '<tr><td>1. claude-opus-5.5</td><td align="right">1\u00a0310 sessions · 94%</td></tr>',
+    '<tr><td>2. gpt-6-luna</td><td align="right">1 session · 3%</td></tr>',
+    '<tr><td>3. &lt;b&gt;x&amp;y&lt;/b&gt;</td><td align="right">7 sessions · &lt;0.1%</td></tr>',
+    '</table>',
+  ].join('\n');
+
+  it('ends the hover with the top models, their chats and share', () => {
+    const records = { leon: [reading(time(23, 15), 23.5)] };
+    expect(hoverMarkdown(records, now, DARK, models)).toBe(`${hoverMarkdown(records, now, DARK, [])}\n${section}`);
+  });
+
+  it('follows unlimited and zero allowances too', () => {
+    const records = { leon: [reading(time(23, 15), 100, { quota: -1, unlimited: true })] };
+    expect(hoverMarkdown(records, now, DARK, models)).toBe(`${hoverMarkdown(records, now, DARK, [])}\n${section}`);
   });
 });
 
@@ -88,7 +117,7 @@ describe('graph', () => {
       reading(time(13, 20), 70), reading(time(14, 20), 52.4), reading(time(15, 20), 52.4),
       reading(time(22, 20), 50), reading(time(23, 15), 48),
     ];
-    const bars = images(hoverMarkdown({ leon: readings }, now, DARK)!);
+    const bars = images(hoverMarkdown({ leon: readings }, now, DARK, [])!);
     expect(bars).toHaveLength(30);
     expect(bars.every((image) => / width="14" height="25" /.test(image))).toBe(true);
     expect(bars[0]).toContain('alt="25 Aug · Not tracked" title="25 Aug · Not tracked"');
@@ -110,23 +139,23 @@ describe('graph', () => {
   });
 
   it('fills the bar area with the busiest day even when it is under 1%', () => {
-    const bars = images(hoverMarkdown({ leon: [reading(time(22, 20), 50), reading(time(23, 15), 49.6)] }, now, DARK)!);
+    const bars = images(hoverMarkdown({ leon: [reading(time(22, 20), 50), reading(time(23, 15), 49.6)] }, now, DARK, [])!);
     expect(bars[29]).toContain('title="23 Sep · 0.4%"');
     expect(svg(bars[29])).toContain('y="0" width="9" height="24"');
   });
 
   it('labels a tiny day past the allowance below 0.1%', () => {
     const readings = [reading(time(22, 20), 0, { additionalUsageUsed: 2560 }), reading(time(23, 15), 0, { additionalUsageUsed: 2590 })];
-    const bars = images(hoverMarkdown({ leon: readings }, now, DARK)!);
+    const bars = images(hoverMarkdown({ leon: readings }, now, DARK, [])!);
     expect(bars[29]).toContain('title="23 Sep · &lt;0.1%"');
-    expect(hoverMarkdown({ leon: readings }, now, DARK)).toContain('<strong>Today:</strong> &lt;0.1%&nbsp;&nbsp;(30)');
+    expect(hoverMarkdown({ leon: readings }, now, DARK, [])).toContain('<strong>Today:</strong> &lt;0.1%&nbsp;&nbsp;(30)');
     expect(svg(bars[29])).toContain('height="24" rx="1"');
   });
 
   it('keeps tiny bars visible, uses the light palette, and moves the bright month with the date', () => {
     const readings = [reading(time(29, 20), 50), reading(time(30, 20), 10),
       reading(time(1, 15, 10), 99.9, { resetDate: '2026-11-01T00:00:00.000Z' })];
-    const bars = images(hoverMarkdown({ leon: readings }, time(1, 16, 10), LIGHT)!);
+    const bars = images(hoverMarkdown({ leon: readings }, time(1, 16, 10), LIGHT, [])!);
     expect(bars[28]).toContain('title="30 Sep · 40%"');
     expect(svg(bars[28])).toContain('height="24" rx="1" fill="#c8c8c8"/>');
     // The reset counts October from zero.

@@ -5,15 +5,20 @@ import { basename, dirname, join } from 'node:path';
 import * as vscode from 'vscode';
 
 import { DARK, hoverMarkdown, LIGHT } from './hover';
+import { loadTally, saveTally, scanDebugLogs, topModels } from './models';
 import {
   addReadings, assignAccounts, currentAccount, loadRecords, readLogs, statusText, type LogState,
 } from './quota';
 
 const RECORDS_KEY = 'records';
+const MODELS_KEY = 'models';
 const POLL_MS = 2_000;
+// Copilot writes its debug logs every 4 seconds, and Model use can wait a little longer.
+const SCAN_MS = 10_000;
 
 export function activate(context: vscode.ExtensionContext): void {
   void removeOldData(context);
+  void enableDebugLog();
 
   // Every window reads every window's Copilot Chat log of this VS Code session.
   // logUri is <logs>/<session>/window<N>/exthost/<extension id>.
@@ -22,6 +27,15 @@ export function activate(context: vscode.ExtensionContext): void {
   const session = dirname(windowFolder);
   const logs: LogState = { windows: new Map(), logins: [] };
   let records = loadRecords(context.globalState.get(RECORDS_KEY));
+  // globalStorageUri is <User>/globalStorage/<extension id>, or sits deeper under <User>/profiles in
+  // another profile. Every profile shares <User>/workspaceStorage.
+  const globalStorage = dirname(context.globalStorageUri.fsPath);
+  let user = dirname(globalStorage);
+  while (basename(user) !== 'User' && dirname(user) !== user) user = dirname(user);
+  const workspaceStorage = join(user, 'workspaceStorage');
+  const tally = loadTally(context.globalState.get(MODELS_KEY), Date.now());
+  const read = new Map<string, number>();
+  let scanned = 0;
   // A reload keeps appending to the same log, so only lines since this extension host started
   // show the level of this window's Copilot Chat channel.
   const hostStart = Date.now() - process.uptime() * 1000;
@@ -42,7 +56,7 @@ export function activate(context: vscode.ExtensionContext): void {
     if (item.text !== text) item.text = text;
     const kind = vscode.window.activeColorTheme.kind;
     const light = kind === vscode.ColorThemeKind.Light || kind === vscode.ColorThemeKind.HighContrastLight;
-    const markdown = hoverMarkdown(records, now, light ? LIGHT : DARK);
+    const markdown = hoverMarkdown(records, now, light ? LIGHT : DARK, topModels(tally, now));
     // Each assignment sends the window an update, so only a changed hover is sent.
     if ((item.tooltip as vscode.MarkdownString | undefined)?.value !== markdown) {
       item.tooltip = markdown === undefined ? undefined
@@ -73,8 +87,20 @@ export function activate(context: vscode.ExtensionContext): void {
       // The next poll tries again; the numbers shown stay.
     }
     if (disposed) return;
-    timer = setTimeout(poll, POLL_MS);
+    // The debug-log scan can take seconds, so the numbers show first; new model use shows next poll.
     render();
+    try {
+      if (Date.now() - scanned >= SCAN_MS) {
+        scanned = Date.now();
+        if (await scanDebugLogs(globalStorage, workspaceStorage, tally, read, scanned)) {
+          await context.globalState.update(MODELS_KEY, saveTally(tally));
+        }
+      }
+    } catch {
+      // The next scan tries again.
+    }
+    if (disposed) return;
+    timer = setTimeout(poll, POLL_MS);
   };
   void poll();
 
@@ -91,6 +117,20 @@ async function removeOldData(context: vscode.ExtensionContext): Promise<void> {
     rm(join(storage, name), { recursive: true, force: true }).catch(() => undefined)));
   if (context.globalState.get('copilotUsage.sortMode') !== undefined) {
     await context.globalState.update('copilotUsage.sortMode', undefined);
+  }
+}
+
+/**
+ * Model use comes from Copilot's debug logs, which a window writes from its next start after this
+ * setting is on. A user value, on or off, stays.
+ */
+export async function enableDebugLog(): Promise<void> {
+  try {
+    const copilot = vscode.workspace.getConfiguration('github.copilot.chat');
+    if (copilot.inspect('agentDebugLog.fileLogging.enabled')?.globalValue !== undefined) return;
+    await copilot.update('agentDebugLog.fileLogging.enabled', true, vscode.ConfigurationTarget.Global);
+  } catch {
+    // Model use stays empty until the user turns the setting on.
   }
 }
 

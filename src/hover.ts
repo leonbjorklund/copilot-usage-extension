@@ -1,5 +1,5 @@
 import {
-  currentAccount, dailyUsed, formatNumber, monthUsed, monthlyPace, todayUsed, type Records,
+  currentAccount, dailyUsed, formatNumber, monthUsed, monthlyPace, todayUsed, type Reading, type Records,
 } from './quota';
 
 const INFO = '<a href="https://docs.github.com/en/copilot/concepts/billing/usage-based-billing-for-individuals" ' +
@@ -25,18 +25,27 @@ export const DARK: Palette = { bright: '#cccccc', dim: '#4a4a4a', axis: '#454545
 export const LIGHT: Palette = { bright: '#616161', dim: '#c8c8c8', axis: '#d4d4d4' };
 
 /**
- * The status bar hover for the account Copilot reported for last, or `undefined` before any
- * reading. It holds a link, since the hover stays open under the mouse only while it has one.
+ * The status bar hover: the quota of the account Copilot reported for last, then the month's top
+ * models, or `undefined` with neither. The quota part holds a link, since the hover stays open
+ * under the mouse only while it has one.
  */
-export function hoverMarkdown(records: Records, now: number, palette: Palette): string | undefined {
+export function hoverMarkdown(
+  records: Records, now: number, palette: Palette, models: Array<{ model: string; chats: number; share: number }>,
+): string | undefined {
+  const sections: string[] = [];
   const login = currentAccount(records);
-  if (!login) return;
-  const readings = records[login];
+  if (login) sections.push(...quota(login, records[login], now, palette));
+  if (models.length) sections.push(modelTable(models));
+  return sections.length ? sections.join('\n\n---\n\n') : undefined;
+}
+
+/** Today with the account, then the month with its pace and graph; one row for an allowance without numbers. */
+function quota(login: string, readings: Reading[], now: number, palette: Palette): string[] {
   const latest = readings.at(-1)!;
   const account = `${muted(login)}&nbsp;&nbsp;${INFO}`;
   if (latest.unlimited || latest.quota <= 0) {
     const label = latest.unlimited ? 'Unlimited Copilot quota' : 'No Copilot credit allowance';
-    return table([`<tr><td>${nbsp(label)}</td><td align="right">${account}</td></tr>`]);
+    return [table([`<tr><td>${nbsp(label)}</td><td align="right">${account}</td></tr>`])];
   }
   const credits = (share: number) => formatNumber(Math.round(share * latest.quota / 100));
   const today = todayUsed(readings, now);
@@ -50,13 +59,24 @@ export function hoverMarkdown(records: Records, now: number, palette: Palette): 
   return [
     table([`<tr><td><strong>Today:</strong> ${nbsp(`${percent(today)}  (${credits(today)})`)}</td>` +
       `<td align="right">${account}</td></tr>`]),
-    '', '---', '',
     table([
       `<tr><td><strong>Month:</strong> ${nbsp(period)}</td><td align="right">&nbsp;&nbsp;` +
         `${nbsp(pace === undefined ? 'Pace unavailable' : `${formatNumber(pace)}% monthly pace`)}</td></tr>`,
       ...graphRows(dailyUsed(readings, now), palette),
     ]),
-  ].join('\n');
+  ];
+}
+
+function modelTable(models: Array<{ model: string; chats: number; share: number }>): string {
+  return table([
+    '<tr><td colspan="2"><strong>Model use this month</strong></td></tr>',
+    ...models.map(({ model, chats, share }, index) => `<tr><td>${index + 1}. ${escapeHtml(model)}</td>` +
+      `<td align="right">${formatNumber(chats)} ${chats === 1 ? 'session' : 'sessions'} · ${percent(share)}</td></tr>`),
+  ]);
+}
+
+function escapeHtml(text: string): string {
+  return text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 }
 
 function table(rows: string[]): string {

@@ -105,7 +105,7 @@ export async function readLogs(session: string, state: LogState): Promise<Found[
 }
 
 /** Reads the whole lines between two byte offsets; `end` is where the next read continues. */
-async function readLines(file: string, from: number, to: number): Promise<{ text: string; end: number }> {
+export async function readLines(file: string, from: number, to: number): Promise<{ text: string; end: number }> {
   const buffer = Buffer.alloc(to - from);
   const handle = await open(file, 'r');
   let length = 0;
