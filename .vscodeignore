@@ -1,5 +1,4 @@
 .vscode/**
-docs/**
 src/**
 test/**
 scripts/**
@@ -15,5 +14,4 @@ TODO
 *.vsix
 .claude/**
 desktop.ini
-analysis/**
 logos/logo.svg

@@ -215,6 +215,14 @@ describe('status bar', () => {
     await vi.waitFor(() => expect(item.text).toBe('Restart to see Credit usage'));
   });
 
+  it('keeps asking for a restart when argv.json already names a Copilot level', WAIT, async () => {
+    await start({ logs: line('[info] Logged in as leon-work') });
+    await vi.waitFor(() => expect(item.text).toBe('Restart to see Credit usage'));
+    await pause(2500);
+    expect(executeCommand).not.toHaveBeenCalled();
+    expect(item.text).toBe('Restart to see Credit usage');
+  });
+
   it('keeps asking for a restart when the only Trace lines came before this extension host started', async () => {
     await start({ logs: line('[trace] before a reload', -86_400_000) + line('[info] after the reload') });
     await vi.waitFor(() => expect(item.text).toBe('Restart to see Credit usage'));
@@ -392,13 +400,14 @@ describe('Trace setup', () => {
     await vi.waitFor(() => expect(executeCommand).toHaveBeenCalledOnce(), { timeout: 5000 });
   });
 
-  it('reads the entry past comments', () => {
+  it('reads the entry past comments and escaped quotes', () => {
     expect(hasCopilotLogLevel('{ "log-level": "github.copilot-chat:debug" }')).toBe(true);
     expect(hasCopilotLogLevel('{ /* "github.copilot-chat=off" */ "url": "https://example.com//x" }')).toBe(false);
     expect(hasCopilotLogLevel('{ "log-level": ["my.github.copilot-chat=info"] }')).toBe(false);
     expect(hasCopilotLogLevel('{ "enable-proposed-api": ["GitHub.copilot-chat"] }')).toBe(false);
     expect(hasCopilotLogLevel('{ "log-level": ["github.copilot-chat="] }')).toBe(false);
     expect(hasCopilotLogLevel('')).toBe(false);
+    expect(hasCopilotLogLevel(String.raw`{ "x": "a\"b", "log-level": ["github.copilot-chat=info"] }`)).toBe(true);
   });
 });
 

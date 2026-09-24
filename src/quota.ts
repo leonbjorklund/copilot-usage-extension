@@ -29,7 +29,7 @@ export interface Found { login?: string | null; reading: Reading }
  * A window's Copilot Chat log: bytes read, the file's modification time, the latest account line's
  * login, and the time of the latest Trace line.
  */
-export interface WindowLog { size: number; modified?: number; login?: string | null; traceAt?: number }
+interface WindowLog { size: number; modified?: number; login?: string | null; traceAt?: number }
 
 /** What has been read so far of one VS Code session's Copilot Chat logs. */
 export interface LogState {
@@ -206,7 +206,7 @@ export function currentAccount(records: Records): string | undefined {
 }
 
 /** The share of the allowance used, past 100 once spending goes beyond the allowance. */
-export function used(reading: Reading): number {
+function used(reading: Reading): number {
   const overage = reading.quota > 0 ? (reading.additionalUsageUsed ?? 0) / reading.quota * 100 : 0;
   return 100 - reading.percentRemaining + overage;
 }

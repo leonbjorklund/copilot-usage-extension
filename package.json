@@ -1,8 +1,8 @@
 {
   "name": "copilot-usage-extension",
   "displayName": "Copilot Credits",
-  "description": "Your Copilot credit use in the status bar, read from Copilot Chat's local log.",
-  "version": "0.0.6",
+  "description": "Your Copilot credit use in the status bar: today, this month, the monthly pace and your top models, read from Copilot Chat's local logs.",
+  "version": "0.1.0",
   "publisher": "leonbjorklund",
   "license": "MIT",
   "scripts": {
@@ -14,7 +14,7 @@
     "compile:production": "npm run check-types && node esbuild.js --production",
     "vscode:prepublish": "npm test && npm run compile:production",
     "watch": "node esbuild.js --watch",
-    "test": "vitest run --dir test --passWithNoTests",
+    "test": "vitest run --dir test",
     "package": "vsce package --no-dependencies",
     "install:local": "node scripts/install-local.js"
   },

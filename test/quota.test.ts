@@ -48,6 +48,7 @@ describe('quota payloads', () => {
     expect(toReading(5, { ...payload, quota: -1 })?.unlimited).toBe(true);
     expect(toReading(5, { ...payload, quota: -1, unlimited: true })?.unlimited).toBe(true);
     expect(toReading(5, { ...payload, unlimited: true })?.unlimited).toBe(true);
+    expect(toReading(5, { ...payload, percentRemaining: 100 })?.percentRemaining).toBe(100);
   });
 
   it('counts spending past the allowance only while no allowance remains', () => {
@@ -375,6 +376,7 @@ describe('today and month', () => {
     expect(statusText({ leon: [reading(time(22, 20), 0, { additionalUsageUsed: 800 }), readings[1]] }, now))
       .toBe('2.2% • 100/103.2%');
     expect(statusText({ leon: [reading(time(23, 15), 0)] }, now)).toBe('0% • 100/100%');
+    expect(statusText({ leon: [reading(time(23, 15), 0, { additionalUsageUsed: 400 })] }, now)).toBe('0% • 100/100.5%');
   });
 
   it('never shows a lower latest reading as negative', () => {
