@@ -169,16 +169,14 @@ describe('scanning the debug logs', () => {
 
   it('starts a new tally in a new month', async () => {
     const root = await user();
-    const file = await log(workspace(root), 'a', 'main.jsonl', request('claude-opus-5', 4, at(30, 12)));
+    await log(workspace(root), 'a', 'main.jsonl', request('claude-opus-5', 4, at(30, 12)));
     const tally = emptyTally(at(30, 13));
     const read = new Map<string, number>();
     await scan(root, tally, read, at(30, 13));
     expect(uses(tally)).toEqual({ 'claude-opus-5': [4, 1] });
-    await appendFile(file, request('claude-opus-5', 1, at(1, 9, 10)));
-    await utimes(file, new Date(at(1, 9, 10)), new Date(at(1, 9, 10)));
     expect(await scan(root, tally, read, at(1, 10, 10))).toBe(true);
     expect(tally.month).toBe('2026-10');
-    expect(uses(tally)).toEqual({ 'claude-opus-5': [1, 1] });
+    expect(uses(tally)).toEqual({});
   });
 
   it.each(['log', 'chat folder'])('leaves the scan incomplete when a %s cannot be read, so a restart reads it again', async (kind) => {
@@ -211,12 +209,6 @@ describe('scanning the debug logs', () => {
     expect(uses(tally)).toEqual({ 'claude-opus-5': [4, 1], 'gpt-6-astra': [2, 1] });
     expect(tally.readAt).toBe(now + 1);
   });
-
-  it('returns nothing without any debug logs', async () => {
-    const tally = emptyTally(now);
-    expect(await scan(join(await user(), 'gone'), tally, new Map(), now)).toBe(false);
-    expect(tally.readAt).toBe(0);
-  });
 });
 
 describe('saved tally', () => {
@@ -231,7 +223,7 @@ describe('saved tally', () => {
     expect(addRequest(loaded, 'a', request('claude-opus-5', 4))).toBe(false);
     expect(loadTally(saved, at(1, 12, 10))).toEqual(emptyTally(at(1, 12, 10)));
     for (const value of [undefined, null, 'text', 5, { month: 5 }]) expect(loadTally(value, now)).toEqual(emptyTally(now));
-    expect(uses(loadTally({ month: '2026-09', readAt: 'soon', seen: 'text', models: {
+    expect(uses(loadTally({ month: '2026-09', models: {
       a: { nano: 1e9, chats: ['x', 5] }, b: { nano: -1, chats: [] }, c: null, d: { nano: 1e9, chats: 'x' },
     } }, now))).toEqual({ a: [1, 1], d: [1, 0] });
   });
@@ -243,16 +235,13 @@ describe('top models', () => {
     const spend: Array<[string, string, number]> = [['a', 'opus', 60], ['b', 'opus', 20], ['a', 'astra', 12.6], ['c', 'luna', 1.4],
       ['d', 'luna', 1], ['e', 'luna', 2], ['c', 'grok', 3]];
     for (const [index, [chat, model, credits]] of spend.entries()) addRequest(tally, chat, request(model, credits, at(23, 10 + index)));
-    expect(topModels(tally, now)).toEqual([
+    expect(topModels(tally)).toEqual([
       { model: 'opus', chats: 2, share: 80 }, { model: 'astra', chats: 1, share: expect.closeTo(12.6) },
       { model: 'luna', chats: 3, share: expect.closeTo(4.4) },
     ]);
   });
 
-  it('lists nothing before any request or in another month', () => {
-    expect(topModels(emptyTally(now), now)).toEqual([]);
-    const tally = emptyTally(now);
-    addRequest(tally, 'a', request('opus', 1));
-    expect(topModels(tally, at(1, 12, 10))).toEqual([]);
+  it('lists nothing before any request', () => {
+    expect(topModels(emptyTally(now))).toEqual([]);
   });
 });

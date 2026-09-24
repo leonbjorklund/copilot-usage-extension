@@ -100,7 +100,7 @@ export async function scanDebugLogs(
               continue;
             }
             for (const line of text.split('\n')) {
-              if (line.includes('"type":"llm_request"') && addRequest(tally, chat, line)) changed = true;
+              if (addRequest(tally, chat, line)) changed = true;
             }
             offset = end;
             span = CHUNK;
@@ -144,8 +144,7 @@ export function loadTally(value: unknown, now: number): Tally {
 }
 
 /** The top 3 models by credits, with their chats and share of all credits; none before any request. */
-export function topModels(tally: Tally, now: number): Array<{ model: string; chats: number; share: number }> {
-  if (tally.month !== monthOf(now)) return [];
+export function topModels(tally: Tally): Array<{ model: string; chats: number; share: number }> {
   const total = [...tally.models.values()].reduce((sum, use) => sum + use.nano, 0);
   return [...tally.models]
     .sort((a, b) => b[1].nano - a[1].nano)

@@ -2,15 +2,12 @@
 src/**
 test/**
 scripts/**
-*.ts
 tsconfig.json
-node_modules/**
 dist/**/*.map
 esbuild.js
 AGENTS.md
 .gitignore
 TODO
-*.vsix
 .claude/**
 desktop.ini
 logos/logo.svg

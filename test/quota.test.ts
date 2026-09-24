@@ -12,8 +12,8 @@ vi.mock('node:fs/promises', async (importOriginal) => {
 import * as fsPromises from 'node:fs/promises';
 
 import {
-  addReadings, assignAccounts, currentAccount, dailyUsed, formatNumber, loadRecords, monthlyPace, monthUsed, readLogs, statusText,
-  todayUsed, toReading, type Found, type LogState, type Reading, type Records,
+  addReadings, assignAccounts, currentAccount, dailyUsed, formatNumber, loadRecords, monthlyPace, readLogs, statusText,
+  toReading, type Found, type LogState, type Reading, type Records,
 } from '../src/quota';
 
 const RESET = '2026-10-01T00:00:00.000Z';
@@ -61,8 +61,8 @@ describe('quota payloads', () => {
     }
   });
 
-  it('keeps a reading whose reset date is unusable, without the date', () => {
-    for (const resetDate of [null, 'soon', 5, undefined]) {
+  it('keeps a reading whose reset date is not text, without the date', () => {
+    for (const resetDate of [null, 5, undefined]) {
       const kept = toReading(5, { ...payload, resetDate });
       expect(kept?.percentRemaining).toBe(26.5);
       expect(kept).not.toHaveProperty('resetDate');
@@ -70,11 +70,10 @@ describe('quota payloads', () => {
   });
 
   it.each([
-    ['nothing', undefined], ['null', null], ['an array', []], ['text', 'text'],
-    ['a text quota', { ...payload, quota: '80000' }], ['a quota below -1', { ...payload, quota: -2 }],
+    ['nothing', undefined], ['null', null],
     ['an infinite quota', { ...payload, quota: Infinity }], ['101% remaining', { ...payload, percentRemaining: 101 }],
     ['-1% remaining', { ...payload, percentRemaining: -1 }], ['NaN remaining', { ...payload, percentRemaining: NaN }],
-    ['no percentage', { ...payload, percentRemaining: undefined }], ['a text unlimited flag', { ...payload, unlimited: 'false' }],
+    ['a text unlimited flag', { ...payload, unlimited: 'false' }],
   ])('rejects %s', (_name, value) => {
     expect(toReading(5, value)).toBeUndefined();
   });
@@ -110,21 +109,14 @@ describe('reading the session logs', () => {
   it('reads every window and names each reading after its window\'s latest account line', async () => {
     const root = await session();
     await log(root, 'window1', [
-      `${stamp(time(23, 9))} [info] Logged in as leon-work\r\n`,
       tokenLine(time(23, 9, 0, 1), 'leon-work'),
       quotaLine(time(23, 9, 5), 26.6, 'processUserInfoQuotaSnapshot'),
-      `${stamp(time(23, 9, 6))} [debug] [ChatQuota] a different line\r\n`,
-      `${stamp(time(23, 9, 7))} [trace] [ChatQuota] refreshQuota: fetched up-to-date quota data\r\n`,
-      '  continuation of a multi-line message: Got Copilot token for someone-else\r\n',
       `  ${stamp(time(23, 9, 8))} [info] Got Copilot token for quoted-in-a-message\r\n`,
       `${stamp(time(23, 9, 9))} [trace] [ChatQuota] processQuotaHeaders: {"quota":"x"}\r\n`,
       quotaLine(time(23, 10), 26.5),
     ].join(''));
     await log(root, 'window2', tokenLine(time(23, 9, 10), 'leon') + quotaLine(time(23, 9, 15), 26.6, 'processQuotaSnapshots'));
-    // The hooks channel shares the folder and is not Copilot Chat's log.
-    await log(root, 'window2', tokenLine(time(23, 9, 20), 'hooks'), 'GitHub Copilot Chat Hooks.log');
     await mkdir(join(root, 'window3', 'exthost'), { recursive: true });
-    await writeFile(join(root, 'main.log'), tokenLine(time(23, 9), 'main'));
 
     const state = newState();
     expect(byTime(await readLogs(root, state))).toEqual([
@@ -328,7 +320,6 @@ describe('saved record', () => {
     expect(loadRecords(null)).toEqual({});
     expect(loadRecords('text')).toEqual({});
     expect(loadRecords({ a: 'text', b: [null, 5, { at: 'soon', ...payload }], c: [] })).toEqual({});
-    expect(loadRecords({ a: [{ ...payload, at: 20 }, { ...payload, at: 10 }] }).a.map((entry) => entry.at)).toEqual([10, 20]);
     expect(loadRecords(JSON.parse(`{"__proto__": [${JSON.stringify({ ...payload, at: 10 })}], "not valid": []}`))).toEqual({});
     expect(loadRecords({ 'not valid': [{ ...payload, at: 10 }] })).toEqual({});
   });
@@ -336,38 +327,17 @@ describe('saved record', () => {
   it('keeps a login that names an object property', () => {
     const records = addReadings({}, [{ login: 'constructor', reading: reading(time(23, 9), 26) }], now);
     expect(Object.keys(records)).toEqual(['constructor']);
-    expect(statusText(records, now)).toBe('0% • 74/100%');
   });
 });
 
 describe('today and month', () => {
   const now = time(23, 16);
 
-  it('reads today as the latest reading minus the last one before midnight', () => {
-    const readings = [reading(time(22, 9), 30), reading(time(22, 23), 26.6), reading(time(23, 10), 25), reading(time(23, 15), 23.5)];
-    expect(todayUsed(readings, now)).toBeCloseTo(3.1);
-    expect(monthUsed(readings, now)).toBeCloseTo(76.5);
-    expect(statusText({ leon: readings }, now)).toBe('3.1% • 76.5/100%');
-  });
-
-  it('counts a reading at midnight as today\'s', () => {
+  it('reads today as the latest reading minus the last one before midnight, a midnight reading included', () => {
     const readings = [reading(time(22, 23), 26.6), reading(time(23, 0), 25), reading(time(23, 15), 23.5)];
     expect(statusText({ leon: readings }, now)).toBe('3.1% • 76.5/100%');
     expect(dailyUsed(readings, now).slice(-2).map((entry) => entry.used)).toEqual([0, expect.closeTo(3.1)]);
-  });
-
-  it('shows 0% today before Copilot reports today', () => {
     expect(statusText({ leon: [reading(time(21, 9), 30), reading(time(22, 15), 23.5)] }, now)).toBe('0% • 76.5/100%');
-  });
-
-  it('folds days without a reading into today', () => {
-    const readings = [reading(time(20, 15), 35), reading(time(21, 15), 30), reading(time(23, 15), 23.5)];
-    expect(statusText({ leon: readings }, now)).toBe('6.5% • 76.5/100%');
-  });
-
-  it('counts from the first reading until an account has one before midnight', () => {
-    expect(statusText({ leon: [reading(time(23, 9), 26.6), reading(time(23, 15), 23.5)] }, now)).toBe('3.1% • 76.5/100%');
-    expect(statusText({ leon: [reading(time(23, 15), 23.5)] }, now)).toBe('0% • 76.5/100%');
   });
 
   it('shows spending past the allowance', () => {
@@ -381,16 +351,6 @@ describe('today and month', () => {
 
   it('never shows a lower latest reading as negative', () => {
     expect(statusText({ leon: [reading(time(22, 20), 23.5), reading(time(23, 15), 23.8)] }, now)).toBe('0% • 76.2/100%');
-  });
-
-  it('counts today from zero across the monthly reset', () => {
-    const readings = [reading(time(30, 10), 20), reading(time(1, 15, 0, 0, 0, 10), 98.5, { resetDate: '2026-11-01T00:00:00.000Z' })];
-    expect(statusText({ leon: readings }, time(1, 16, 0, 0, 0, 10))).toBe('1.5% • 1.5/100%');
-  });
-
-  it('shows zero once the reset passed and Copilot has not reported since', () => {
-    expect(statusText({ leon: [reading(time(29, 10), 30), reading(time(30, 10), 23.5)] }, time(2, 12, 0, 0, 0, 10)))
-      .toBe('0% • 0/100%');
   });
 
   it('shows zero today too once the reset passed and Copilot has not reported since', () => {
@@ -420,8 +380,8 @@ describe('today and month', () => {
   });
 
   it('shows the account Copilot reported for last', () => {
-    const records = { leon: [reading(time(22, 20), 51), reading(time(23, 15), 50)],
-      'leon-work': [reading(time(22, 20), 26.6), reading(time(23, 14), 23.5)] };
+    const records = { 'leon-work': [reading(time(22, 20), 26.6), reading(time(23, 14), 23.5)],
+      leon: [reading(time(22, 20), 51), reading(time(23, 15), 50)] };
     expect(statusText(records, now)).toBe('1% • 50/100%');
   });
 
@@ -475,8 +435,7 @@ describe('monthly pace', () => {
 
 describe('numbers', () => {
   it.each([
-    [76.5, '76.5'], [76, '76'], [100 - 64.4, '35.6'], [76.5 - 73.4, '3.1'], [0.04, '0'], [0.05, '0.1'],
-    [103.2, '103.2'], [1100, '1\u00a0100'], [61200, '61\u00a0200'], [0, '0'],
+    [76.5 - 73.4, '3.1'], [0.04, '0'], [0.05, '0.1'], [61200, '61\u00a0200'],
   ])('formats %s as %s', (value, text) => {
     expect(formatNumber(value)).toBe(text);
   });

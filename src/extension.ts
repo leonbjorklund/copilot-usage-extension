@@ -56,7 +56,7 @@ export function activate(context: vscode.ExtensionContext): void {
     if (item.text !== text) item.text = text;
     const kind = vscode.window.activeColorTheme.kind;
     const light = kind === vscode.ColorThemeKind.Light || kind === vscode.ColorThemeKind.HighContrastLight;
-    const markdown = hoverMarkdown(records, now, light ? LIGHT : DARK, topModels(tally, now));
+    const markdown = hoverMarkdown(records, now, light ? LIGHT : DARK, topModels(tally));
     // Each assignment sends the window an update, so only a changed hover is sent.
     if ((item.tooltip as vscode.MarkdownString | undefined)?.value !== markdown) {
       item.tooltip = markdown === undefined ? undefined
@@ -113,7 +113,7 @@ export function activate(context: vscode.ExtensionContext): void {
 /** The old build's history and caches. Old windows still running recreate them until they reload. */
 async function removeOldData(context: vscode.ExtensionContext): Promise<void> {
   const storage = context.globalStorageUri.fsPath;
-  await Promise.all(['account-tracking', 'account-poc', 'quota-history.jsonl', 'scan-cache'].map((name) =>
+  await Promise.all(['account-tracking', 'quota-history.jsonl', 'scan-cache'].map((name) =>
     rm(join(storage, name), { recursive: true, force: true }).catch(() => undefined)));
   if (context.globalState.get('copilotUsage.sortMode') !== undefined) {
     await context.globalState.update('copilotUsage.sortMode', undefined);

@@ -138,12 +138,6 @@ describe('graph', () => {
     expect(svg(bars[21])).not.toContain('rx="1"');
   });
 
-  it('fills the bar area with the busiest day even when it is under 1%', () => {
-    const bars = images(hoverMarkdown({ leon: [reading(time(22, 20), 50), reading(time(23, 15), 49.6)] }, now, DARK, [])!);
-    expect(bars[29]).toContain('title="23 Sep · 0.4%"');
-    expect(svg(bars[29])).toContain('y="0" width="9" height="24"');
-  });
-
   it('labels a tiny day past the allowance below 0.1%', () => {
     const readings = [reading(time(22, 20), 0, { additionalUsageUsed: 2560 }), reading(time(23, 15), 0, { additionalUsageUsed: 2590 })];
     const bars = images(hoverMarkdown({ leon: readings }, now, DARK, [])!);

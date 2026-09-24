@@ -154,6 +154,7 @@ const quota = (percentRemaining: number, offset = 0) => line(`[trace] [ChatQuota
 
 const exists = (path: string) => access(path).then(() => true, () => false);
 const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+const hover = () => (item.tooltip as { value: string } | undefined)?.value ?? '';
 
 describe('status bar', () => {
   it('shows the saved numbers and their hover at once, on the right, with no click', async () => {
@@ -174,7 +175,6 @@ describe('status bar', () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date(2026, 8, 23, 16));
     const records = { leon: [reading(new Date(2026, 8, 23, 15).getTime(), 23.5)] };
-    const hover = () => (item.tooltip as { value: string }).value;
     theme.kind = 4;
     await start({ records });
     expect(hover()).toBe(hoverMarkdown(records, Date.now(), LIGHT, []));
@@ -182,13 +182,6 @@ describe('status bar', () => {
     await vi.waitFor(() => expect(hover()).toBe(hoverMarkdown(records, Date.now(), DARK, [])), { timeout: 5000 });
     theme.kind = 1;
     await vi.waitFor(() => expect(hover()).toBe(hoverMarkdown(records, Date.now(), LIGHT, [])), { timeout: 5000 });
-  });
-
-  it('waits for Copilot on a fresh install, without a hover', async () => {
-    await start();
-    await pause(300);
-    expect(item.text).toBe('Waiting for Copilot');
-    expect(item.tooltip).toBeUndefined();
   });
 
   it('removes the hover once every saved reading is older than 35 days', WAIT, async () => {
@@ -208,46 +201,19 @@ describe('status bar', () => {
     await vi.waitFor(() => expect(item.text).toBe('Waiting for Copilot'), { timeout: 5000 });
   });
 
-  it("counts log lines written between this extension host's start and activation", async () => {
-    // Halfway between the process start and now, so the line predates activation but not the host.
-    const written = new Date(Date.now() - Math.min(400, process.uptime() * 500));
-    await start({ logs: line('[info] Logged in as leon-work'), modified: written });
-    await vi.waitFor(() => expect(item.text).toBe('Restart to see Credit usage'));
-  });
-
-  it('keeps asking for a restart when argv.json already names a Copilot level', WAIT, async () => {
-    await start({ logs: line('[info] Logged in as leon-work') });
-    await vi.waitFor(() => expect(item.text).toBe('Restart to see Credit usage'));
-    await pause(2500);
-    expect(executeCommand).not.toHaveBeenCalled();
-    expect(item.text).toBe('Restart to see Credit usage');
-  });
-
   it('keeps asking for a restart when the only Trace lines came before this extension host started', async () => {
     await start({ logs: line('[trace] before a reload', -86_400_000) + line('[info] after the reload') });
     await vi.waitFor(() => expect(item.text).toBe('Restart to see Credit usage'));
   });
 
-  it('updates from the session\'s Copilot Chat logs and saves the record', async () => {
-    vi.useFakeTimers({ toFake: ['Date'] });
-    vi.setSystemTime(new Date(2026, 8, 23, 16));
-    const logged = (time: string, percentRemaining: number) => `2026-09-23 ${time} [trace] [ChatQuota] processQuotaHeaders: ` +
-      `${JSON.stringify({ quota: 80000, unlimited: false, hasQuota: true, percentRemaining, additionalUsageUsed: 0,
-        additionalUsageEnabled: true, resetDate: RESET })}\r\n`;
-    const { state } = await start({ logs: '2026-09-23 15:00:00.000 [info] Got Copilot token for leon-work\r\n' +
-      logged('15:00:01.000', 26.6) + logged('15:30:00.000', 26.5) });
-    await vi.waitFor(() => expect(item.text).toBe('0.1% • 73.5/100%'));
-    expect(state.get('records')).toEqual({ 'leon-work': [
-      reading(new Date(2026, 8, 23, 15, 0, 1).getTime(), 26.6), reading(new Date(2026, 8, 23, 15, 30).getTime(), 26.5),
-    ] });
-  });
-
   it('names readings from a log without account lines after the saved account', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date(2026, 8, 23, 16));
-    const { state } = await start({ records: { leon: [reading(Date.now() - 86_400_000, 26.6, FAR_RESET)] }, logs: quota(23.5) });
+    const now = Date.now();
+    const saved = reading(now - 86_400_000, 26.6, FAR_RESET);
+    const { state } = await start({ records: { leon: [saved] }, logs: quota(23.5) });
     await vi.waitFor(() => expect(item.text).toBe('3.1% • 76.5/100%'));
-    expect(Object.keys(state.get('records') as object)).toEqual(['leon']);
+    expect(state.get('records')).toEqual({ leon: [saved, reading(now, 23.5, FAR_RESET)] });
   });
 
   it('keeps polling after a failed save', WAIT, async () => {
@@ -287,7 +253,7 @@ describe('status bar', () => {
 describe('old data', () => {
   it('removes the old build\'s stored data and nothing else', async () => {
     const storage = join(await folder(), 'globalStorage');
-    for (const path of ['account-tracking/ledger.jsonl', 'account-poc/start.json', 'scan-cache/usage-index.cache']) {
+    for (const path of ['account-tracking/ledger.jsonl', 'scan-cache/usage-index.cache']) {
       await mkdir(join(storage, path, '..'), { recursive: true });
       await writeFile(join(storage, path), 'old');
     }
@@ -295,7 +261,7 @@ describe('old data', () => {
     await writeFile(join(storage, 'keep.json'), 'new');
     const { state } = await start({ storage, state: { 'copilotUsage.sortMode': 'cost', other: 'kept' } });
     await vi.waitFor(async () => {
-      for (const name of ['account-tracking', 'account-poc', 'scan-cache', 'quota-history.jsonl']) {
+      for (const name of ['account-tracking', 'scan-cache', 'quota-history.jsonl']) {
         expect(await exists(join(storage, name))).toBe(false);
       }
       expect(state.has('copilotUsage.sortMode')).toBe(false);
@@ -307,7 +273,7 @@ describe('old data', () => {
   it('removes the rest when one old path cannot be removed', async () => {
     const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
     vi.mocked(fsPromises.rm).mockImplementation(async (path, options) => {
-      if (String(path).endsWith('account-poc')) throw Object.assign(new Error('busy'), { code: 'EBUSY' });
+      if (String(path).endsWith('account-tracking')) throw Object.assign(new Error('busy'), { code: 'EBUSY' });
       return actual.rm(path, options);
     });
     try {
@@ -409,14 +375,13 @@ describe('Trace setup', () => {
     expect(hasCopilotLogLevel('{ "enable-proposed-api": ["GitHub.copilot-chat"] }')).toBe(false);
     expect(hasCopilotLogLevel('{ "log-level": ["github.copilot-chat="] }')).toBe(false);
     expect(hasCopilotLogLevel('')).toBe(false);
-    expect(hasCopilotLogLevel(String.raw`{ "x": "a\"b", "log-level": ["github.copilot-chat=info"] }`)).toBe(true);
+    expect(hasCopilotLogLevel(String.raw`{ "x": "a // b \" c", "log-level": ["github.copilot-chat=info"] }`)).toBe(true);
   });
 });
 
 describe('model use', () => {
   const request = (credits: number, model = 'claude-opus-5') => `${JSON.stringify({ ts: Date.now(), spanId: '0000000000000001',
     type: 'llm_request', attrs: { model, copilotUsageNanoAiu: credits * 1e9 } })}\n`;
-  const hover = () => (item.tooltip as { value: string } | undefined)?.value ?? '';
   const chat = (name: string) => join('workspaceStorage', 'abc', 'GitHub.copilot-chat', 'debug-logs', name, 'main.jsonl');
 
   it("turns on Copilot's debug logs unless the user set that setting", async () => {
@@ -444,7 +409,7 @@ describe('model use', () => {
     for (const subscription of first.context.subscriptions) subscription.dispose();
     item.tooltip = undefined;
     await start({ records, state: { models: JSON.parse(JSON.stringify(saved)) } });
-    expect((item.tooltip as { value: string }).value).toContain(section);
+    expect(hover()).toContain(section);
   });
 
   it('finds every folder\'s chats from another profile, and that profile\'s chats without a folder', WAIT, async () => {

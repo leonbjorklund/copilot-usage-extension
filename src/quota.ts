@@ -51,7 +51,7 @@ const LOGIN = /^[a-z\d](?:[a-z\d_-]*[a-z\d])?$/i;
 export function toReading(at: unknown, value: unknown): Reading | undefined {
   if (typeof at !== 'number' || !Number.isFinite(at) || typeof value !== 'object' || value === null) return;
   const { quota, percentRemaining, additionalUsageUsed, resetDate, unlimited } = value as { [key: string]: unknown };
-  if (typeof quota !== 'number' || !Number.isFinite(quota) || quota < -1 || typeof unlimited !== 'boolean' ||
+  if (typeof quota !== 'number' || !Number.isFinite(quota) || typeof unlimited !== 'boolean' ||
     typeof percentRemaining !== 'number' || !(percentRemaining >= 0 && percentRemaining <= 100)) return;
   // Copilot holds the percentage at 0 while spending goes past the allowance.
   const overage = percentRemaining === 0 && typeof additionalUsageUsed === 'number' &&
@@ -59,7 +59,7 @@ export function toReading(at: unknown, value: unknown): Reading | undefined {
   return {
     at, quota, percentRemaining,
     ...(overage ? { additionalUsageUsed } : {}),
-    ...(typeof resetDate === 'string' && !Number.isNaN(Date.parse(resetDate)) ? { resetDate } : {}),
+    ...(typeof resetDate === 'string' ? { resetDate } : {}),
     unlimited: unlimited || quota === -1,
   };
 }
@@ -108,17 +108,8 @@ export async function readLogs(session: string, state: LogState): Promise<Found[
 export async function readLines(file: string, from: number, to: number): Promise<{ text: string; end: number }> {
   const buffer = Buffer.alloc(to - from);
   const handle = await open(file, 'r');
-  let length = 0;
-  try {
-    while (length < buffer.length) {
-      const { bytesRead } = await handle.read(buffer, length, buffer.length - length, from + length);
-      if (!bytesRead) break;
-      length += bytesRead;
-    }
-  } finally {
-    await handle.close();
-  }
-  const last = buffer.subarray(0, length).lastIndexOf(10);
+  const { bytesRead } = await handle.read(buffer, 0, buffer.length, from).finally(() => handle.close());
+  const last = buffer.subarray(0, bytesRead).lastIndexOf(10);
   return { text: buffer.toString('utf8', 0, last + 1), end: from + last + 1 };
 }
 
@@ -301,8 +292,7 @@ export function loadRecords(value: unknown): Records {
     if (!LOGIN.test(login)) continue;
     const readings = (Array.isArray(list) ? list : [])
       .map((entry) => toReading((entry as { at?: unknown } | null)?.at, entry))
-      .filter((reading): reading is Reading => reading !== undefined)
-      .sort((a, b) => a.at - b.at);
+      .filter((reading): reading is Reading => reading !== undefined);
     if (readings.length) records[login] = readings;
   }
   return records;

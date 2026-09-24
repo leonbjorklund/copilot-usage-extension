@@ -6,8 +6,7 @@
   "publisher": "leonbjorklund",
   "license": "MIT",
   "scripts": {
-    "clean": "node -e \"const fs=require('node:fs'); fs.rmSync('dist',{recursive:true,force:true});\"",
-    "check-types": "tsc --noEmit -p ./",
+    "check-types": "tsc -p ./",
     "compile": "npm run check-types && node esbuild.js",
     "prepreview": "npm test",
     "preview": "npm run compile && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/preview.ps1",
@@ -33,7 +32,6 @@
   "bugs": {
     "url": "https://github.com/leonbjorklund/copilot-usage-extension/issues"
   },
-  "homepage": "https://github.com/leonbjorklund/copilot-usage-extension#readme",
   "keywords": [
     "copilot",
     "credits",
@@ -41,7 +39,6 @@
     "usage",
     "ai"
   ],
-  "pricing": "Free",
   "engines": {
     "vscode": "^1.120.0"
   },

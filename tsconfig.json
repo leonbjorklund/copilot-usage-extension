@@ -6,9 +6,7 @@
       "ES2022"
     ],
     "noEmit": true,
-    "rootDir": "src",
     "strict": true,
-    "esModuleInterop": true,
     "types": [
       "node"
     ],
@@ -16,8 +14,5 @@
   },
   "include": [
     "src/**/*.ts"
-  ],
-  "exclude": [
-    "node_modules"
   ]
 }
