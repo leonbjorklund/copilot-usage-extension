@@ -21,6 +21,9 @@ const HEIGHT_EXPONENT = 0.7;
 
 interface Palette { bright: string; dim: string; axis: string }
 
+/** A model's sessions, its credits per session and its share of the month's credits. */
+interface ModelUse { model: string; chats: number; perChat: number; share: number }
+
 export const DARK: Palette = { bright: '#cccccc', dim: '#4a4a4a', axis: '#454545' };
 export const LIGHT: Palette = { bright: '#616161', dim: '#c8c8c8', axis: '#d4d4d4' };
 
@@ -30,7 +33,7 @@ export const LIGHT: Palette = { bright: '#616161', dim: '#c8c8c8', axis: '#d4d4d
  * under the mouse only while it has one.
  */
 export function hoverMarkdown(
-  records: Records, now: number, palette: Palette, models: Array<{ model: string; chats: number; share: number }>,
+  records: Records, now: number, palette: Palette, models: ModelUse[],
 ): string | undefined {
   const sections: string[] = [];
   const login = currentAccount(records);
@@ -67,11 +70,16 @@ function quota(login: string, readings: Reading[], now: number, palette: Palette
   ];
 }
 
-function modelTable(models: Array<{ model: string; chats: number; share: number }>): string {
+/** One row per model with its sessions, credits per session and share, in columns headed by the title row. */
+function modelTable(models: ModelUse[]): string {
+  // A width of 1 holds each number column to its widest cell, so the model column takes the spare width.
+  const numbers = (...cells: string[]) =>
+    cells.map((cell) => `<td align="right" width="1">&nbsp;&nbsp;&nbsp;${cell}</td>`).join('');
+  const labels = ['Sessions', 'Per session', 'Share'].map((label) => muted(nbsp(label)));
   return table([
-    '<tr><td colspan="2"><strong>Model use this month</strong></td></tr>',
-    ...models.map(({ model, chats, share }, index) => `<tr><td>${index + 1}. ${escapeHtml(model)}</td>` +
-      `<td align="right">${formatNumber(chats)} ${chats === 1 ? 'session' : 'sessions'} · ${formatNumber(share)}%</td></tr>`),
+    `<tr><td><strong>Model use this month</strong></td>${numbers(...labels)}</tr>`,
+    ...models.map(({ model, chats, perChat, share }, index) => `<tr><td>${index + 1}. ${escapeHtml(model)}</td>` +
+      `${numbers(formatNumber(chats), formatNumber(Math.round(perChat)), `${formatNumber(share)}%`)}</tr>`),
   ]);
 }
 

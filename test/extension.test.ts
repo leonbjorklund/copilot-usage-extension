@@ -374,6 +374,9 @@ describe('model use', () => {
   const request = (credits: number, model = 'claude-opus-5') => `${JSON.stringify({ ts: Date.now(), spanId: '0000000000000001',
     type: 'llm_request', attrs: { model, copilotUsageNanoAiu: credits * 1e9 } })}\n`;
   const chat = (name: string) => join('workspaceStorage', 'abc', 'GitHub.copilot-chat', 'debug-logs', name, 'main.jsonl');
+  /** A model's hover row: its sessions, credits per session and share. */
+  const row = (name: string, ...cells: string[]) =>
+    `<tr><td>${name}</td>${cells.map((cell) => `<td align="right" width="1">&nbsp;&nbsp;&nbsp;${cell}</td>`).join('')}</tr>`;
 
   it("turns on Copilot's and VS Code's agent debug logs, leaving each setting the user set", async () => {
     const [copilot, agentHost] = ['github.copilot.chat.agentDebugLog.fileLogging.enabled', 'chat.agentHost.agentDebugLog.enabled'];
@@ -402,7 +405,7 @@ describe('model use', () => {
     const records = { leon: [reading(Date.now() - 1000, 23.5)] };
     const first = await start({ records, debugLogs: { [chat('a')]: request(4) } });
     expect(configuration.update).toHaveBeenCalledWith('github.copilot.chat.agentDebugLog.fileLogging.enabled', true, 1);
-    const section = '<tr><td>1. claude-opus-5</td><td align="right">1 session · 100%</td></tr>';
+    const section = row('1. claude-opus-5', '1', '4', '100%');
     await nextPoll();
     expect(hover()).toContain(section);
     const saved = first.state.get('models');
@@ -420,8 +423,8 @@ describe('model use', () => {
       [join(profile, 'globalStorage', 'github.copilot-chat', 'debug-logs', 'b', 'main.jsonl')]: request(1, 'gpt-6-astra'),
     } });
     await nextPoll();
-    expect(hover()).toContain('<tr><td>1. claude-opus-5</td><td align="right">1 session · 80%</td></tr>');
-    expect(hover()).toContain('<tr><td>2. gpt-6-astra</td><td align="right">1 session · 20%</td></tr>');
+    expect(hover()).toContain(row('1. claude-opus-5', '1', '4', '80%'));
+    expect(hover()).toContain(row('2. gpt-6-astra', '1', '1', '20%'));
   });
 
   it('reads new debug-log lines on a later scan, and keeps polling after a failed save', async () => {

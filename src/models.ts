@@ -196,17 +196,23 @@ export function loadTally(value: unknown, now: number): Tally {
   const strings = (list: unknown) => Array.isArray(list) ? list.filter((item): item is string => typeof item === 'string') : [];
   for (const [model, use] of entries(saved.models)) {
     const { nano, chats } = (use ?? {}) as { [key: string]: unknown };
-    if (typeof nano === 'number' && nano > 0 && Number.isFinite(nano)) tally.models.set(model, { nano, chats: new Set(strings(chats)) });
+    // Every credit counted comes from a chat, so a model without one is malformed.
+    const names = strings(chats);
+    if (typeof nano === 'number' && nano > 0 && Number.isFinite(nano) && names.length) {
+      tally.models.set(model, { nano, chats: new Set(names) });
+    }
   }
   for (const [chat, keys] of entries(saved.seen)) tally.seen.set(chat, new Set(strings(keys)));
   return tally;
 }
 
-/** The top 5 models by credits, with their chats and share of all credits; none before any request. */
-export function topModels(tally: Tally): Array<{ model: string; chats: number; share: number }> {
+/** The top 5 models by credits, with their chats, credits per chat and share of all credits; none before any request. */
+export function topModels(tally: Tally): Array<{ model: string; chats: number; perChat: number; share: number }> {
   const total = [...tally.models.values()].reduce((sum, use) => sum + use.nano, 0);
   return [...tally.models]
     .sort((a, b) => b[1].nano - a[1].nano)
     .slice(0, 5)
-    .map(([model, use]) => ({ model, chats: use.chats.size, share: use.nano / total * 100 }));
+    .map(([model, use]) => ({
+      model, chats: use.chats.size, perChat: use.nano / 1e9 / use.chats.size, share: use.nano / total * 100,
+    }));
 }

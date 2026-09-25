@@ -11,6 +11,10 @@ const svg = (image: string) => Buffer.from(/base64,([^"]+)"/.exec(image)![1], 'b
 const muted = (text: string) => `<span style="color:var(--vscode-descriptionForeground);">${text}</span>`;
 const info = '<a href="https://docs.github.com/en/copilot/concepts/billing/usage-based-billing-for-individuals" ' +
   'title="How GitHub bills Copilot credits">$(info)</a>';
+/** Right-aligned number cells, each held to its column's widest cell. */
+const numbers = (...cells: string[]) => cells.map((cell) => `<td align="right" width="1">&nbsp;&nbsp;&nbsp;${cell}</td>`).join('');
+const heading = '<tr><td><strong>Model use this month</strong></td>' +
+  `${numbers(muted('Sessions'), muted('Per&nbsp;session'), muted('Share'))}</tr>`;
 
 function reading(at: number, percentRemaining: number, extra: Partial<Reading> = {}): Reading {
   return { at, quota: 80000, percentRemaining, resetDate: RESET, unlimited: false, ...extra };
@@ -72,29 +76,28 @@ describe('hover', () => {
   });
 
   it('shows only model use before any reading, and nothing without either', () => {
-    expect(hoverMarkdown({}, now, DARK, [{ model: 'claude-opus-5', chats: 1, share: 100 }])).toBe('<table width="100%">\n' +
-      '<tr><td colspan="2"><strong>Model use this month</strong></td></tr>\n' +
-      '<tr><td>1. claude-opus-5</td><td align="right">1 session · 100%</td></tr>\n</table>');
+    expect(hoverMarkdown({}, now, DARK, [{ model: 'claude-opus-5', chats: 1, perChat: 4, share: 100 }])).toBe(
+      `<table width="100%">\n${heading}\n<tr><td>1. claude-opus-5</td>${numbers('1', '4', '100%')}</tr>\n</table>`);
     expect(hoverMarkdown({}, now, DARK, [])).toBeUndefined();
   });
 });
 
 describe('model use', () => {
-  const models = [{ model: 'claude-opus-5.5', chats: 1310, share: 94.04 }, { model: 'gpt-6-luna', chats: 1, share: 3 },
-    { model: '<b>x&y</b>', chats: 7, share: 0.01 }];
+  const models = [{ model: 'claude-opus-5.5', chats: 1310, perChat: 2898.6, share: 94.04 },
+    { model: 'gpt-6-luna', chats: 1, perChat: 0.4, share: 3 }, { model: '<b>x&y</b>', chats: 7, perChat: 12.5, share: 0.01 }];
   const section = [
     '',
     '---',
     '',
     '<table width="100%">',
-    '<tr><td colspan="2"><strong>Model use this month</strong></td></tr>',
-    '<tr><td>1. claude-opus-5.5</td><td align="right">1\u00a0310 sessions · 94%</td></tr>',
-    '<tr><td>2. gpt-6-luna</td><td align="right">1 session · 3%</td></tr>',
-    '<tr><td>3. &lt;b&gt;x&amp;y&lt;/b&gt;</td><td align="right">7 sessions · 0%</td></tr>',
+    heading,
+    `<tr><td>1. claude-opus-5.5</td>${numbers('1\u00a0310', '2\u00a0899', '94%')}</tr>`,
+    `<tr><td>2. gpt-6-luna</td>${numbers('1', '0', '3%')}</tr>`,
+    `<tr><td>3. &lt;b&gt;x&amp;y&lt;/b&gt;</td>${numbers('7', '13', '0%')}</tr>`,
     '</table>',
   ].join('\n');
 
-  it('ends the hover with the top models, their chats and share', () => {
+  it('ends the hover with the top models, their sessions, whole credits per session and share', () => {
     const records = { leon: [reading(time(23, 15), 23.5)] };
     expect(hoverMarkdown(records, now, DARK, models)).toBe(`${hoverMarkdown(records, now, DARK, [])}\n${section}`);
   });

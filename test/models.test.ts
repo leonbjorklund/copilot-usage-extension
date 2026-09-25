@@ -68,9 +68,6 @@ describe('scanning the debug logs', () => {
     await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
   });
 
-  const scan = (root: string, tally: Tally, read: Map<string, number>, time: number) =>
-    scanDebugLogs(root, tally, read, time);
-
   async function user(): Promise<string> {
     const root = await mkdtemp(join(tmpdir(), 'copilot-credits-'));
     roots.push(root);
@@ -99,7 +96,7 @@ describe('scanning the debug logs', () => {
     // Folders without chats, and a file where a chat folder would be, leave the scan complete.
     await writeFile(join(global(root), 'loose.jsonl'), request('claude-opus-5', 50, at(23, 14)));
     const tally = emptyTally(now);
-    expect(await scan(root, tally, new Map(), now)).toBe(true);
+    expect(await scanDebugLogs(root, tally, new Map(), now)).toBe(true);
     expect(uses(tally)).toEqual({ 'claude-opus-5': [8, 3], 'gpt-6-astra': [3, 1], 'gemini-3.8-flash': [2, 2] });
     expect(tally.readAt).toBe(now);
   });
@@ -109,17 +106,17 @@ describe('scanning the debug logs', () => {
     const file = await log(workspace(root), 'a', 'main.jsonl', request('claude-opus-5', 4));
     const tally = emptyTally(now);
     const read = new Map<string, number>();
-    await scan(root, tally, read, now);
+    await scanDebugLogs(root, tally, read, now);
     const length = request('claude-opus-5', 4).length;
     expect(read.get(file)).toBe(length);
-    expect(await scan(root, tally, read, now + 1)).toBe(false);
+    expect(await scanDebugLogs(root, tally, read, now + 1)).toBe(false);
     expect(tally.readAt).toBe(now);
     const next = request('claude-opus-5', 2, at(23, 11));
     await appendFile(file, next.slice(0, 50));
-    expect(await scan(root, tally, read, now + 2)).toBe(false);
+    expect(await scanDebugLogs(root, tally, read, now + 2)).toBe(false);
     expect(read.get(file)).toBe(length);
     await appendFile(file, next.slice(50));
-    expect(await scan(root, tally, read, now + 3)).toBe(true);
+    expect(await scanDebugLogs(root, tally, read, now + 3)).toBe(true);
     expect(read.get(file)).toBe(length + next.length);
     expect(uses(tally)).toEqual({ 'claude-opus-5': [6, 1] });
   });
@@ -128,15 +125,15 @@ describe('scanning the debug logs', () => {
     const root = await user();
     const file = await log(workspace(root), 'a', 'main.jsonl', request('claude-opus-5', 4) + request('claude-opus-5', 2, at(23, 11)));
     const first = emptyTally(now);
-    await scan(root, first, new Map(), now);
+    await scanDebugLogs(root, first, new Map(), now);
     // A restart loads the saved tally and reads the logs from their start.
     const restarted = loadTally(JSON.parse(JSON.stringify(saveTally(first))), now);
     restarted.readAt = 0;
     const read = new Map<string, number>();
-    expect(await scan(root, restarted, read, now + 1)).toBe(false);
+    expect(await scanDebugLogs(root, restarted, read, now + 1)).toBe(false);
     // Copilot trims a large log to its newest part, cutting its first line.
     await writeFile(file, request('claude-opus-5', 2, at(23, 11)).slice(20) + request('claude-opus-5', 1, at(23, 12)));
-    expect(await scan(root, restarted, read, now + 2)).toBe(true);
+    expect(await scanDebugLogs(root, restarted, read, now + 2)).toBe(true);
     expect(uses(restarted)).toEqual({ 'claude-opus-5': [7, 1] });
   });
 
@@ -144,9 +141,9 @@ describe('scanning the debug logs', () => {
     const root = await user();
     await log(workspace(root), 'a', 'main.jsonl', request('claude-opus-5', 4));
     const tally = emptyTally(now);
-    await scan(root, tally, new Map(), now);
+    await scanDebugLogs(root, tally, new Map(), now);
     await rm(join(workspace(root), 'a'), { recursive: true });
-    expect(await scan(root, tally, new Map(), now + 1)).toBe(false);
+    expect(await scanDebugLogs(root, tally, new Map(), now + 1)).toBe(false);
     expect(uses(tally)).toEqual({ 'claude-opus-5': [4, 1] });
   });
 
@@ -160,10 +157,10 @@ describe('scanning the debug logs', () => {
     await utimes(earlier, new Date(at(31, 12, 8)), new Date(at(31, 12, 8)));
     await utimes(close, new Date(now - 2000), new Date(now - 2000));
     const tally = { ...emptyTally(now), readAt: now - 1000 };
-    expect(await scan(root, tally, new Map(), now)).toBe(true);
+    expect(await scanDebugLogs(root, tally, new Map(), now)).toBe(true);
     expect(uses(tally)).toEqual({ 'gpt-6-astra': [2, 1] });
     tally.readAt = 0;
-    expect(await scan(root, tally, new Map(), now)).toBe(true);
+    expect(await scanDebugLogs(root, tally, new Map(), now)).toBe(true);
     expect(uses(tally)).toEqual({ 'gpt-6-astra': [2, 1], 'claude-opus-5': [4, 1] });
   });
 
@@ -172,7 +169,7 @@ describe('scanning the debug logs', () => {
     const long = request('claude-opus-5', 4).replace('"inputTokens"', `"inputMessages":"${'x'.repeat(9 * 1024 * 1024)}","inputTokens"`);
     await log(workspace(root), 'a', 'main.jsonl', long + request('claude-opus-5', 2, at(23, 11)));
     const tally = emptyTally(now);
-    await scan(root, tally, new Map(), now);
+    await scanDebugLogs(root, tally, new Map(), now);
     expect(uses(tally)).toEqual({ 'claude-opus-5': [6, 1] });
   });
 
@@ -190,7 +187,7 @@ describe('scanning the debug logs', () => {
       call('gpt-6-astra', undefined, 7) + call('claude-opus-5', 3, 8) + call('claude-opus-5', 4, 9).slice(0, 40));
     await writeFile(join(usage(root), 'b.jsonl'), call('claude-opus-5', 1, 1, at(31, 12, 8)) + call('claude-opus-5', 3, 2));
     const tally = emptyTally(now);
-    expect(await scan(root, tally, new Map(), now)).toBe(true);
+    expect(await scanDebugLogs(root, tally, new Map(), now)).toBe(true);
     expect(uses(tally)).toEqual({ 'claude-opus-5': [14, 2], 'claude-haiku-5': [1, 1], 'gpt-6-astra': [2, 1] });
   });
 
@@ -200,15 +197,15 @@ describe('scanning the debug logs', () => {
     const file = join(usage(root), 'a.jsonl');
     await writeFile(file, call('claude-opus-5', 4, 1) + call('claude-opus-5', 6, 2));
     const first = emptyTally(now);
-    await scan(root, first, new Map(), now);
+    await scanDebugLogs(root, first, new Map(), now);
     const restarted = loadTally(JSON.parse(JSON.stringify(saveTally(first))), now);
     restarted.readAt = 0;
     const read = new Map<string, number>();
-    expect(await scan(root, restarted, read, now + 1)).toBe(false);
+    expect(await scanDebugLogs(root, restarted, read, now + 1)).toBe(false);
     // VS Code rewrites a log to its newest lines, here at a clearly later time.
     await writeFile(file, call('claude-opus-5', 6, 2) + call('claude-opus-5', 9, 3));
     await utimes(file, new Date(now), new Date(now));
-    expect(await scan(root, restarted, read, now + 2)).toBe(true);
+    expect(await scanDebugLogs(root, restarted, read, now + 2)).toBe(true);
     expect(uses(restarted)).toEqual({ 'claude-opus-5': [9, 1] });
   });
 
@@ -222,9 +219,9 @@ describe('scanning the debug logs', () => {
     for (const path of [file, agent]) await utimes(path, new Date(at(1, 0, 10)), new Date(at(1, 0, 10)));
     const tally = emptyTally(at(30, 13));
     const read = new Map<string, number>();
-    await scan(root, tally, read, at(30, 13));
+    await scanDebugLogs(root, tally, read, at(30, 13));
     expect(uses(tally)).toEqual({ 'claude-opus-5': [5, 2] });
-    expect(await scan(root, tally, read, at(1, 10, 10))).toBe(true);
+    expect(await scanDebugLogs(root, tally, read, at(1, 10, 10))).toBe(true);
     expect(tally.month).toBe('2026-10');
     expect(uses(tally)).toEqual({ 'gpt-6-astra': [2, 1], 'claude-haiku-5': [2, 1] });
   });
@@ -248,14 +245,14 @@ describe('scanning the debug logs', () => {
     }
     const tally = emptyTally(now);
     try {
-      expect(await scan(root, tally, new Map(), now)).toBe(true);
+      expect(await scanDebugLogs(root, tally, new Map(), now)).toBe(true);
     } finally {
       vi.mocked(fsPromises.stat).mockImplementation(actual.stat);
       vi.mocked(fsPromises.readdir).mockImplementation(actual.readdir);
     }
     expect(uses(tally)).toEqual({ 'claude-opus-5': [4, 1] });
     expect(tally.readAt).toBe(0);
-    expect(await scan(root, tally, new Map(), now + 1)).toBe(true);
+    expect(await scanDebugLogs(root, tally, new Map(), now + 1)).toBe(true);
     expect(uses(tally)).toEqual({ 'claude-opus-5': [4, 1], 'gpt-6-astra': [2, 1] });
     expect(tally.readAt).toBe(now + 1);
   });
@@ -275,20 +272,22 @@ describe('saved tally', () => {
     for (const value of [undefined, null, 'text', 5, { month: 5 }]) expect(loadTally(value, now)).toEqual(emptyTally(now));
     expect(uses(loadTally({ month: '2026-09', models: {
       a: { nano: 1e9, chats: ['x', 5] }, b: { nano: -1, chats: [] }, c: null, d: { nano: 1e9, chats: 'x' },
-    } }, now))).toEqual({ a: [1, 1], d: [1, 0] });
+    } }, now))).toEqual({ a: [1, 1] });
   });
 });
 
 describe('top models', () => {
-  it('lists the 5 models with the most credits, their chats and share', () => {
+  it('lists the 5 models with the most credits, their chats, credits per chat and share', () => {
     const tally = emptyTally(now);
     const spend: Array<[string, string, number]> = [['a', 'opus', 60], ['b', 'opus', 20], ['a', 'astra', 12.6], ['c', 'luna', 1.4],
       ['d', 'luna', 1], ['e', 'luna', 2], ['c', 'grok', 2], ['f', 'sonnet', 0.6], ['g', 'haiku', 0.4]];
     for (const [index, [chat, model, credits]] of spend.entries()) addRequest(tally, chat, request(model, credits, at(23, 10 + index)));
     expect(topModels(tally)).toEqual([
-      { model: 'opus', chats: 2, share: 80 }, { model: 'astra', chats: 1, share: expect.closeTo(12.6) },
-      { model: 'luna', chats: 3, share: expect.closeTo(4.4) }, { model: 'grok', chats: 1, share: expect.closeTo(2) },
-      { model: 'sonnet', chats: 1, share: expect.closeTo(0.6) },
+      { model: 'opus', chats: 2, perChat: 40, share: 80 },
+      { model: 'astra', chats: 1, perChat: expect.closeTo(12.6), share: expect.closeTo(12.6) },
+      { model: 'luna', chats: 3, perChat: expect.closeTo(4.4 / 3), share: expect.closeTo(4.4) },
+      { model: 'grok', chats: 1, perChat: expect.closeTo(2), share: expect.closeTo(2) },
+      { model: 'sonnet', chats: 1, perChat: expect.closeTo(0.6), share: expect.closeTo(0.6) },
     ]);
   });
 
@@ -296,6 +295,6 @@ describe('top models', () => {
     expect(topModels(emptyTally(now))).toEqual([]);
     const tally = emptyTally(now);
     addRequest(tally, 'a', request('opus', 4));
-    expect(topModels(tally)).toEqual([{ model: 'opus', chats: 1, share: 100 }]);
+    expect(topModels(tally)).toEqual([{ model: 'opus', chats: 1, perChat: 4, share: 100 }]);
   });
 });

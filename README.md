@@ -21,7 +21,7 @@ Hover the item to see:
 - Today's share and credits, and the account Copilot Chat signed in with.
 - The month's share and credits of your allowance, and the monthly pace: the share you will have used by the reset if your average daily use so far continues.
 - A graph of your last 30 days. Bars for this month are bright. Hover a bar to see that day's share.
-- Model use this month: your top 5 models by credits, how many chat sessions used each, and each model's share. It counts every account's chats in this VS Code since its debug logs were turned on, GPT models included, and leaves out Copilot use elsewhere, like on github.com. VS Code's agent sessions count too.
+- Model use this month: your top 5 models by credits, how many chat sessions used each, the average credits per session, and each model's share. It counts every account's chats in this VS Code since its debug logs were turned on, GPT models included, and leaves out Copilot use elsewhere, like on github.com. VS Code's agent sessions count too.
 
 ## How it works
 
