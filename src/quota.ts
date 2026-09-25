@@ -1,4 +1,4 @@
-import { open, readdir, stat } from 'node:fs/promises';
+import { open, readdir, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
 /** One `[ChatQuota]` value from Copilot Chat's output log, stamped with the log line's local time. */
@@ -15,7 +15,7 @@ export interface Reading {
 
 /**
  * Per account, oldest first: its earliest reading, or the newest one older than 35 days, then the
- * last reading of each local day.
+ * last reading of each local day and the last one before a monthly reset.
  */
 export type Records = { [login: string]: Reading[] };
 
@@ -38,12 +38,10 @@ export interface LogState {
   logins: Array<{ at: number; login: string | null }>;
 }
 
-const CHANNEL = 'GitHub Copilot Chat';
 const DAYS_KEPT = 35;
 // `2026-09-23 10:04:50.301 [trace] [ChatQuota] processQuotaHeaders: {...}`, stamped in local time.
 const LINE = /^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}) \[\w+\] (?:\[ChatQuota\] process\w+: (.*?)|Got Copilot token for (.*?))\r?$/gm;
 const TRACE = /^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}) \[trace\] /gm;
-const STAMP = /^(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)\.(\d{3})$/;
 // GitHub logins, including the underscore of enterprise managed users.
 const LOGIN = /^[a-z\d](?:[a-z\d_-]*[a-z\d])?$/i;
 
@@ -73,22 +71,16 @@ export async function readLogs(session: string, state: LogState): Promise<Found[
   const names = await readdir(session).catch(() => []);
   for (const name of names.filter((name) => /^window\d+$/.test(name))) {
     const folder = join(session, name, 'exthost', 'GitHub.copilot-chat');
-    const file = join(folder, `${CHANNEL}.log`);
+    const file = join(folder, 'GitHub Copilot Chat.log');
     try {
       const { size, mtimeMs } = await stat(file);
       let window = state.windows.get(name);
       if (!window) {
         window = { size: 0 };
         state.windows.set(name, window);
-        // Rotated copies hold the window's earlier lines; `.1.log` is the newest of them.
-        const rotated = (await readdir(folder))
-          .map((entry) => Number(/^GitHub Copilot Chat\.(\d+)\.log$/.exec(entry)?.[1]))
-          .filter((index) => index > 0)
-          .sort((a, b) => b - a);
-        for (const index of rotated) {
-          const copy = join(folder, `${CHANNEL}.${index}.log`);
-          parse((await readLines(copy, 0, (await stat(copy)).size)).text, window, state, found);
-        }
+        // Rotated copies hold the window's earlier lines, from `.6.log` the oldest to `.1.log` the newest.
+        const rotated = (await readdir(folder)).filter((entry) => /^GitHub Copilot Chat\.\d\.log$/.test(entry));
+        for (const copy of rotated.sort().reverse()) parse(await readFile(join(folder, copy), 'utf8'), window, state, found);
       }
       window.modified = mtimeMs;
       if (size < window.size) window.size = 0;
@@ -108,14 +100,15 @@ export async function readLogs(session: string, state: LogState): Promise<Found[
 export async function readLines(file: string, from: number, to: number): Promise<{ text: string; end: number }> {
   const buffer = Buffer.alloc(to - from);
   const handle = await open(file, 'r');
-  const { bytesRead } = await handle.read(buffer, 0, buffer.length, from).finally(() => handle.close());
-  const last = buffer.subarray(0, bytesRead).lastIndexOf(10);
+  // Bytes past the end of a file that shrank stay zero, so they hold no line end.
+  await handle.read(buffer, 0, buffer.length, from).finally(() => handle.close());
+  const last = buffer.lastIndexOf(10);
   return { text: buffer.toString('utf8', 0, last + 1), end: from + last + 1 };
 }
 
+/** A date and time without an offset parses as local time. */
 function localTime(stamp: string): number {
-  const [, year, month, day, hour, minute, second, ms] = STAMP.exec(stamp)!;
-  return new Date(+year, +month - 1, +day, +hour, +minute, +second, +ms).getTime();
+  return Date.parse(stamp.replace(' ', 'T'));
 }
 
 function parse(text: string, window: WindowLog, state: LogState, found: Found[]): void {
@@ -165,8 +158,9 @@ function localDay(at: number, offset = 0): number {
 }
 
 /**
- * Keeps each account's earliest reading and the last reading of each local day, for 35 days,
- * plus the newest older reading while newer ones remain, since the oldest day kept counts from it.
+ * Keeps each account's earliest reading, the last reading of each local day and the last one before
+ * a monthly reset, for 35 days, plus the newest older reading while newer ones remain, since the
+ * oldest day kept counts from it.
  * Readings stamped later than `now` are dropped, since they would stay the latest.
  */
 export function addReadings(records: Records, added: Array<{ login: string; reading: Reading }>, now: number): Records {
@@ -180,8 +174,8 @@ export function addReadings(records: Records, added: Array<{ login: string; read
       .filter((reading, index, sorted) => index === 0 || reading.at !== sorted[index - 1].at);
     const recent = readings.findIndex((reading) => reading.at >= cutoff);
     const all = recent < 0 ? [] : readings.slice(Math.max(0, recent - 1));
-    const kept = all.filter((reading, index) =>
-      index === 0 || index === all.length - 1 || localDay(reading.at) !== localDay(all[index + 1].at));
+    const kept = all.filter((reading, index) => index === 0 || index === all.length - 1 ||
+      localDay(reading.at) !== localDay(all[index + 1].at) || newPeriod(reading, all[index + 1]));
     if (kept.length) next[login] = kept;
   }
   return next;
@@ -220,29 +214,30 @@ function newPeriod(earlier: Reading, later: Reading): boolean {
 }
 
 /**
- * The local day's last reading minus the last one before that day, counting from zero across a
- * reset; `undefined` before the account's first reading.
+ * The local day's last reading minus the last one before that day; across a reset, the day's spend
+ * before the reset plus the new period's use. `undefined` before the account's first reading.
  */
 function usedOn(readings: Reading[], day: number): number | undefined {
-  const latest = readings.filter((reading) => reading.at < localDay(day, 1)).at(-1);
+  const dayReadings = readings.filter((reading) => reading.at < localDay(day, 1));
+  const latest = dayReadings.at(-1);
   if (!latest) return;
   // Until an account has a reading before the day, the day counts from its first reading.
   const base = readings.filter((reading) => reading.at < day).at(-1) ?? readings[0];
-  return Math.max(0, used(latest) - (newPeriod(base, latest) ? 0 : used(base)));
+  if (!newPeriod(base, latest)) return Math.max(0, used(latest) - used(base));
+  const beforeReset = dayReadings.filter((reading) => !newPeriod(base, reading)).at(-1)!;
+  return Math.max(0, used(beforeReset) - used(base)) + used(latest);
 }
 
-/** The latest reading minus the last one before local midnight, counting from zero across a reset. */
+/** Today's use, counted like any other day. */
 export function todayUsed(readings: Reading[], now: number): number {
-  const latest = readings.at(-1);
-  return !latest || expired(latest, now) ? 0 : usedOn(readings, localDay(now)) ?? 0;
+  return usedOn(readings, localDay(now)) ?? 0;
 }
 
-/** Each of the last 30 local days, oldest first, with its use; today's matches `todayUsed`. */
+/** Each of the last 30 local days, oldest first, with its use. */
 export function dailyUsed(readings: Reading[], now: number): Array<{ day: number; used?: number }> {
-  const today = localDay(now);
   return Array.from({ length: 30 }, (_, index) => {
     const day = localDay(now, index - 29);
-    return { day, used: day === today ? todayUsed(readings, now) : usedOn(readings, day) };
+    return { day, used: usedOn(readings, day) };
   });
 }
 

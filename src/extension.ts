@@ -1,17 +1,23 @@
-import { readFile, rm } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { readFile, rm } from "node:fs/promises";
+import { homedir } from "node:os";
+import { basename, dirname, join } from "node:path";
 
-import * as vscode from 'vscode';
+import * as vscode from "vscode";
 
-import { DARK, hoverMarkdown, LIGHT } from './hover';
-import { loadTally, saveTally, scanDebugLogs, topModels } from './models';
+import { DARK, hoverMarkdown, LIGHT } from "./hover";
+import { loadTally, saveTally, scanDebugLogs, topModels } from "./models";
 import {
-  addReadings, assignAccounts, currentAccount, loadRecords, readLogs, statusText, type LogState,
-} from './quota';
+  addReadings,
+  assignAccounts,
+  currentAccount,
+  loadRecords,
+  readLogs,
+  statusText,
+  type LogState,
+} from "./quota";
 
-const RECORDS_KEY = 'records';
-const MODELS_KEY = 'models';
+const RECORDS_KEY = "records";
+const MODELS_KEY = "models";
 const POLL_MS = 2_000;
 // Copilot writes its debug logs every 4 seconds, and Model use can wait a little longer.
 const SCAN_MS = 10_000;
@@ -28,11 +34,9 @@ export function activate(context: vscode.ExtensionContext): void {
   const logs: LogState = { windows: new Map(), logins: [] };
   let records = loadRecords(context.globalState.get(RECORDS_KEY));
   // globalStorageUri is <User>/globalStorage/<extension id>, or sits deeper under <User>/profiles in
-  // another profile. Every profile shares <User>/workspaceStorage.
-  const globalStorage = dirname(context.globalStorageUri.fsPath);
-  let user = dirname(globalStorage);
-  while (basename(user) !== 'User' && dirname(user) !== user) user = dirname(user);
-  const workspaceStorage = join(user, 'workspaceStorage');
+  // another profile.
+  let user = dirname(dirname(context.globalStorageUri.fsPath));
+  while (basename(user) !== "User" && dirname(user) !== user) user = dirname(user);
   const tally = loadTally(context.globalState.get(MODELS_KEY), Date.now());
   const read = new Map<string, number>();
   let scanned = 0;
@@ -45,28 +49,32 @@ export function activate(context: vscode.ExtensionContext): void {
   };
 
   // The window that switched Copilot Chat to Trace needs no restart, even before its next Trace line.
-  let switched = false;
+  // Unset until this extension host's Copilot Chat channel has written to the log.
+  let switched: boolean | undefined;
 
   // Copilot's own item sits right of the language mode (100.1); this lands directly right of it.
   const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100.05);
   const render = () => {
     const now = Date.now();
-    const needsRestart = !switched && ownLogWritten() && (logs.windows.get(windowName)!.traceAt ?? 0) < hostStart;
+    const needsRestart =
+      !switched && ownLogWritten() && (logs.windows.get(windowName)!.traceAt ?? 0) < hostStart;
     const text = statusText(records, now, needsRestart);
     if (item.text !== text) item.text = text;
     const kind = vscode.window.activeColorTheme.kind;
-    const light = kind === vscode.ColorThemeKind.Light || kind === vscode.ColorThemeKind.HighContrastLight;
+    const light =
+      kind === vscode.ColorThemeKind.Light || kind === vscode.ColorThemeKind.HighContrastLight;
     const markdown = hoverMarkdown(records, now, light ? LIGHT : DARK, topModels(tally));
     // Each assignment sends the window an update, so only a changed hover is sent.
     if ((item.tooltip as vscode.MarkdownString | undefined)?.value !== markdown) {
-      item.tooltip = markdown === undefined ? undefined
-        : Object.assign(new vscode.MarkdownString(markdown, true), { supportHtml: true });
+      item.tooltip =
+        markdown === undefined
+          ? undefined
+          : Object.assign(new vscode.MarkdownString(markdown, true), { supportHtml: true });
     }
   };
   render();
   item.show();
 
-  let traceChecked = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let disposed = false;
   const poll = async () => {
@@ -74,11 +82,12 @@ export function activate(context: vscode.ExtensionContext): void {
       const found = await readLogs(session, logs);
       // A Copilot Chat channel created after the switch would start at the old level, so wait until
       // this extension host's channel has written to the log.
-      if (!traceChecked && ownLogWritten()) {
-        traceChecked = true;
-        switched = await enableTrace();
-      }
-      const next = addReadings(records, assignAccounts(found, logs.logins, currentAccount(records)), Date.now());
+      if (switched === undefined && ownLogWritten()) switched = await enableTrace();
+      const next = addReadings(
+        records,
+        assignAccounts(found, logs.logins, currentAccount(records)),
+        Date.now(),
+      );
       if (JSON.stringify(next) !== JSON.stringify(records)) {
         records = next;
         await context.globalState.update(RECORDS_KEY, records);
@@ -86,13 +95,12 @@ export function activate(context: vscode.ExtensionContext): void {
     } catch {
       // The next poll tries again; the numbers shown stay.
     }
-    if (disposed) return;
     // The debug-log scan can take seconds, so the numbers show first; new model use shows next poll.
     render();
     try {
       if (Date.now() - scanned >= SCAN_MS) {
         scanned = Date.now();
-        if (await scanDebugLogs(globalStorage, workspaceStorage, tally, read, scanned)) {
+        if (await scanDebugLogs(user, tally, read, scanned)) {
           await context.globalState.update(MODELS_KEY, saveTally(tally));
         }
       }
@@ -104,33 +112,45 @@ export function activate(context: vscode.ExtensionContext): void {
   };
   void poll();
 
-  context.subscriptions.push(item, new vscode.Disposable(() => {
-    disposed = true;
-    clearTimeout(timer);
-  }));
+  context.subscriptions.push(
+    item,
+    new vscode.Disposable(() => {
+      disposed = true;
+      clearTimeout(timer);
+    }),
+  );
 }
 
 /** The old build's history and caches. Old windows still running recreate them until they reload. */
 async function removeOldData(context: vscode.ExtensionContext): Promise<void> {
   const storage = context.globalStorageUri.fsPath;
-  await Promise.all(['account-tracking', 'quota-history.jsonl', 'scan-cache'].map((name) =>
-    rm(join(storage, name), { recursive: true, force: true }).catch(() => undefined)));
-  if (context.globalState.get('copilotUsage.sortMode') !== undefined) {
-    await context.globalState.update('copilotUsage.sortMode', undefined);
+  await Promise.all(
+    ["account-tracking", "quota-history.jsonl", "scan-cache"].map((name) =>
+      rm(join(storage, name), { recursive: true, force: true }).catch(() => undefined),
+    ),
+  );
+  if (context.globalState.get("copilotUsage.sortMode") !== undefined) {
+    await context.globalState.update("copilotUsage.sortMode", undefined);
   }
 }
 
 /**
- * Model use comes from Copilot's debug logs, which a window writes from its next start after this
- * setting is on. A user value, on or off, stays.
+ * Model use comes from Copilot's debug logs, which a window writes from its next start after the
+ * first setting is on, and from VS Code's agent session usage logs, written at once after the
+ * second. A user value, on or off, stays.
  */
 export async function enableDebugLog(): Promise<void> {
-  try {
-    const copilot = vscode.workspace.getConfiguration('github.copilot.chat');
-    if (copilot.inspect('agentDebugLog.fileLogging.enabled')?.globalValue !== undefined) return;
-    await copilot.update('agentDebugLog.fileLogging.enabled', true, vscode.ConfigurationTarget.Global);
-  } catch {
-    // Model use stays empty until the user turns the setting on.
+  for (const setting of [
+    "github.copilot.chat.agentDebugLog.fileLogging.enabled",
+    "chat.agentHost.agentDebugLog.enabled",
+  ]) {
+    try {
+      const settings = vscode.workspace.getConfiguration();
+      if (settings.inspect(setting)?.globalValue !== undefined) continue;
+      await settings.update(setting, true, vscode.ConfigurationTarget.Global);
+    } catch {
+      // Model use misses these logs until the user turns the setting on.
+    }
   }
 }
 
@@ -143,10 +163,20 @@ export async function enableDebugLog(): Promise<void> {
 export async function enableTrace(): Promise<boolean> {
   try {
     const portable = process.env.VSCODE_PORTABLE;
-    const argv = portable ? join(portable, 'argv.json') : join(homedir(),
-      JSON.parse(await readFile(join(vscode.env.appRoot, 'product.json'), 'utf8')).dataFolderName, 'argv.json');
-    if (hasCopilotLogLevel(await readFile(argv, 'utf8').catch(() => ''))) return false;
-    await vscode.commands.executeCommand('workbench.action.setDefaultLogLevel', vscode.LogLevel.Trace, 'github.copilot-chat');
+    const argv = portable
+      ? join(portable, "argv.json")
+      : join(
+          homedir(),
+          JSON.parse(await readFile(join(vscode.env.appRoot, "product.json"), "utf8"))
+            .dataFolderName,
+          "argv.json",
+        );
+    if (hasCopilotLogLevel(await readFile(argv, "utf8").catch(() => ""))) return false;
+    await vscode.commands.executeCommand(
+      "workbench.action.setDefaultLogLevel",
+      vscode.LogLevel.Trace,
+      "github.copilot-chat",
+    );
     return true;
   } catch {
     // Copilot Chat keeps its level.
@@ -156,13 +186,7 @@ export async function enableTrace(): Promise<boolean> {
 
 /** argv.json has a `github.copilot-chat` log-level entry. argv.json allows comments. */
 export function hasCopilotLogLevel(argv: string): boolean {
-  for (const [token] of argv.matchAll(/\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:[^"\\\n]|\\.)*"/g)) {
-    if (!token.startsWith('"')) continue;
-    try {
-      if (/^github\.copilot-chat[:=]./i.test(JSON.parse(token))) return true;
-    } catch {
-      // A malformed string is not an entry.
-    }
-  }
-  return false;
+  return [...argv.matchAll(/\/\/[^\n]*|\/\*[\s\S]*?\*\/|"((?:[^"\\\n]|\\.)*)"/g)].some(([, text]) =>
+    /^github\.copilot-chat[:=]./i.test(text ?? ""),
+  );
 }

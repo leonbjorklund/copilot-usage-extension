@@ -22,6 +22,13 @@ function request(model: string, credits: number | undefined, ts = at(23, 10), sp
     attrs: { model, inputTokens: 38420, outputTokens: 58, ...(credits === undefined ? {} : { copilotUsageNanoAiu: credits * 1e9 }) } })}\n`;
 }
 
+/** One line of a VS Code agent session's usage log, holding its turn's running total unless that is 0. */
+function call(model: string, total: number | undefined, id: number, ts = at(23, 10)): string {
+  return `${JSON.stringify({ model, inputTokens: 25669, outputTokens: 268, cacheReadTokens: 0,
+    ...(total === undefined ? {} : { totalNanoAiu: total * 1e9 }), schemaVersion: 2, sdkSessionId: 's', eventId: `${String(id).padStart(8, '0')}-0000-4000-8000-000000000000`,
+    kind: 'modelCall', correlation: 'unresolved', ts: new Date(ts).toISOString() })}\n`;
+}
+
 function uses(tally: Tally): { [model: string]: [number, number] } {
   return Object.fromEntries([...tally.models].map(([model, use]) => [model, [use.nano / 1e9, use.chats.size]]));
 }
@@ -62,7 +69,7 @@ describe('scanning the debug logs', () => {
   });
 
   const scan = (root: string, tally: Tally, read: Map<string, number>, time: number) =>
-    scanDebugLogs(join(root, 'globalStorage'), join(root, 'workspaceStorage'), tally, read, time);
+    scanDebugLogs(root, tally, read, time);
 
   async function user(): Promise<string> {
     const root = await mkdtemp(join(tmpdir(), 'copilot-credits-'));
@@ -79,19 +86,21 @@ describe('scanning the debug logs', () => {
   const workspace = (root: string, id = 'abc') => join(root, 'workspaceStorage', id, 'GitHub.copilot-chat', 'debug-logs');
   const global = (root: string) => join(root, 'globalStorage', 'github.copilot-chat', 'debug-logs');
 
-  it('reads every folder\'s chats and counts each chat\'s files, subagents included', async () => {
+  it('reads every folder\'s and profile\'s chats and counts each chat\'s files, subagents included', async () => {
     const root = await user();
     await log(workspace(root), 'a', 'main.jsonl', request('claude-opus-5', 4) + request('gpt-6-astra', 3, at(23, 11)));
     await log(workspace(root), 'a', 'runSubagent-Explore-1.jsonl', request('claude-opus-5', 2, at(23, 12), '0000000000000001'));
     await log(workspace(root), 'a', 'models.json', request('claude-opus-5', 50, at(23, 13)));
     await log(workspace(root, 'def'), 'b', 'main.jsonl', request('claude-opus-5', 1));
     await log(global(root), 'c', 'main.jsonl', request('gemini-3.8-flash', 1));
+    await log(global(join(root, 'profiles', '1a2b3c')), 'd', 'main.jsonl', request('claude-opus-5', 1, at(23, 15)));
+    await log(global(join(root, 'profiles', 'builtin', 'agents')), 'e', 'main.jsonl', request('gemini-3.8-flash', 1, at(23, 16)));
     await mkdir(join(root, 'workspaceStorage', 'empty'), { recursive: true });
     // Folders without chats, and a file where a chat folder would be, leave the scan complete.
     await writeFile(join(global(root), 'loose.jsonl'), request('claude-opus-5', 50, at(23, 14)));
     const tally = emptyTally(now);
     expect(await scan(root, tally, new Map(), now)).toBe(true);
-    expect(uses(tally)).toEqual({ 'claude-opus-5': [7, 2], 'gpt-6-astra': [3, 1], 'gemini-3.8-flash': [1, 1] });
+    expect(uses(tally)).toEqual({ 'claude-opus-5': [8, 3], 'gpt-6-astra': [3, 1], 'gemini-3.8-flash': [2, 2] });
     expect(tally.readAt).toBe(now);
   });
 
@@ -167,16 +176,57 @@ describe('scanning the debug logs', () => {
     expect(uses(tally)).toEqual({ 'claude-opus-5': [6, 1] });
   });
 
-  it('starts a new tally in a new month', async () => {
+  const usage = (root: string) => join(root, 'agentHostUsage');
+
+  it('counts each agent session call once, by the rise of its turn\'s running total', async () => {
     const root = await user();
-    await log(workspace(root), 'a', 'main.jsonl', request('claude-opus-5', 4, at(30, 12)));
+    await mkdir(usage(root), { recursive: true });
+    await writeFile(join(usage(root), 'a.jsonl'), call('claude-opus-5', 4, 1) + call('claude-haiku-5', 5, 2) +
+      // Another window can log a call again, after later calls.
+      call('claude-opus-5', 8, 3) + call('claude-haiku-5', 5, 2) + call('claude-opus-5', 10, 4) +
+      // A new turn starts its total from zero, and a free call costs nothing.
+      call('gpt-6-astra', 2, 5) + call('gpt-6-astra', 2, 6) +
+      // A turn whose total is still 0 logs none; the last line is still being written.
+      call('gpt-6-astra', undefined, 7) + call('claude-opus-5', 3, 8) + call('claude-opus-5', 4, 9).slice(0, 40));
+    await writeFile(join(usage(root), 'b.jsonl'), call('claude-opus-5', 1, 1, at(31, 12, 8)) + call('claude-opus-5', 3, 2));
+    const tally = emptyTally(now);
+    expect(await scan(root, tally, new Map(), now)).toBe(true);
+    expect(uses(tally)).toEqual({ 'claude-opus-5': [14, 2], 'claude-haiku-5': [1, 1], 'gpt-6-astra': [2, 1] });
+  });
+
+  it('never counts an agent session call twice when reading its log again after a restart or a rewrite', async () => {
+    const root = await user();
+    await mkdir(usage(root), { recursive: true });
+    const file = join(usage(root), 'a.jsonl');
+    await writeFile(file, call('claude-opus-5', 4, 1) + call('claude-opus-5', 6, 2));
+    const first = emptyTally(now);
+    await scan(root, first, new Map(), now);
+    const restarted = loadTally(JSON.parse(JSON.stringify(saveTally(first))), now);
+    restarted.readAt = 0;
+    const read = new Map<string, number>();
+    expect(await scan(root, restarted, read, now + 1)).toBe(false);
+    // VS Code rewrites a log to its newest lines, here at a clearly later time.
+    await writeFile(file, call('claude-opus-5', 6, 2) + call('claude-opus-5', 9, 3));
+    await utimes(file, new Date(now), new Date(now));
+    expect(await scan(root, restarted, read, now + 2)).toBe(true);
+    expect(uses(restarted)).toEqual({ 'claude-opus-5': [9, 1] });
+  });
+
+  it('starts a new tally in a new month, counting the lines of it that the last scan before midnight read', async () => {
+    const root = await user();
+    const file = await log(workspace(root), 'a', 'main.jsonl',
+      request('claude-opus-5', 4, at(30, 12)) + request('gpt-6-astra', 2, at(1, 0, 10)));
+    await mkdir(usage(root), { recursive: true });
+    const agent = join(usage(root), 'b.jsonl');
+    await writeFile(agent, call('claude-opus-5', 1, 1, at(30, 12)) + call('claude-haiku-5', 3, 2, at(1, 0, 10)));
+    for (const path of [file, agent]) await utimes(path, new Date(at(1, 0, 10)), new Date(at(1, 0, 10)));
     const tally = emptyTally(at(30, 13));
     const read = new Map<string, number>();
     await scan(root, tally, read, at(30, 13));
-    expect(uses(tally)).toEqual({ 'claude-opus-5': [4, 1] });
+    expect(uses(tally)).toEqual({ 'claude-opus-5': [5, 2] });
     expect(await scan(root, tally, read, at(1, 10, 10))).toBe(true);
     expect(tally.month).toBe('2026-10');
-    expect(uses(tally)).toEqual({});
+    expect(uses(tally)).toEqual({ 'gpt-6-astra': [2, 1], 'claude-haiku-5': [2, 1] });
   });
 
   it.each(['log', 'chat folder'])('leaves the scan incomplete when a %s cannot be read, so a restart reads it again', async (kind) => {

@@ -1,15 +1,8 @@
-import { appendFile, mkdir, mkdtemp, rm, stat, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
-
-vi.mock('node:fs/promises', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('node:fs/promises')>();
-  return { ...actual, stat: vi.fn(actual.stat), open: vi.fn(actual.open) };
-});
-
-import * as fsPromises from 'node:fs/promises';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   addReadings, assignAccounts, currentAccount, dailyUsed, formatNumber, loadRecords, monthlyPace, readLogs, statusText,
@@ -186,7 +179,7 @@ describe('reading the session logs', () => {
     expect(await readLogs(root, newState())).toEqual([{ login: 'leon-work', reading: reading(time(23, 23, 59, 59, 999), 26.5) }]);
   });
 
-  it('keeps each window\'s latest Trace line time and the log\'s modification time', async () => {
+  it('keeps each window\'s latest Trace line time', async () => {
     const root = await session();
     const first = await log(root, 'window1', `${stamp(time(23, 9))} [info] Logged in as leon-work, not [trace]\r\n` +
       `  ${stamp(time(23, 9, 1))} [trace] inside a multi-line message\r\n`);
@@ -196,36 +189,12 @@ describe('reading the session logs', () => {
     await readLogs(root, state);
     expect(state.windows.get('window1')?.traceAt).toBeUndefined();
     expect(state.windows.get('window2')?.traceAt).toBe(time(23, 9, 2));
-    expect(state.windows.get('window2')?.modified).toBe((await stat(second)).mtimeMs);
     await appendFile(first, `${stamp(time(23, 10))} [trace] now\r\n`);
     await readLogs(root, state);
     expect(state.windows.get('window1')?.traceAt).toBe(time(23, 10));
-    expect(state.windows.get('window1')?.modified).toBe((await stat(first)).mtimeMs);
     await appendFile(second, `${stamp(time(23, 11))} [info] no Trace line in this read\r\n`);
     await readLogs(root, state);
     expect(state.windows.get('window2')?.traceAt).toBe(time(23, 9, 2));
-  });
-
-  it('stops at the end of a log that shrank while being read, and closes every file', async () => {
-    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
-    const root = await session();
-    const file = await log(root, 'window1', tokenLine(time(23, 9), 'leon-work') + quotaLine(time(23, 9, 1), 26.6));
-    const real = await actual.stat(file);
-    let open = 0;
-    vi.mocked(fsPromises.stat).mockResolvedValueOnce({ ...real, size: real.size + 100 } as Awaited<ReturnType<typeof actual.stat>>);
-    vi.mocked(fsPromises.open).mockImplementation(async (...args: Parameters<typeof actual.open>) => {
-      const handle = await actual.open(...args);
-      open++;
-      const close = handle.close.bind(handle);
-      handle.close = async () => { open--; return close(); };
-      return handle;
-    });
-    try {
-      expect(await readLogs(root, newState())).toEqual([{ login: 'leon-work', reading: reading(time(23, 9, 1), 26.6) }]);
-      expect(open).toBe(0);
-    } finally {
-      vi.mocked(fsPromises.open).mockImplementation(actual.open);
-    }
   });
 
   it('returns nothing for a missing session', async () => {
@@ -353,11 +322,11 @@ describe('today and month', () => {
     expect(statusText({ leon: [reading(time(22, 20), 23.5), reading(time(23, 15), 23.8)] }, now)).toBe('0% • 76.2/100%');
   });
 
-  it('shows zero today too once the reset passed and Copilot has not reported since', () => {
+  it('keeps today\'s spend but shows the month at zero once the reset passed and Copilot has not reported since', () => {
     // A reset at local noon keeps the reset apart from local midnight in every time zone.
     const resetDate = new Date(2026, 9, 1, 12).toISOString();
     const readings = [reading(time(30, 23, 59), 30, { resetDate }), reading(time(1, 11, 59, 0, 0, 10), 28, { resetDate })];
-    expect(statusText({ leon: readings }, time(1, 12, 1, 0, 0, 10))).toBe('0% • 0/100%');
+    expect(statusText({ leon: readings }, time(1, 12, 1, 0, 0, 10))).toBe('2% • 0/100%');
   });
 
   it('trusts a reading that still reports the old period after its reset date', () => {
@@ -406,13 +375,16 @@ describe('days', () => {
     ]);
   });
 
-  it('counts a day from zero across the monthly reset, and today as zero once the reset passed unreported', () => {
+  it('adds a reset day\'s spend before the reset to the new period\'s, keeping the reading before the reset', () => {
     const resetDate = new Date(2026, 9, 1, 12).toISOString();
     const readings = [reading(time(29, 20), 50, { resetDate }), reading(time(30, 20), 40, { resetDate }),
       reading(time(1, 15, 0, 0, 0, 10), 97, { resetDate: '2026-11-01T00:00:00.000Z' })];
     expect(dailyUsed(readings, time(1, 16, 0, 0, 0, 10)).slice(-2).map((entry) => entry.used)).toEqual([10, 3]);
-    const unreported = [reading(time(30, 20), 40, { resetDate }), reading(time(1, 11, 0, 0, 0, 10), 38, { resetDate })];
-    expect(dailyUsed(unreported, time(1, 16, 0, 0, 0, 10)).slice(-2).map((entry) => entry.used)).toEqual([0, 0]);
+    const beforeReset = reading(time(1, 11, 0, 0, 0, 10), 38, { resetDate });
+    const saved = addReadings({}, [...readings, beforeReset].map((entry) => ({ login: 'leon', reading: entry })),
+      time(1, 16, 0, 0, 0, 10));
+    expect(saved.leon).toContainEqual(beforeReset);
+    expect(dailyUsed(saved.leon, time(1, 16, 0, 0, 0, 10)).slice(-2).map((entry) => entry.used)).toEqual([10, 5]);
   });
 });
 

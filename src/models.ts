@@ -1,9 +1,9 @@
-import { readdir, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { readdir, readFile, stat } from 'node:fs/promises';
+import { basename, join } from 'node:path';
 
 import { readLines } from './quota';
 
-/** This local month's model use from Copilot's debug logs, across every account. */
+/** This local month's model use from Copilot's debug logs and VS Code's agent session usage logs, across every account. */
 export interface Tally {
   /** The local month, like `2026-09`. */
   month: string;
@@ -41,10 +41,45 @@ export function addRequest(tally: Tally, chat: string, line: string): boolean {
   }
   const { type, ts, spanId, attrs } = (entry ?? {}) as { [key: string]: unknown };
   const { model, copilotUsageNanoAiu: nano } = (attrs ?? {}) as { [key: string]: unknown };
-  if (type !== 'llm_request' || typeof ts !== 'number' || monthOf(ts) !== tally.month || typeof spanId !== 'string' ||
-    typeof model !== 'string' || !model || typeof nano !== 'number' || !(nano > 0 && Number.isFinite(nano))) return false;
+  if (type !== 'llm_request' || typeof ts !== 'number' || typeof spanId !== 'string' || typeof model !== 'string' ||
+    typeof nano !== 'number') return false;
   // Every window numbers its spans from 1, so the start time tells requests of one chat apart.
-  const key = `${ts.toString(36)}.${spanId.replace(/^0+/, '')}`;
+  return count(tally, chat, ts, `${ts.toString(36)}.${spanId.replace(/^0+/, '')}`, model, nano);
+}
+
+/**
+ * Counts the model calls of one VS Code agent session's usage log. Each line holds its turn's
+ * running total, left out while it is 0, so a call costs the rise since the line before, or the
+ * whole total when it drops, which marks a new turn. Another window can log the same call again.
+ * Returns whether the tally changed.
+ */
+function addAgentCalls(tally: Tally, chat: string, text: string): boolean {
+  let changed = false;
+  let turn = 0;
+  const calls = new Set<string>();
+  for (const line of text.split('\n')) {
+    let entry: unknown;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      // The line VS Code is still writing.
+      continue;
+    }
+    const { kind, model, ts, eventId, totalNanoAiu } = (entry ?? {}) as { [key: string]: unknown };
+    if (kind !== 'modelCall' || typeof model !== 'string' || typeof ts !== 'string' || typeof eventId !== 'string' ||
+      calls.has(eventId)) continue;
+    calls.add(eventId);
+    const total = typeof totalNanoAiu === 'number' ? totalNanoAiu : 0;
+    // The first 12 hex digits of the call's id tell the calls of a session apart.
+    if (count(tally, chat, Date.parse(ts), eventId.slice(0, 13), model, total >= turn ? total - turn : total)) changed = true;
+    turn = total;
+  }
+  return changed;
+}
+
+/** Counts a request of this month with a cost once per chat and key. Returns whether the tally changed. */
+function count(tally: Tally, chat: string, at: number, key: string, model: string, nano: number): boolean {
+  if (monthOf(at) !== tally.month || !model || !(nano > 0 && Number.isFinite(nano))) return false;
   const seen = tally.seen.get(chat) ?? new Set();
   if (seen.has(key)) return false;
   tally.seen.set(chat, seen.add(key));
@@ -57,16 +92,17 @@ export function addRequest(tally: Tally, chat: string, line: string): boolean {
 
 /**
  * Reads what Copilot's debug logs gained since the last scan into the tally, starting a new tally
- * in a new month. Copilot keeps them per folder under `workspaceStorage`, and under this profile's
- * `globalStorage` for windows without a folder. `read` holds the bytes read of each file. Resolves
- * to whether the tally changed.
+ * in a new month. Copilot keeps them per folder under `workspaceStorage`, and under each profile's
+ * `globalStorage` for windows without a folder; VS Code keeps its agent sessions' usage logs in
+ * `agentHostUsage`. `user` is VS Code's `User` folder, and `read` holds the bytes read of each debug
+ * log and the modification time of each usage log read. Resolves to whether the tally changed.
  */
-export async function scanDebugLogs(
-  globalStorage: string, workspaceStorage: string, tally: Tally, read: Map<string, number>, now: number,
-): Promise<boolean> {
+export async function scanDebugLogs(user: string, tally: Tally, read: Map<string, number>, now: number): Promise<boolean> {
   let changed = false;
   if (tally.month !== monthOf(now)) {
     Object.assign(tally, emptyTally(now));
+    // A scan that started before midnight read past lines of this month without counting them.
+    read.clear();
     changed = true;
   }
   let complete = true;
@@ -78,7 +114,15 @@ export async function scanDebugLogs(
   const monthStart = new Date(new Date(now).getFullYear(), new Date(now).getMonth(), 1).getTime();
   // File times can trail the clock by a moment.
   const since = Math.max(tally.readAt, monthStart) - 2000;
-  const roots = [join(globalStorage, 'github.copilot-chat', 'debug-logs'),
+  // Other profiles sit at `profiles/<id>`, or a level deeper like `profiles/builtin/agents`.
+  const profiles = join(user, 'profiles');
+  const folders = [user];
+  for (const id of await list(profiles)) {
+    folders.push(join(profiles, id));
+    for (const name of await list(join(profiles, id))) folders.push(join(profiles, id, name));
+  }
+  const workspaceStorage = join(user, 'workspaceStorage');
+  const roots = [...folders.map((folder) => join(folder, 'globalStorage', 'github.copilot-chat', 'debug-logs')),
     ...(await list(workspaceStorage)).map((id) => join(workspaceStorage, id, 'GitHub.copilot-chat', 'debug-logs'))];
   for (const root of roots) {
     for (const chat of await list(root)) {
@@ -111,6 +155,21 @@ export async function scanDebugLogs(
           complete = false;
         }
       }
+    }
+  }
+  // VS Code rewrites an agent session's usage log to its newest lines now and then, so a changed log is read whole.
+  const usage = join(user, 'agentHostUsage');
+  for (const name of await list(usage)) {
+    if (!name.endsWith('.jsonl')) continue;
+    const file = join(usage, name);
+    try {
+      const { mtimeMs } = await stat(file);
+      if (read.has(file) ? read.get(file) === mtimeMs : mtimeMs < since) continue;
+      if (addAgentCalls(tally, basename(name, '.jsonl'), await readFile(file, 'utf8'))) changed = true;
+      read.set(file, mtimeMs);
+    } catch {
+      // The next scan tries again.
+      complete = false;
     }
   }
   if (changed && complete) tally.readAt = now;

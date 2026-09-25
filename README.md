@@ -21,17 +21,17 @@ Hover the item to see:
 - Today's share and credits, and the account Copilot Chat signed in with.
 - The month's share and credits of your allowance, and the monthly pace: the share you will have used by the reset if your average daily use so far continues.
 - A graph of your last 30 days. Bars for this month are bright. Hover a bar to see that day's share.
-- Model use this month: your top 5 models by credits, how many chat sessions used each, and each model's share. It counts every account's chats in this VS Code since its debug logs were turned on, GPT models included, and leaves out Copilot use elsewhere, like on github.com.
+- Model use this month: your top 5 models by credits, how many chat sessions used each, and each model's share. It counts every account's chats in this VS Code since its debug logs were turned on, GPT models included, and leaves out Copilot use elsewhere, like on github.com. VS Code's agent sessions count too.
 
 ## How it works
 
 Copilot Chat logs your remaining allowance after each response, but only at the Trace log level. Copilot Credits reads those lines from every open window and saves a small daily record per account in VS Code's extension storage, so the numbers show at once after a restart. Copilot reports the share of your allowance left in steps of 0.1%, and the credits shown come from that share, so they move in steps of 80 credits on an 80 000 credit allowance. The share can stay flat through dozens of requests, then drop several tenths at once.
 
-Model use comes from Copilot's debug logs, which record each request's model and credits. These logs also store each chat in full on your disk, including your messages, the replies and tool output, and they can take gigabytes of space.
+Model use comes from Copilot's debug logs, which record each request's model and credits, and from VS Code's usage logs for its agent sessions. Copilot's debug logs also store each chat in full on your disk, including your messages, the replies and tool output, and they can take gigabytes of space.
 
-Copilot Credits turns both logs on without a prompt:
+Copilot Credits turns these logs on without a prompt:
 
 - Copilot Chat's default log level becomes Trace. VS Code saves it in `argv.json`.
-- `github.copilot.chat.agentDebugLog.fileLogging.enabled` becomes true in your user settings, which Settings Sync copies to your other machines.
+- `github.copilot.chat.agentDebugLog.fileLogging.enabled` and `chat.agentHost.agentDebugLog.enabled` become true in your user settings, which Settings Sync copies to your other machines.
 
-A value you already set yourself stays as you set it, so setting the debug log setting to false keeps it off. Uninstalling leaves both in place. To undo them after uninstalling, run **Preferences: Configure Runtime Arguments** and remove `github.copilot-chat=trace` from `log-level`, then remove the setting from your user settings.
+A value you already set yourself stays as you set it, so setting either debug log setting to false keeps it off. Uninstalling leaves all of them in place. To undo them after uninstalling, run **Preferences: Configure Runtime Arguments** and remove `github.copilot-chat=trace` from `log-level`, then remove both settings from your user settings.

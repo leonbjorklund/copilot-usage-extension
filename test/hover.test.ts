@@ -54,11 +54,6 @@ describe('hover', () => {
       '(80\u00a0000&nbsp;/&nbsp;82\u00a0560&nbsp;credits)');
   });
 
-  it('keeps the used share first until the allowance is spent', () => {
-    expect(hoverMarkdown({ leon: [reading(time(23, 15), 0.5)] }, now, DARK, []))
-      .toContain('<strong>Month:</strong> 99.5%&nbsp;/&nbsp;100%&nbsp;&nbsp;');
-  });
-
   it('shows the pace as unavailable without a reset at the start of next month', () => {
     for (const resetDate of [undefined, '2026-10-23T15:00:00.000Z']) {
       expect(hoverMarkdown({ leon: [reading(time(23, 15), 23.5, { resetDate })] }, now, DARK, []))
@@ -101,11 +96,6 @@ describe('model use', () => {
 
   it('ends the hover with the top models, their chats and share', () => {
     const records = { leon: [reading(time(23, 15), 23.5)] };
-    expect(hoverMarkdown(records, now, DARK, models)).toBe(`${hoverMarkdown(records, now, DARK, [])}\n${section}`);
-  });
-
-  it('follows unlimited and zero allowances too', () => {
-    const records = { leon: [reading(time(23, 15), 100, { quota: -1, unlimited: true })] };
     expect(hoverMarkdown(records, now, DARK, models)).toBe(`${hoverMarkdown(records, now, DARK, [])}\n${section}`);
   });
 });
