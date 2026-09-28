@@ -1,8 +1,8 @@
 node_modules/
-out/
 dist/
 .worktrees/
 *.vsix
 TODO
 .claude/worktrees/
 /scripts/preview.ps1
+/scripts/mock.ts
