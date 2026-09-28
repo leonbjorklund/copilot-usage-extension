@@ -1,27 +1,13 @@
-## GitHub Copilot Tokens and AI Credit Cost
+## Copilot Credits
 
-Lightweight Copilot usage viewer for token count and AI credit cost from Copilot log files. Runs locally. Shows monthly credit use and estimated monthly pace. Requires `github.copilot.chat.agentDebugLog.fileLogging.enabled`.
+Lightweight Copilot usage viewer for credit use from Copilot log files. Shows today's and this month's credit use, estimated monthly pace, last 30 days and credits by model. Runs locally.
 
-Dollar amounts are estimates using [GitHub's rate](https://docs.github.com/en/copilot/concepts/billing/usage-based-billing-for-individuals) of $0.01 USD per AI Credit.
-
-#### Status Bar
-
-<img src="https://github.com/leonbjorklund/copilot-usage-extension/raw/main/docs/statusbar-tooltip.png?v=3" width="400" alt="Status bar tooltip" />
-
-#### Tree View
-
-<img src="https://github.com/leonbjorklund/copilot-usage-extension/raw/main/docs/activity-bar-treeview.png?v=3" width="400" alt="Usage tree view" />
+<img src="docs/statusbar-tooltip.png" width="400" alt="Status bar hover" />
 
 ## Reference
 
-Commands:
+Reads Copilot's own log files. Sets:
 
-- `Copilot Token Cost: Refresh` — re-scans log files and updates totals
-- `Copilot Token Cost: Show Scan Diagnostics` — shows details about skipped or unreadable files
-- `Open Source Log` — opens the log file a session was read from
-- `Sort Sessions by Cost` — orders the session list by AI Credit cost
-- `Sort Sessions by Time` — orders the session list by most recent
-
-Settings:
-
-- `copilotUsage.dataPath` — extra local folder to scan for Copilot usage data (absolute path)
+- Copilot Chat's default log level trace, usage by date
+- `github.copilot.chat.agentDebugLog.fileLogging.enabled`, credits by model
+- `chat.agentHost.agentDebugLog.enabled`, for the agents window

@@ -1,23 +1,36 @@
-# Copilot Token Cost
+# Copilot Credits
 
-Local TypeScript VS Code extension. Entry point: `src/extension.ts`; esbuild output: `dist/extension.js`.
+VS Code extension that shows the signed-in account's Copilot credit use in a status bar item and its hover. It reads Copilot's log files on this machine.
 
-## Development
+## Project map
 
-- Use scripts in `package.json`. After code changes, run `npm run compile`, relevant tests, and `npm run preview`. Docs-only changes need no build or tests.
-- Preview and F5 use real usage data and sign-ins. Keep their test gates; use temporary log fixtures for account transitions. Live account switching belongs to the user. Never run old authenticated quota builds against this profile or edit authentication storage.
-- Keep changes localized and preserve strict TypeScript and CommonJS. Add focused regression tests for behavior changes.
-- If a design rule causes incorrect behavior, present the evidence, proposed change, and drawbacks, then ask before changing the rule or affected behavior.
+- `src/extension.ts`: activation, polling, settings setup and the status bar item.
+- `src/quota.ts`: reads quota lines from Copilot Chat's output logs, assigns them to accounts, and does the today, month and pace math.
+- `src/models.ts`: tallies credits by model from Copilot's debug logs and VS Code's agent session usage logs.
+- `src/hover.ts`: builds the hover's markdown and the daily bar images.
+- `test/`: Vitest tests, one file per source file.
+- `esbuild.js`: bundles `src/extension.ts` into `dist/extension.js`.
+- `scripts/install-local.js`: packages the extension and installs it into VS Code.
 
-## Project safeguards
+## Commands
 
-- Keep usage local. Read quota from Copilot's output log; no telemetry, GitHub session requests, authenticated quota fetches, or credential extraction.
-- Count only positive `copilotUsageNanoAiu`. Tokens are not billing; USD is an estimate. Child runs bill to the parent session but never name it. Title records supply metadata only.
-- Assign requests to accounts only with a unique window match and successful authentication evidence. Leave historical and uncertain usage unassigned. Local usage must work without quota.
-- Preserve `globalStorageUri/account-tracking/start.json` and recorded usage. Shared ledgers and `quota-history.jsonl` are append-only; never truncate, rewrite, or reset them for recovery. Use temporary copies for destructive tests.
-- Preserve concurrent append retries, atomic snapshot publication, and validation before retiring ledgers. Frozen account decisions are permanent. Before changing attribution, log-loss handling, or rollover, read `src/core/accountTracking.ts` and `test/accountTracking.test.ts`.
-- Keep scans bounded and tolerate unreadable files. Resume JSONL reads from `consumedBytes`, not a pre-read file size. Title updates must preserve request identity and billing.
-- Named quota requires successful account evidence in this window. Lost evidence must not retain an owner or add account history. Before changing quota continuity or account transitions, read `src/core/quotaService.ts` and `test/quotaService.test.ts`.
-- Keep the last server-reported percentage without time-based expiry and preserve its precision. Do not reconstruct exact spent credits or guess daily usage across unobserved gaps.
-- Keep Copilot Chat's Trace default enabled across reloads and shutdown. Preserve other logging settings, explicit channel overrides, sign-ins, and other extensions' approvals.
-- VS Code sanitizes tooltip HTML. Keep graph rendering compatible and assign the tooltip only when its markdown changes to avoid redrawing an open hover.
+- `npm test`: run the tests.
+- `npm run compile`: type check and build.
+- `npm run package`: tests, type check and production build into a `.vsix`. It must pack only `LICENSE`, `package.json`, `README.md`, `logos/logo.png` and `dist/extension.js`.
+- `npm run install:local`: package and install into VS Code.
+
+## Data sources
+
+`<data>` = VS Code user data dir (`%APPDATA%\Code`, `~/Library/Application Support/Code`, `~/.config/Code`).
+
+- Quota: `<data>/logs/<session>/window<N>/exthost/GitHub.copilot-chat/GitHub Copilot Chat.log`, `[ChatQuota]` lines (Trace only)
+- Model credits: `debug-logs/<chat>/*.jsonl` under `<data>/User/workspaceStorage/<id>/GitHub.copilot-chat/` and `<data>/User/globalStorage/github.copilot-chat/`, `llm_request` lines
+- Agent sessions: `<data>/User/agentHostUsage/<session>.jsonl`, `modelCall` lines
+- Copilot Chat source: `resources/app/extensions/copilot/dist/extension.js` inside the VS Code install (on Windows under a `<commit>` folder)
+
+## Working rules
+
+- Make the normal path work: several windows, restarts, account switches and a new month. A rare case may show a wrong value briefly if the next update fixes it. Guard against values that stay wrong, and against crashes.
+- Stay local: no network calls, sign-in or telemetry.
+- Add focused tests for parsing and math, and break the code once to see each new test fail.
+- Finish with `npm run package` and a subagent review of the diff.
