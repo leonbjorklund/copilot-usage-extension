@@ -37,7 +37,7 @@
     "ai"
   ],
   "engines": {
-    "vscode": "^1.120.0"
+    "vscode": "^1.139.0"
   },
   "categories": [
     "AI"
