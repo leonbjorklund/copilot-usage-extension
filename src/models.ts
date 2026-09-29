@@ -50,8 +50,9 @@ export function addRequest(tally: Tally, chat: string, line: string): boolean {
 /**
  * Counts the model calls of one VS Code agent session's usage log. Each line holds its turn's
  * running total, left out while it is 0, so a call costs the rise since the line before, or the
- * whole total when it drops, which marks a new turn. Another window can log the same call again.
- * Returns whether the tally changed.
+ * whole total when it drops, which marks a new turn. The log marks no turns, so a new turn whose
+ * first call costs more than the whole turn before reads as a rise and counts short. Another window
+ * can log the same call again. Returns whether the tally changed.
  */
 function addAgentCalls(tally: Tally, chat: string, text: string): boolean {
   let changed = false;
@@ -92,10 +93,11 @@ function count(tally: Tally, chat: string, at: number, key: string, model: strin
 
 /**
  * Reads what Copilot's debug logs gained since the last scan into the tally, starting a new tally
- * in a new month. Copilot keeps them per folder under `workspaceStorage`, and under each profile's
- * `globalStorage` for windows without a folder; VS Code keeps its agent sessions' usage logs in
- * `agentHostUsage`. `user` is VS Code's `User` folder, and `read` holds the bytes read of each debug
- * log and the modification time of each usage log read. Resolves to whether the tally changed.
+ * in a new month. Copilot keeps them per folder under `workspaceStorage`, and under `globalStorage`,
+ * the default profile's in every profile, for windows without a folder; VS Code keeps its agent
+ * sessions' usage logs in `agentHostUsage`. `user` is VS Code's `User` folder, and `read` holds the
+ * bytes read of each debug log and the modification time of each usage log read. Resolves to
+ * whether the tally changed.
  */
 export async function scanDebugLogs(user: string, tally: Tally, read: Map<string, number>, now: number): Promise<boolean> {
   let changed = false;
@@ -114,15 +116,8 @@ export async function scanDebugLogs(user: string, tally: Tally, read: Map<string
   const monthStart = new Date(new Date(now).getFullYear(), new Date(now).getMonth(), 1).getTime();
   // File times can trail the clock by a moment.
   const since = Math.max(tally.readAt, monthStart) - 2000;
-  // Other profiles sit at `profiles/<id>`, or a level deeper like `profiles/builtin/agents`.
-  const profiles = join(user, 'profiles');
-  const folders = [user];
-  for (const id of await list(profiles)) {
-    folders.push(join(profiles, id));
-    for (const name of await list(join(profiles, id))) folders.push(join(profiles, id, name));
-  }
   const workspaceStorage = join(user, 'workspaceStorage');
-  const roots = [...folders.map((folder) => join(folder, 'globalStorage', 'github.copilot-chat', 'debug-logs')),
+  const roots = [join(user, 'globalStorage', 'github.copilot-chat', 'debug-logs'),
     ...(await list(workspaceStorage)).map((id) => join(workspaceStorage, id, 'GitHub.copilot-chat', 'debug-logs'))];
   for (const root of roots) {
     for (const chat of await list(root)) {

@@ -1,4 +1,4 @@
-import { access, appendFile, mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
+import { access, appendFile, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -53,7 +53,7 @@ vi.mock('vscode', () => ({
 
 import * as vscode from 'vscode';
 
-import { activate, enableDebugLog, enableTrace, hasCopilotLogLevel } from '../src/extension';
+import { activate, copilotLogLevel, enableDebugLog, enableTrace } from '../src/extension';
 import { DARK, hoverMarkdown, LIGHT } from '../src/hover';
 
 const RESET = '2026-10-01T00:00:00.000Z';
@@ -66,6 +66,8 @@ afterEach(async () => {
   vi.useRealTimers();
   vi.unstubAllEnvs();
   vi.clearAllMocks();
+  // Back to both debug log settings on.
+  configuration.inspect.mockReset();
   item.text = '';
   item.tooltip = undefined;
   item.sets = 0;
@@ -83,6 +85,8 @@ interface Start {
   records?: unknown;
   /** This window's Copilot Chat log; `null` leaves it missing. */
   logs?: string | null;
+  /** Other windows' Copilot Chat logs, by window folder. */
+  windows?: { [name: string]: string };
   /** The log's modification time, to look written before this extension host started. */
   modified?: Date;
   argv?: string;
@@ -90,8 +94,6 @@ interface Start {
   state?: { [key: string]: unknown };
   /** Chats' debug logs, by their path under the VS Code user folder. */
   debugLogs?: { [path: string]: string };
-  /** The profile folder under the VS Code user folder, like `profiles/builtin/agents`. */
-  profile?: string;
 }
 
 async function start(options: Start = {}) {
@@ -106,15 +108,23 @@ async function start(options: Start = {}) {
   await mkdir(copilot, { recursive: true });
   if (options.logs !== null) await writeFile(log, options.logs ?? '');
   if (options.modified) await utimes(log, options.modified, options.modified);
+  for (const [name, text] of Object.entries(options.windows ?? {})) {
+    const other = join(session, name, 'exthost', 'GitHub.copilot-chat');
+    await mkdir(other, { recursive: true });
+    await writeFile(join(other, 'GitHub Copilot Chat.log'), text);
+  }
   env.appRoot = join(root, 'app');
   vi.stubEnv('VSCODE_PORTABLE', root);
   await writeFile(join(root, 'argv.json'), options.argv ?? '{ "log-level": ["github.copilot-chat=trace"] }');
+  const storage = options.storage ?? join(root, 'User', 'globalStorage', 'leonbjorklund.copilot-usage-extension');
+  if (options.records) {
+    await mkdir(storage, { recursive: true });
+    await writeFile(join(storage, 'records.json'), JSON.stringify(options.records));
+  }
   const state = new Map<string, unknown>(Object.entries(options.state ?? {}));
-  if (options.records) state.set('records', options.records);
   const context = {
     subscriptions: [] as Array<{ dispose(): void }>,
-    globalStorageUri: { fsPath: options.storage ??
-      join(root, 'User', options.profile ?? '', 'globalStorage', 'leonbjorklund.copilot-usage-extension') },
+    globalStorageUri: { fsPath: storage },
     logUri: { fsPath: join(session, 'window1', 'exthost', 'leonbjorklund.copilot-usage-extension') },
     globalState: {
       get: (key: string) => state.get(key),
@@ -126,7 +136,7 @@ async function start(options: Start = {}) {
   };
   contexts.push(context);
   activate(context as unknown as vscode.ExtensionContext);
-  return { state, log, context, root };
+  return { state, log, context, root, storage };
 }
 
 function reading(at: number, percentRemaining: number, resetDate = RESET) {
@@ -146,6 +156,7 @@ const quota = (percentRemaining: number, offset = 0) => line(`[trace] [ChatQuota
   resetDate: FAR_RESET })}`, offset);
 
 const exists = (path: string) => access(path).then(() => true, () => false);
+const saved = async (storage: string) => JSON.parse(await readFile(join(storage, 'records.json'), 'utf8'));
 const hover = () => (item.tooltip as { value: string } | undefined)?.value ?? '';
 
 /** Fakes the clock and the timer between polls, so `nextPoll` runs a poll at once instead of 2 seconds later. */
@@ -220,39 +231,89 @@ describe('status bar', () => {
     await vi.waitFor(() => expect(item.text).toBe('Restart to see Credit usage'));
   });
 
+  it("asks for Trace instead of a restart when argv.json keeps the user's own level for Copilot Chat", async () => {
+    await start({ logs: line('[info] Logged in as leon-work'), argv: '{ "log-level": ["github.copilot-chat=info"] }' });
+    await vi.waitFor(() => expect(item.text).toBe('Set Copilot Chat log level to Trace'));
+  });
+
+  it('leaves readings from before this extension host without an account line to the window that saved them', async () => {
+    fakeTimers(new Date(2026, 8, 23, 16));
+    const now = Date.now();
+    // leon-work's window closed an hour ago, and this window's log was emptied since, taking its account line for leon.
+    // A reading with its own account line still counts, as after a first install.
+    const leon = [reading(now - 86_400_000, 26.6, FAR_RESET), reading(now - 1_800_000, 23.5, FAR_RESET)];
+    const { storage } = await start({ records: { leon }, logs: quota(23.5, -1_800_000), windows: {
+      window2: line('[info] Got Copilot token for leon-work', -3_600_000) + quota(40, -3_590_000),
+    } });
+    await nextPoll();
+    expect(await saved(storage)).toEqual({ leon, 'leon-work': [reading(now - 3_590_000, 40, FAR_RESET)] });
+    expect(item.text).toBe('3.1% | 76.5%');
+  });
+
+  it('keeps a reading from before this extension host without an account line when no window saved it', async () => {
+    fakeTimers(new Date(2026, 8, 23, 16));
+    const now = Date.now();
+    // A window of a profile without this extension logged it after its log was emptied.
+    const earlier = reading(now - 86_400_000, 26.6, FAR_RESET);
+    const { storage } = await start({ records: { leon: [earlier] }, windows: { window2: quota(23.5, -1_800_000) } });
+    await nextPoll();
+    expect(await saved(storage)).toEqual({ leon: [earlier, reading(now - 1_800_000, 23.5, FAR_RESET)] });
+  });
+
   it('names readings from a log without account lines after the saved account', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date(2026, 8, 23, 16));
     const now = Date.now();
-    const saved = reading(now - 86_400_000, 26.6, FAR_RESET);
-    const { state } = await start({ records: { leon: [saved] }, logs: quota(23.5) });
+    const earlier = reading(now - 86_400_000, 26.6, FAR_RESET);
+    const { storage } = await start({ records: { leon: [earlier] }, logs: quota(23.5) });
     await vi.waitFor(() => expect(item.text).toBe('3.1% | 76.5%'));
-    expect(state.get('records')).toEqual({ leon: [saved, reading(now, 23.5, FAR_RESET)] });
+    expect(await saved(storage)).toEqual({ leon: [earlier, reading(now, 23.5, FAR_RESET)] });
   });
 
-  it('keeps polling after a failed save', async () => {
+  it('shows the readings that a window of another profile saved', async () => {
     fakeTimers(new Date(2026, 8, 23, 16));
-    const { log, context } = await start({ logs: line('[info] Got Copilot token for leon-work', -2000) + quota(26.6, -1000) });
-    context.globalState.update.mockRejectedValueOnce(new Error('storage closed'));
+    const storage = join(await folder(), 'globalStorage');
+    const first = await start({ storage, logs: line('[info] Got Copilot token for leon-work', -2000) + quota(26.6, -1000) });
+    await vi.waitFor(() => expect(item.text).toBe('0% | 73.4%'));
+    for (const subscription of first.context.subscriptions) subscription.dispose();
+    item.text = '';
+    // The other profile keeps its own globalState, and its window has written no Copilot Chat log yet.
+    await start({ storage, logs: null });
+    expect(item.text).toBe('0% | 73.4%');
+  });
+
+  it('keeps polling after a failed save, and saves again on the next poll', async () => {
+    fakeTimers(new Date(2026, 8, 23, 16));
+    // A file where the storage folder should be makes every save fail.
+    const blocker = join(await folder(), 'globalStorage');
+    await writeFile(blocker, '');
+    const { log, storage } = await start({ storage: join(blocker, 'leonbjorklund.copilot-usage-extension'),
+      logs: line('[info] Got Copilot token for leon-work', -2000) + quota(26.6, -1000) });
     await vi.waitFor(() => expect(item.text).toBe('0% | 73.4%'));
     await appendFile(log, quota(26.5));
     await nextPoll();
     expect(item.text).toBe('0.1% | 73.5%');
+    await rm(blocker);
+    await nextPoll();
+    expect(await exists(join(storage, 'records.json'))).toBe(true);
   });
 
   it('saves and redraws only on a change, and stops polling once disposed', async () => {
     fakeTimers();
-    const { log, context } = await start({ logs: line('[info] Got Copilot token for leon-work') + quota(26.6) });
+    const { log, context, storage } = await start({ logs: line('[info] Got Copilot token for leon-work') + quota(26.6) });
+    const file = join(storage, 'records.json');
     await vi.waitFor(() => expect(item.text).toBe('0% | 73.4%'));
-    expect(context.globalState.update).toHaveBeenCalledOnce();
+    expect(await exists(file)).toBe(true);
+    // Removed, the file only comes back with another save.
+    await rm(file);
     const sets = item.sets;
     await nextPoll();
-    expect(context.globalState.update).toHaveBeenCalledOnce();
+    expect(await exists(file)).toBe(false);
     expect(item.sets).toBe(sets);
     for (const subscription of context.subscriptions) subscription.dispose();
     await appendFile(log, quota(26.5));
     expect(vi.getTimerCount()).toBe(0);
-    expect(context.globalState.update).toHaveBeenCalledOnce();
+    expect(await exists(file)).toBe(false);
   });
 
   it('stops a poll that is running when disposed', async () => {
@@ -301,15 +362,16 @@ describe('Trace setup', () => {
     for (const text of texts) {
       executeCommand.mockClear();
       await argv(text);
-      expect(await enableTrace()).toBe(true);
+      expect(await enableTrace()).toBe('switched');
       expect(executeCommand).toHaveBeenCalledExactlyOnceWith('workbench.action.setDefaultLogLevel', 1, 'github.copilot-chat');
     }
   });
 
   it('leaves an existing Copilot entry alone', async () => {
-    for (const level of ['trace', 'info', 'off']) {
+    // VS Code ignores a level that is not lowercase, so Copilot Chat stays at its default.
+    for (const [level, result] of [['trace', 'kept'], ['Trace', 'other'], ['info', 'other'], ['off', 'other']]) {
       await argv(`{ /* comment */ "log-level": ["warn", "GitHub.copilot-chat=${level}"], }`);
-      expect(await enableTrace()).toBe(false);
+      expect(await enableTrace()).toBe(result);
     }
     expect(executeCommand).not.toHaveBeenCalled();
   });
@@ -324,17 +386,17 @@ describe('Trace setup', () => {
     vi.stubEnv('USERPROFILE', home);
     vi.stubEnv('HOME', home);
     vi.stubEnv('VSCODE_PORTABLE', '');
-    expect(await enableTrace()).toBe(false);
+    expect(await enableTrace()).toBe('other');
     expect(executeCommand).not.toHaveBeenCalled();
     await rm(join(home, '.copilot-credits-test', 'argv.json'));
-    expect(await enableTrace()).toBe(true);
+    expect(await enableTrace()).toBe('switched');
     expect(executeCommand).toHaveBeenCalledExactlyOnceWith('workbench.action.setDefaultLogLevel', 1, 'github.copilot-chat');
   });
 
-  it('shrugs off a rejected switch', async () => {
+  it('asks for Trace after a rejected switch, which a restart would not change', async () => {
     await argv('{}');
     executeCommand.mockRejectedValueOnce(new Error('argv.json has errors'));
-    await expect(enableTrace()).resolves.toBe(false);
+    await expect(enableTrace()).resolves.toBe('other');
   });
 
   it("switches once, after this window's Copilot Chat channel writes its log", async () => {
@@ -370,13 +432,13 @@ describe('Trace setup', () => {
   });
 
   it('reads the entry past comments and escaped quotes', () => {
-    expect(hasCopilotLogLevel('{ "log-level": "github.copilot-chat:debug" }')).toBe(true);
-    expect(hasCopilotLogLevel('{ /* "github.copilot-chat=off" */ "url": "https://example.com//x" }')).toBe(false);
-    expect(hasCopilotLogLevel('{ "log-level": ["my.github.copilot-chat=info"] }')).toBe(false);
-    expect(hasCopilotLogLevel('{ "enable-proposed-api": ["GitHub.copilot-chat"] }')).toBe(false);
-    expect(hasCopilotLogLevel('{ "log-level": ["github.copilot-chat="] }')).toBe(false);
-    expect(hasCopilotLogLevel('')).toBe(false);
-    expect(hasCopilotLogLevel(String.raw`{ "x": "a // b \" c", "log-level": ["github.copilot-chat=info"] }`)).toBe(true);
+    expect(copilotLogLevel('{ "log-level": "github.copilot-chat:debug" }')).toBe('debug');
+    expect(copilotLogLevel('{ /* "github.copilot-chat=off" */ "url": "https://example.com//x" }')).toBeUndefined();
+    expect(copilotLogLevel('{ "log-level": ["my.github.copilot-chat=info"] }')).toBeUndefined();
+    expect(copilotLogLevel('{ "enable-proposed-api": ["GitHub.copilot-chat"] }')).toBeUndefined();
+    expect(copilotLogLevel('{ "log-level": ["github.copilot-chat="] }')).toBeUndefined();
+    expect(copilotLogLevel('')).toBeUndefined();
+    expect(copilotLogLevel(String.raw`{ "x": "a // b \" c", "log-level": ["github.copilot-chat=info"] }`)).toBe('info');
   });
 });
 
@@ -393,29 +455,58 @@ describe('model use', () => {
       `${cell(dim(`${perSession}&nbsp;/&nbsp;session`))}${divider}${cell(share)}</tr>`;
   };
 
+  const [copilot, agentHost] = ['github.copilot.chat.agentDebugLog.fileLogging.enabled', 'chat.agentHost.agentDebugLog.enabled'];
+  /** A profile's globalState. */
+  const memento = () => {
+    const values = new Map<string, unknown>();
+    return { get: (key: string) => values.get(key), update: async (key: string, value: unknown) => { values.set(key, value); } };
+  };
+
   it("turns on Copilot's and VS Code's agent debug logs, leaving each setting the user set", async () => {
-    const [copilot, agentHost] = ['github.copilot.chat.agentDebugLog.fileLogging.enabled', 'chat.agentHost.agentDebugLog.enabled'];
     // It resolves to whether it turned Copilot's debug log on, which shows only after a restart.
     configuration.inspect.mockReturnValueOnce({}).mockReturnValueOnce({});
-    await expect(enableDebugLog()).resolves.toBe(true);
+    await expect(enableDebugLog(memento() as unknown as vscode.Memento)).resolves.toBe(true);
     // Full setting names only work on the unsectioned configuration.
     expect(vi.mocked(vscode.workspace.getConfiguration).mock.calls).toEqual([[], []]);
     expect(configuration.inspect.mock.calls).toEqual([[copilot], [agentHost]]);
     expect(configuration.update.mock.calls).toEqual([[copilot, true, 1], [agentHost, true, 1]]);
     configuration.update.mockClear();
     configuration.inspect.mockReturnValueOnce({ globalValue: false }).mockReturnValueOnce({});
-    await expect(enableDebugLog()).resolves.toBe(false);
+    await expect(enableDebugLog(memento() as unknown as vscode.Memento)).resolves.toBe(false);
     expect(configuration.update.mock.calls).toEqual([[agentHost, true, 1]]);
     configuration.update.mockClear();
     configuration.inspect.mockReturnValueOnce({}).mockReturnValueOnce({ globalValue: true });
-    await expect(enableDebugLog()).resolves.toBe(true);
+    await expect(enableDebugLog(memento() as unknown as vscode.Memento)).resolves.toBe(true);
     expect(configuration.update.mock.calls).toEqual([[copilot, true, 1]]);
-    // A setting that fails to save leaves the other one.
+  });
+
+  it('turns each setting on once, so a value the user removes later stays removed', async () => {
+    const state = memento() as unknown as vscode.Memento;
+    configuration.inspect.mockReturnValueOnce({}).mockReturnValueOnce({ globalValue: false });
+    await enableDebugLog(state);
     configuration.update.mockClear();
-    configuration.inspect.mockReturnValueOnce({}).mockReturnValueOnce({});
+    // The Settings editor saves a switch back to off as no value.
+    configuration.inspect.mockReturnValue({});
+    await expect(enableDebugLog(state)).resolves.toBe(false);
+    expect(configuration.update).not.toHaveBeenCalled();
+  });
+
+  it('tries a setting that failed to save again on the next start, leaving the other one', async () => {
+    const state = memento() as unknown as vscode.Memento;
+    configuration.inspect.mockReturnValue({});
     configuration.update.mockRejectedValueOnce(new Error('settings.json has errors'));
-    await expect(enableDebugLog()).resolves.toBe(false);
+    await expect(enableDebugLog(state)).resolves.toBe(false);
     expect(configuration.update.mock.calls).toEqual([[copilot, true, 1], [agentHost, true, 1]]);
+    configuration.update.mockClear();
+    await expect(enableDebugLog(state)).resolves.toBe(true);
+    expect(configuration.update.mock.calls).toEqual([[copilot, true, 1]]);
+    // Only the second setting fails to save.
+    const later = memento() as unknown as vscode.Memento;
+    configuration.update.mockResolvedValueOnce(undefined).mockRejectedValueOnce(new Error('settings.json has errors'));
+    await enableDebugLog(later);
+    configuration.update.mockClear();
+    await expect(enableDebugLog(later)).resolves.toBe(false);
+    expect(configuration.update.mock.calls).toEqual([[agentHost, true, 1]]);
   });
 
   it('counts debug-log requests into a saved tally that a restart shows at once', async () => {
@@ -432,18 +523,6 @@ describe('model use', () => {
     item.tooltip = undefined;
     await start({ records, state: { models: JSON.parse(JSON.stringify(saved)) } });
     expect(hover()).toContain(section);
-  });
-
-  it('finds every folder\'s chats from another profile, and that profile\'s chats without a folder', async () => {
-    fakeTimers();
-    const profile = join('profiles', 'builtin', 'agents');
-    await start({ records: { leon: [reading(Date.now() - 1000, 23.5)] }, profile, debugLogs: {
-      [chat('a')]: request(4),
-      [join(profile, 'globalStorage', 'github.copilot-chat', 'debug-logs', 'b', 'main.jsonl')]: request(1, 'gpt-6-astra'),
-    } });
-    await nextPoll();
-    expect(hover()).toContain(row('1. claude-opus-5', '1', '4', '80%'));
-    expect(hover()).toContain(row('2. gpt-6-astra', '1', '1', '20%'));
   });
 
   it('reads new debug-log lines on a later scan, and keeps polling after a failed save', async () => {

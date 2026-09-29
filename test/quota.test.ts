@@ -343,8 +343,9 @@ describe('today and month', () => {
 
   it('names unlimited and zero allowances and waits without a reading', () => {
     expect(statusText({}, now)).toBe('Waiting for Copilot');
-    expect(statusText({}, now, true)).toBe('Restart to see Credit usage');
-    expect(statusText({ leon: [reading(time(22, 20), 26.6), reading(time(23, 15), 23.5)] }, now, true)).toBe('3.1% | 76.5%');
+    expect(statusText({}, now, 'restart')).toBe('Restart to see Credit usage');
+    expect(statusText({}, now, 'trace')).toBe('Set Copilot Chat log level to Trace');
+    expect(statusText({ leon: [reading(time(22, 20), 26.6), reading(time(23, 15), 23.5)] }, now, 'trace')).toBe('3.1% | 76.5%');
     expect(statusText({ leon: [reading(time(23, 15), 100, { quota: -1, unlimited: true })] }, now)).toBe('Unlimited Copilot quota');
     expect(statusText({ leon: [reading(time(23, 15), 100, { quota: 0, unlimited: true })] }, now)).toBe('Unlimited Copilot quota');
     expect(statusText({ leon: [reading(time(23, 15), 0, { quota: 0 })] }, now)).toBe('No Copilot credit allowance');

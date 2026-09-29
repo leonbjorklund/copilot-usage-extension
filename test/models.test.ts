@@ -83,21 +83,19 @@ describe('scanning the debug logs', () => {
   const workspace = (root: string, id = 'abc') => join(root, 'workspaceStorage', id, 'GitHub.copilot-chat', 'debug-logs');
   const global = (root: string) => join(root, 'globalStorage', 'github.copilot-chat', 'debug-logs');
 
-  it('reads every folder\'s and profile\'s chats and counts each chat\'s files, subagents included', async () => {
+  it('reads every folder\'s chats and those without a folder, and counts each chat\'s files, subagents included', async () => {
     const root = await user();
     await log(workspace(root), 'a', 'main.jsonl', request('claude-opus-5', 4) + request('gpt-6-astra', 3, at(23, 11)));
     await log(workspace(root), 'a', 'runSubagent-Explore-1.jsonl', request('claude-opus-5', 2, at(23, 12), '0000000000000001'));
     await log(workspace(root), 'a', 'models.json', request('claude-opus-5', 50, at(23, 13)));
     await log(workspace(root, 'def'), 'b', 'main.jsonl', request('claude-opus-5', 1));
     await log(global(root), 'c', 'main.jsonl', request('gemini-3.8-flash', 1));
-    await log(global(join(root, 'profiles', '1a2b3c')), 'd', 'main.jsonl', request('claude-opus-5', 1, at(23, 15)));
-    await log(global(join(root, 'profiles', 'builtin', 'agents')), 'e', 'main.jsonl', request('gemini-3.8-flash', 1, at(23, 16)));
     await mkdir(join(root, 'workspaceStorage', 'empty'), { recursive: true });
     // Folders without chats, and a file where a chat folder would be, leave the scan complete.
     await writeFile(join(global(root), 'loose.jsonl'), request('claude-opus-5', 50, at(23, 14)));
     const tally = emptyTally(now);
     expect(await scanDebugLogs(root, tally, new Map(), now)).toBe(true);
-    expect(uses(tally)).toEqual({ 'claude-opus-5': [8, 3], 'gpt-6-astra': [3, 1], 'gemini-3.8-flash': [2, 2] });
+    expect(uses(tally)).toEqual({ 'claude-opus-5': [7, 2], 'gpt-6-astra': [3, 1], 'gemini-3.8-flash': [1, 1] });
     expect(tally.readAt).toBe(now);
   });
 

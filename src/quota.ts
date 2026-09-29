@@ -264,14 +264,18 @@ export function formatNumber(value: number): string {
 }
 
 /**
- * `3.1% | 76.5%`: today's share of the allowance, then the month used. `needsRestart` means
- * this window's Copilot Chat channel is not at Trace, so its chats log no quota until VS Code restarts.
+ * `3.1% | 76.5%`: today's share of the allowance, then the month used. `noTrace` means this window's
+ * Copilot Chat channel is not at Trace, so its chats log no quota: until VS Code restarts, or until
+ * the user sets Trace.
  */
-export function statusText(records: Records, now: number, needsRestart = false): string {
+export function statusText(records: Records, now: number, noTrace?: 'restart' | 'trace'): string {
   const login = currentAccount(records);
   const readings = login ? records[login] : [];
   const latest = readings.at(-1);
-  if (!latest) return needsRestart ? 'Restart to see Credit usage' : 'Waiting for Copilot';
+  if (!latest) {
+    if (noTrace === 'restart') return 'Restart to see Credit usage';
+    return noTrace === 'trace' ? 'Set Copilot Chat log level to Trace' : 'Waiting for Copilot';
+  }
   if (latest.unlimited) return 'Unlimited Copilot quota';
   if (latest.quota <= 0) return 'No Copilot credit allowance';
   return `${formatNumber(todayUsed(readings, now))}% | ${formatNumber(monthUsed(readings, now))}%`;
