@@ -1,8 +1,8 @@
 {
   "name": "copilot-usage-extension",
   "displayName": "Copilot Credits",
-  "description": "Your Copilot credit use in the status bar: today, this month, the monthly pace and your top models, read from Copilot Chat's local logs.",
-  "version": "0.1.0",
+  "description": "Local Copilot credit usage, read from Copilot logs.",
+  "version": "0.1.1",
   "publisher": "leonbjorklund",
   "license": "MIT",
   "scripts": {
