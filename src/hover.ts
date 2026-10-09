@@ -1,7 +1,15 @@
 import type { ModelUse } from './models';
 import {
-  currentAccount, dailyUsed, formatNumber, monthUsed, monthlyPace, todayUsed, type Reading, type Records,
-} from './quota';
+  currentAccount,
+  dailyUsed,
+  formatNumber,
+  monthUsed,
+  monthlyPace,
+  todayUsed,
+  type DayUsage,
+  type Reading,
+  type Records,
+} from "./quota";
 
 const INFO = '<a href="https://docs.github.com/en/copilot/concepts/billing/usage-based-billing-for-individuals" ' +
   'title="How GitHub bills Copilot credits">$(info)</a>';
@@ -16,14 +24,25 @@ const BAR_WIDTH = 9;
 const BAR_AREA_HEIGHT = 24;
 const AXIS_HEIGHT = 1;
 const IMAGE_HEIGHT = BAR_AREA_HEIGHT + AXIS_HEIGHT;
+const GAP_HEIGHT = 14;
 // Heights compress toward the tallest day so one heavy day does not flatten the rest: a day at a
 // tenth of the peak draws at a fifth of its height.
 const HEIGHT_EXPONENT = 0.7;
 
-interface Palette { bright: string; dim: string; axis: string }
+interface Palette {
+  bright: string;
+  dim: string;
+  axis: string;
+  gap: string;
+}
 
-export const DARK: Palette = { bright: '#cccccc', dim: '#4a4a4a', axis: '#454545' };
-export const LIGHT: Palette = { bright: '#616161', dim: '#c8c8c8', axis: '#d4d4d4' };
+export const DARK: Palette = { bright: "#cccccc", dim: "#4a4a4a", axis: "#454545", gap: "#989898" };
+export const LIGHT: Palette = {
+  bright: "#616161",
+  dim: "#c8c8c8",
+  axis: "#d4d4d4",
+  gap: "#616161",
+};
 
 /**
  * The status bar hover: the quota of the account Copilot reported for last, then the month's top
@@ -110,17 +129,32 @@ function nbsp(text: string): string {
 }
 
 /** One row of day images and one row with the first and last date. */
-function graphRows(days: Array<{ day: number; used?: number }>, palette: Palette): string[] {
-  const scale = Math.max(...days.map((day) => day.used ?? 0));
+function graphRows(days: DayUsage[], palette: Palette): string[] {
+  const scale = Math.max(...days.map((day) => (day.gap ? 0 : (day.used ?? 0))));
   const currentMonth = new Date(days.at(-1)!.day).getMonth();
-  const images = days.map(({ day, used }) => {
-    const label = `${formatDate(day)} · ${used === undefined ? 'Not tracked' : `${formatNumber(used)}%`}`;
-    const height = used === undefined || used <= 0 ? 0
-      : Math.max(1, Math.round((used / scale) ** HEIGHT_EXPONENT * BAR_AREA_HEIGHT));
-    const color = new Date(day).getMonth() === currentMonth ? palette.bright : palette.dim;
-    return `<img src="${dayImage(height, color, palette.axis)}" width="${COLUMN_WIDTH}" height="${IMAGE_HEIGHT}" ` +
-      `alt="${label}" title="${label}">`;
-  }).join('');
+  const images = days
+    .map(({ day, used, gap }) => {
+      const label = gap
+        ? `${formatNumber(gap.used)}% between ${formatDate(gap.from)} and ${formatDate(gap.to)} · Day unknown` +
+          (used ? `; ${formatNumber(used)}% recorded on ${formatDate(day)}` : "")
+        : `${formatDate(day)} · ${used === undefined ? "Not tracked" : `${formatNumber(used)}%`}`;
+      const height = gap
+        ? GAP_HEIGHT
+        : used === undefined || used <= 0
+          ? 0
+          : Math.max(1, Math.round((used / scale) ** HEIGHT_EXPONENT * BAR_AREA_HEIGHT));
+      const color =
+        new Date(day).getMonth() === currentMonth
+          ? gap
+            ? palette.gap
+            : palette.bright
+          : palette.dim;
+      return (
+        `<img src="${dayImage(height, color, palette.axis, !!gap)}" width="${COLUMN_WIDTH}" height="${IMAGE_HEIGHT}" ` +
+        `alt="${label}" title="${label}">`
+      );
+    })
+    .join("");
   return [
     `<tr><td colspan="2" align="center">${images}</td></tr>`,
     `<tr><td>${muted(formatDate(days[0].day))}</td><td align="right">${muted(formatDate(days.at(-1)!.day))}</td></tr>`,
@@ -132,12 +166,21 @@ function formatDate(day: number): string {
   return `${date.getDate()} ${date.toLocaleString('en-US', { month: 'short' })}`;
 }
 
-function dayImage(height: number, color: string, axis: string): string {
-  const bar = height > 0
-    ? `<rect x="${(COLUMN_WIDTH - BAR_WIDTH) / 2}" y="${BAR_AREA_HEIGHT - height}" width="${BAR_WIDTH}" ` +
-      `height="${height}" rx="1" fill="${color}"/>`
-    : '';
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${COLUMN_WIDTH}" height="${IMAGE_HEIGHT}">${bar}` +
+function dayImage(height: number, color: string, axis: string, striped: boolean): string {
+  const bar = striped
+    ? '<defs><pattern id="stripes" width="7" height="7" patternUnits="userSpaceOnUse">' +
+      '<rect width="7" height="7" fill="white"/>' +
+      '<path d="M-1,1 L1,-1 M0,7 L7,0 M6,8 L8,6" fill="none" stroke="black" stroke-width="1.25" opacity="0.55"/>' +
+      `</pattern><mask id="striped-fill" maskUnits="userSpaceOnUse" x="0" y="0" width="${BAR_WIDTH}" height="${height}">` +
+      `<rect width="${BAR_WIDTH}" height="${height}" fill="url(#stripes)"/></mask></defs>` +
+      `<rect width="${BAR_WIDTH}" height="${height}" transform="translate(${(COLUMN_WIDTH - BAR_WIDTH) / 2} ${BAR_AREA_HEIGHT - height})" ` +
+      `fill="${color}" mask="url(#striped-fill)"/>`
+    : height > 0
+      ? `<rect x="${(COLUMN_WIDTH - BAR_WIDTH) / 2}" y="${BAR_AREA_HEIGHT - height}" width="${BAR_WIDTH}" ` +
+        `height="${height}" rx="1" fill="${color}"/>`
+      : "";
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${COLUMN_WIDTH}" height="${IMAGE_HEIGHT}">${bar}` +
     `<rect y="${BAR_AREA_HEIGHT}" width="${COLUMN_WIDTH}" height="${AXIS_HEIGHT}" fill="${axis}"/></svg>`;
-  return `data:image/svg+xml;base64,${Buffer.from(svg).toString('base64')}`;
+  return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
 }

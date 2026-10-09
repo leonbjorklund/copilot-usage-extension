@@ -165,10 +165,13 @@ describe("graph", () => {
   it("draws one bottom-aligned bar per day, bright this month and dim before, scaled to the busiest day", () => {
     const readings = [
       reading(time(26, 9, 8), 80),
+      reading(time(30, 20, 8), 80),
       reading(time(31, 20, 8), 77.8),
+      reading(time(12, 20), 77.8),
       reading(time(13, 20), 70),
       reading(time(14, 20), 52.4),
       reading(time(15, 20), 52.4),
+      reading(time(21, 20), 52.4),
       reading(time(22, 20), 50),
       reading(time(23, 15), 48),
     ];
@@ -195,6 +198,30 @@ describe("graph", () => {
         '<rect y="24" width="14" height="1" fill="#454545"/></svg>',
     );
     expect(svg(bars[21])).not.toContain('rx="1"');
+  });
+
+  it("draws equal striped placeholders for a gap and keeps the return day's observed bar", () => {
+    const readings = [
+      reading(time(20, 20), 90),
+      reading(time(21, 20), 88),
+      reading(time(23, 8), 78),
+      reading(time(23, 15), 77),
+    ];
+    for (const palette of [DARK, LIGHT]) {
+      const bars = images(hoverMarkdown({ leon: readings }, now, palette, [])!);
+      expect(bars).toHaveLength(30);
+      for (const index of [27, 28]) {
+        expect(bars[index]).toContain("10% between 21 Sep and 23 Sep");
+        expect(svg(bars[index])).toContain('height="14"');
+        expect(svg(bars[index])).toContain('mask="url(#striped-fill)"');
+      }
+      expect(svg(bars[27])).toBe(svg(bars[28]));
+      expect(bars[27]).toContain("2% recorded on 21 Sep");
+      expect(svg(bars[27])).toContain(`fill="${palette === DARK ? "#989898" : "#616161"}"`);
+      expect(bars[29]).toContain('title="23 Sep · 1%"');
+      expect(svg(bars[29])).toContain('height="24" rx="1"');
+      expect(svg(bars[29])).not.toContain("<mask");
+    }
   });
 
   it("still draws a tiny day past the allowance, labeled 0%", () => {

@@ -15,9 +15,16 @@ export interface Reading {
 
 /**
  * Per account, oldest first: its earliest reading, or the newest one older than 35 days, then the
- * last reading of each local day and the last one before a monthly reset.
+ * last reading of each local day, the first after a missing day and both sides of a monthly reset.
  */
 export type Records = { [login: string]: Reading[] };
+
+export interface DayUsage {
+  day: number;
+  used?: number;
+  /** One interval's total, shared by its striped days; never a per-day amount. */
+  gap?: { from: number; to: number; used: number };
+}
 
 /**
  * A reading with the account its window's log named last: `null` when that account is anonymous
@@ -192,9 +199,9 @@ function localDay(at: number, offset = 0): number {
 }
 
 /**
- * Keeps each account's earliest reading, the last reading of each local day and the last one before
- * a monthly reset, for 35 days, plus the newest older reading while newer ones remain, since the
- * oldest day kept counts from it.
+ * Keeps each account's earliest reading, the last of each local day, the first after a missing day
+ * and both sides of a monthly reset, for 35 days, plus the newest older reading while newer ones
+ * remain. Keeping a gap's first returning reading stops later polls from adding to its total.
  * Readings stamped later than `now` are dropped, since they would stay the latest.
  */
 export function addReadings(
@@ -220,6 +227,8 @@ export function addReadings(
       (reading, index) =>
         index === 0 ||
         index === all.length - 1 ||
+        localDay(reading.at) > localDay(all[index - 1].at, 1) ||
+        newPeriod(all[index - 1], reading) ||
         localDay(reading.at) !== localDay(all[index + 1].at) ||
         newPeriod(reading, all[index + 1]),
     );
@@ -260,19 +269,46 @@ function newPeriod(earlier: Reading, later: Reading): boolean {
   return later.resetDate !== earlier.resetDate && later.at >= resetAt(earlier);
 }
 
+/** Only an increase across a whole missing local day is unassigned; ordinary overnights stay daily. */
+function usageGap(earlier: Reading, later: Reading, beforeDay = earlier): DayUsage["gap"] {
+  const reset = newPeriod(earlier, later);
+  // A late reset snapshot may follow an old-period snapshot on the return day. The reset date
+  // alone is not evidence of a missing day; check the last observation before that day as well.
+  if (localDay(later.at) <= localDay((reset ? beforeDay : earlier).at, 1)) return;
+  let from = reset ? resetAt(earlier) : earlier.at;
+  if (reset) {
+    const observed = new Date(later.at);
+    const nextMonth = Date.UTC(observed.getUTCFullYear(), observed.getUTCMonth() + 1, 1);
+    // Several resets may have passed: the latest monthly balance says nothing about older months.
+    if (resetAt(later) === nextMonth) {
+      from = Math.max(from, Date.UTC(observed.getUTCFullYear(), observed.getUTCMonth(), 1));
+    }
+  }
+  const amount = reset ? used(later) : used(later) - used(earlier);
+  if (amount > 0 && localDay(later.at) > localDay(from, 1)) {
+    return { from, to: later.at, used: amount };
+  }
+}
+
 /**
  * The local day's last reading minus the last one before that day; across a reset, the day's spend
- * before the reset plus the new period's use. `undefined` before the account's first reading.
+ * before the reset plus the new period's use. After a gap, count from the first returning reading.
+ * `undefined` before the account's first reading.
  */
 function usedOn(readings: Reading[], day: number): number | undefined {
   const dayReadings = readings.filter((reading) => reading.at < localDay(day, 1));
   const latest = dayReadings.at(-1);
   if (!latest) return;
   // Until an account has a reading before the day, the day counts from its first reading.
-  const base = readings.filter((reading) => reading.at < day).at(-1) ?? readings[0];
+  const beforeDay = readings.filter((reading) => reading.at < day).at(-1) ?? readings[0];
+  let base = beforeDay;
+  const first = dayReadings.find((reading) => reading.at >= day);
+  if (first && usageGap(base, first)) base = first;
   if (!newPeriod(base, latest)) return Math.max(0, used(latest) - used(base));
   const beforeReset = dayReadings.filter((reading) => !newPeriod(base, reading)).at(-1)!;
-  return Math.max(0, used(beforeReset) - used(base)) + used(latest);
+  const afterReset = dayReadings.find((reading) => newPeriod(base, reading))!;
+  const gap = usageGap(beforeReset, afterReset, beforeDay);
+  return Math.max(0, used(beforeReset) - used(base)) + Math.max(0, used(latest) - (gap?.used ?? 0));
 }
 
 /** Today's use, counted like any other day. */
@@ -281,10 +317,23 @@ export function todayUsed(readings: Reading[], now: number): number {
 }
 
 /** Each of the last 30 local days, oldest first, with its use. */
-export function dailyUsed(readings: Reading[], now: number): Array<{ day: number; used?: number }> {
+export function dailyUsed(readings: Reading[], now: number): DayUsage[] {
+  const gaps = readings.flatMap((reading, index) => {
+    let earlier = readings[index - 1];
+    // Another window can repeat an old-period snapshot; resume an already observed period.
+    if (earlier && newPeriod(earlier, reading)) {
+      earlier = readings.slice(0, index).filter((entry) => entry.resetDate === reading.resetDate).at(-1) ?? earlier;
+    }
+    const beforeDay = readings.filter((entry) => entry.at < localDay(reading.at)).at(-1);
+    const gap = earlier ? usageGap(earlier, reading, beforeDay) : undefined;
+    return gap ? [gap] : [];
+  }).reverse();
   return Array.from({ length: 30 }, (_, index) => {
     const day = localDay(now, index - 29);
-    return { day, used: usedOn(readings, day) };
+    // The return day keeps its observed bar; the preceding days share the interval's placeholder.
+    // A delayed reset can overlap an older gap; the newer period owns those days.
+    const gap = gaps.find((gap) => day >= localDay(gap.from) && day < localDay(gap.to));
+    return { day, used: usedOn(readings, day), ...(gap ? { gap } : {}) };
   });
 }
 

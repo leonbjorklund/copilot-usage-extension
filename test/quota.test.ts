@@ -404,7 +404,12 @@ describe("saved record", () => {
     ]);
     expect(
       dailyUsed(records.leon, later).find((entry) => entry.day === time(21, 0, 0, 0, 0, 8))?.used,
-    ).toBe(10);
+    ).toBe(0);
+    expect(dailyUsed(records.leon, later)[0].gap).toEqual({
+      from: time(10, 9, 0, 0, 0, 8),
+      to: time(21, 9, 0, 0, 0, 8),
+      used: 10,
+    });
   });
 
   it("keeps accounts apart", () => {
@@ -564,6 +569,125 @@ describe("today and month", () => {
 });
 
 describe("days", () => {
+  it("keeps the first reading after a gap as the daily baseline across polls and restarts", () => {
+    const before = reading(time(21, 17), 89.1);
+    const first = reading(time(23, 7), 82.6);
+    const add = (records: Records, entries: Reading[]) =>
+      addReadings(
+        records,
+        entries.map((entry) => ({ login: "leon", reading: entry })),
+        time(23, 16),
+      );
+    let records = add({}, [before, first]);
+    expect(statusText(records, time(23, 7))).toBe("0% | 17.4%");
+    records = add(records, [reading(time(23, 9), 82)]);
+    records = add(loadRecords(JSON.parse(JSON.stringify(records))), [reading(time(23, 15), 81.8)]);
+    expect(records.leon).toContainEqual(first);
+    expect(statusText(records, time(23, 16))).toBe("0.8% | 18.2%");
+    const days = dailyUsed(records.leon, time(23, 16)).slice(-3);
+    const gap = { from: before.at, to: first.at, used: expect.closeTo(6.5) };
+    expect(days.map((day) => day.gap)).toEqual([gap, gap, undefined]);
+    expect(days.map((day) => day.used)).toEqual([0, 0, expect.closeTo(0.8)]);
+  });
+
+  it.each([
+    ["unchanged balance", time(21, 9), 80, time(23, 9), 80, 0, false],
+    ["lower use", time(21, 9), 80, time(23, 9), 81, 0, false],
+    ["same day", time(23, 8), 80, time(23, 9), 79, 1, false],
+    ["consecutive days over 24 hours apart", time(22, 0), 80, time(23, 15), 79, 1, false],
+    ["one whole missing calendar day", time(21, 23, 59), 80, time(23, 0), 79, 0, true],
+  ])(
+    "marks only an increase across a missing day: %s",
+    (_name, from, before, to, after, today, striped) => {
+      const readings = [reading(from, before), reading(to, after)];
+      const days = dailyUsed(readings, time(23, 16));
+      expect(days.some((day) => day.gap !== undefined)).toBe(striped);
+      expect(days.at(-1)?.used).toBe(today);
+    },
+  );
+
+  it("limits a gap across a monthly reset to the new period's observed usage", () => {
+    const resetDate = new Date(2026, 9, 1, 12).toISOString();
+    const before = reading(time(29, 20), 40, { resetDate });
+    const first = reading(time(3, 8, 0, 0, 0, 10), 97, { resetDate: "2026-11-01T00:00:00.000Z" });
+    const later = { ...first, at: time(3, 15, 0, 0, 0, 10), percentRemaining: 96.5 };
+    const days = dailyUsed([before, first, later], later.at);
+    expect(days.slice(-3).map((day) => day.gap)).toEqual([
+      { from: Date.parse(resetDate), to: first.at, used: 3 },
+      { from: Date.parse(resetDate), to: first.at, used: 3 },
+      undefined,
+    ]);
+    expect(days.slice(0, -3).every((day) => day.gap === undefined)).toBe(true);
+    expect(statusText({ leon: [before, first, later] }, later.at)).toBe("0.5% | 3.5%");
+    // Returning on the reset day counts only the new allowance, without inventing a gap total.
+    const resetDay = { ...first, at: time(1, 15, 0, 0, 0, 10) };
+    expect(statusText({ leon: [before, resetDay] }, resetDay.at)).toBe("3% | 3%");
+    expect(dailyUsed([before, resetDay], resetDay.at).some((day) => day.gap)).toBe(false);
+    // Several resets may pass while away; October's total cannot describe September's use.
+    const older = reading(time(30, 20, 0, 0, 0, 8), 80, { resetDate: "2026-09-01T00:00:00.000Z" });
+    const monthStart = Date.UTC(2026, 9, 1);
+    const afterSeveralResets = dailyUsed([older, first, later], later.at);
+    const gaps = afterSeveralResets.filter((day) => day.gap);
+    expect(gaps.length).toBeGreaterThan(0);
+    expect(gaps.every((day) => day.gap!.from === monthStart && day.gap!.used === 3)).toBe(true);
+  });
+
+  it("recomputes a gap when another window supplies the missing day's readings", () => {
+    const entries = [
+      reading(time(21, 18), 80),
+      reading(time(23, 8), 75),
+      reading(time(23, 15), 74),
+    ];
+    const now = time(23, 16);
+    const records = addReadings(
+      {},
+      entries.map((entry) => ({ login: "leon", reading: entry })),
+      now,
+    );
+    expect(statusText(records, now)).toBe("1% | 26%");
+    const filled = addReadings(
+      records,
+      [{ login: "leon", reading: reading(time(22, 20), 77) }],
+      now,
+    );
+    expect(statusText(filled, now)).toBe("3% | 26%");
+    expect(dailyUsed(filled.leon, now).some((day) => day.gap)).toBe(false);
+  });
+
+  it("keeps a delayed monthly reset's first reading out of today's use after a gap", () => {
+    const before = reading(time(29, 20), 80);
+    const oldPeriod = reading(time(3, 8, 0, 0, 0, 10), 75);
+    const first = reading(time(3, 9, 0, 0, 0, 10), 97, { resetDate: "2026-11-01T00:00:00.000Z" });
+    const later = { ...first, at: time(3, 15, 0, 0, 0, 10), percentRemaining: 96 };
+    const records = addReadings(
+      {},
+      [before, oldPeriod, first, later].map((entry) => ({ login: "leon", reading: entry })),
+      later.at,
+    );
+    expect(statusText(records, later.at)).toBe("1% | 4%");
+    expect(records.leon).toContainEqual(first);
+    expect(dailyUsed(records.leon, later.at).at(-2)?.gap).toEqual({
+      from: Date.parse(RESET), to: first.at, used: 3,
+    });
+    const interleaved = addReadings(records, [
+      { ...oldPeriod, at: time(3, 10, 0, 0, 0, 10) },
+      { ...first, at: time(3, 11, 0, 0, 0, 10), percentRemaining: 96 },
+      { ...later, at: time(3, 16, 0, 0, 0, 10), percentRemaining: 95 },
+    ].map((entry) => ({ login: "leon", reading: entry })), time(3, 16, 0, 0, 0, 10));
+    expect(statusText(interleaved, time(3, 16, 0, 0, 0, 10))).toBe("2% | 5%");
+    expect(dailyUsed(interleaved.leon, time(3, 16, 0, 0, 0, 10)).at(-2)?.gap).toEqual({
+      from: Date.parse(RESET), to: first.at, used: 3,
+    });
+    // A delayed reset alone is not a missing day when quota readings continued every day.
+    const continuous = addReadings(records, [
+      reading(time(30, 20), 80),
+      reading(time(1, 20, 0, 0, 0, 10), 80),
+      reading(time(2, 20, 0, 0, 0, 10), 80),
+    ].map((entry) => ({ login: "leon", reading: entry })), later.at);
+    expect(statusText(continuous, later.at)).toBe("9% | 4%");
+    expect(dailyUsed(continuous.leon, later.at).some((day) => day.gap)).toBe(false);
+  });
+
   it("gives each of the last 30 days its last reading minus the one before, nothing before the first reading", () => {
     const readings = [
       reading(time(20, 9), 40),
@@ -578,7 +702,7 @@ describe("days", () => {
       [19, undefined],
       [20, 2],
       [21, 0],
-      [22, 8],
+      [22, 0],
       [23, 4],
     ]);
   });
