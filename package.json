@@ -2,7 +2,7 @@
   "name": "copilot-usage-extension",
   "displayName": "Copilot Credits",
   "description": "Local Copilot credit usage, read from Copilot logs.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "leonbjorklund",
   "license": "MIT",
   "scripts": {

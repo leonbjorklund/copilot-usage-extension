@@ -135,8 +135,8 @@ function graphRows(days: DayUsage[], palette: Palette): string[] {
   const images = days
     .map(({ day, used, gap }) => {
       const label = gap
-        ? `${formatNumber(gap.used)}% between ${formatDate(gap.from)} and ${formatDate(gap.to)} · Day unknown` +
-          (used ? `; ${formatNumber(used)}% recorded on ${formatDate(day)}` : "")
+        ? `${formatDateRange(gap.from, gap.to)}: ${formatNumber(gap.used)}% unknown` +
+          (used ? `; ${formatDate(day)}: ${formatNumber(used)}%` : "")
         : `${formatDate(day)} · ${used === undefined ? "Not tracked" : `${formatNumber(used)}%`}`;
       const height = gap
         ? GAP_HEIGHT
@@ -164,6 +164,16 @@ function graphRows(days: DayUsage[], palette: Palette): string[] {
 function formatDate(day: number): string {
   const date = new Date(day);
   return `${date.getDate()} ${date.toLocaleString('en-US', { month: 'short' })}`;
+}
+
+function formatDateRange(from: number, to: number): string {
+  const first = new Date(from);
+  const last = new Date(to);
+  const start =
+    first.getFullYear() === last.getFullYear() && first.getMonth() === last.getMonth()
+      ? first.getDate()
+      : formatDate(from);
+  return `${start}–${formatDate(to)}`;
 }
 
 function dayImage(height: number, color: string, axis: string, striped: boolean): string {

@@ -274,7 +274,7 @@ function usageGap(earlier: Reading, later: Reading, beforeDay = earlier): DayUsa
   const reset = newPeriod(earlier, later);
   // A late reset snapshot may follow an old-period snapshot on the return day. The reset date
   // alone is not evidence of a missing day; check the last observation before that day as well.
-  if (localDay(later.at) <= localDay((reset ? beforeDay : earlier).at, 1)) return;
+  if (reset && localDay(later.at) <= localDay(beforeDay.at, 1)) return;
   let from = reset ? resetAt(earlier) : earlier.at;
   if (reset) {
     const observed = new Date(later.at);

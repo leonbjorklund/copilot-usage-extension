@@ -211,12 +211,12 @@ describe("graph", () => {
       const bars = images(hoverMarkdown({ leon: readings }, now, palette, [])!);
       expect(bars).toHaveLength(30);
       for (const index of [27, 28]) {
-        expect(bars[index]).toContain("10% between 21 Sep and 23 Sep");
+        expect(bars[index]).toContain("21–23 Sep: 10% unknown");
         expect(svg(bars[index])).toContain('height="14"');
         expect(svg(bars[index])).toContain('mask="url(#striped-fill)"');
       }
       expect(svg(bars[27])).toBe(svg(bars[28]));
-      expect(bars[27]).toContain("2% recorded on 21 Sep");
+      expect(bars[27]).toContain("; 21 Sep: 2%");
       expect(svg(bars[27])).toContain(`fill="${palette === DARK ? "#989898" : "#616161"}"`);
       expect(bars[29]).toContain('title="23 Sep · 1%"');
       expect(svg(bars[29])).toContain('height="24" rx="1"');
