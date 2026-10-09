@@ -282,6 +282,44 @@ describe('status bar', () => {
     expect(item.text).toBe('0% | 73.4%');
   });
 
+  it("prefers this window's account with saved quota, otherwise keeping the latest account", async () => {
+    fakeTimers(new Date(2026, 8, 23, 16));
+    const now = Date.now();
+    const leon = [reading(now - 86_400_000, 26.6, FAR_RESET), reading(now - 2000, 23.5, FAR_RESET)];
+    const { log, storage } = await start({
+      records: { leon },
+      logs: null,
+      windows: {
+        window2: line("[info] Got Copilot token for leon-work", -1500) + quota(40, -1000),
+      },
+    });
+    await nextPoll();
+    expect(item.text).toBe("0% | 60%");
+
+    await writeFile(log, line("[info] Got Copilot token for leon"));
+    await nextPoll();
+    expect(item.text).toBe("3.1% | 76.5%");
+    expect(hover()).toBe(hoverMarkdown({ leon }, Date.now(), DARK, []));
+
+    const otherLog = log.replace("window1", "window2");
+    await appendFile(otherLog, quota(30));
+    await nextPoll();
+    expect(item.text).toBe("3.1% | 76.5%");
+    expect((await saved(storage)).leon).toEqual(leon);
+    expect((await saved(storage))["leon-work"].at(-1).percentRemaining).toBe(30);
+
+    await appendFile(log, line("[info] Got Copilot token for leon-work"));
+    await nextPoll();
+    expect(item.text).toBe("10% | 70%");
+    const workHover = hover();
+    for (const login of ["leon-without-quota", "devDeviceId"]) {
+      await appendFile(log, line(`[info] Got Copilot token for ${login}`));
+      await nextPoll();
+      expect(item.text).toBe("10% | 70%");
+      expect(hover()).toBe(workHover);
+    }
+  });
+
   it('keeps polling after a failed save, and saves again on the next poll', async () => {
     fakeTimers(new Date(2026, 8, 23, 16));
     // A file where the storage folder should be makes every save fail.

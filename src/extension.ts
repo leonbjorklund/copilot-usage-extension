@@ -54,12 +54,15 @@ export function activate(context: vscode.ExtensionContext): void {
   const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100.05);
   const render = () => {
     const now = Date.now();
+    const login = logs.windows.get(windowName)?.login;
+    // Prefer this window's account once it has quota; otherwise keep the latest account shown.
+    const displayRecords = login && Object.hasOwn(records, login) ? { [login]: records[login] } : records;
     const noTrace = trace !== 'switched' && ownLogWritten() && (logs.windows.get(windowName)!.traceAt ?? 0) < hostStart;
-    const text = statusText(records, now, noTrace ? (trace === 'other' ? 'trace' : 'restart') : undefined);
+    const text = statusText(displayRecords, now, noTrace ? (trace === 'other' ? 'trace' : 'restart') : undefined);
     if (item.text !== text) item.text = text;
     const kind = vscode.window.activeColorTheme.kind;
     const light = kind === vscode.ColorThemeKind.Light || kind === vscode.ColorThemeKind.HighContrastLight;
-    const markdown = hoverMarkdown(records, now, light ? LIGHT : DARK, topModels(tally), modelsNeedRestart);
+    const markdown = hoverMarkdown(displayRecords, now, light ? LIGHT : DARK, topModels(tally), modelsNeedRestart);
     // Each assignment sends the window an update, so only a changed hover is sent.
     if ((item.tooltip as vscode.MarkdownString | undefined)?.value !== markdown) {
       item.tooltip = markdown === undefined
