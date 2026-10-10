@@ -1,8 +1,8 @@
 {
   "name": "copilot-usage-extension",
   "displayName": "Copilot Credits",
-  "description": "Local Copilot credit usage, read from Copilot logs.",
-  "version": "0.1.2",
+  "description": "Track GitHub Copilot credit usage in your status bar.",
+  "version": "0.1.3",
   "publisher": "leonbjorklund",
   "license": "MIT",
   "scripts": {
@@ -34,7 +34,12 @@
     "credits",
     "quota",
     "usage",
-    "ai"
+    "ai",
+    "github copilot",
+    "copilot usage",
+    "copilot chat",
+    "usage tracker",
+    "status bar"
   ],
   "engines": {
     "vscode": "^1.139.0"
